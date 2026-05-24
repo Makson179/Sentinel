@@ -127,9 +127,13 @@ All permanent state lives under `.supervisor/` in the project root.
 
 `log.jsonl` is an append-only event and decision log. Each entry contains monotonic wrapper sequence number, hook event id, generation, source hook, handling path, latency, decision, and any fallback reason.
 
+`codex-stdout.log` and `codex-stderr.log` capture the supervised `codex exec` process output for the current run. Supervised Codex runs use `codex exec --json`, so stdout contains Codex's JSON event stream rather than relying on sparse human output. The logs are truncated at the start of a fresh Codex launch and appended across supervisor restarts within that run.
+
+`codex-hook-trace.log` is a JSONL diagnostic trace written by Supervisor's Codex hook process. It records hook input receipt, IPC responses, and whether the hook emitted empty stdout or Codex JSON. It is separate from hook stdout because Codex parses hook stdout as protocol.
+
 `agent-settings.json` is Claude-only temporary settings passed to Claude Code. It is created at startup and removed at cleanup.
 
-No additional permanent state files are introduced. Temporary lock files, temp files for atomic replace, and Unix sockets are implementation artifacts, not user-facing state.
+No other permanent state files are introduced. Temporary lock files, temp files for atomic replace, and Unix sockets are implementation artifacts, not user-facing state.
 
 ## State locking and concurrency
 
@@ -204,7 +208,7 @@ Fast-path policy is deterministic code in `policy.py`. It runs before any LLM ca
 
 Instant allow applies only when all of the following are true:
 
-- The operation is read-only or informational.
+- The operation is read-only/informational, or it is a parsed workspace edit using a known file-edit hook payload.
 - Every resolved real path is inside the project workspace.
 - No resolved path matches the secret-pattern list.
 - The command or tool input is parsed confidently.
@@ -213,7 +217,8 @@ Examples:
 
 - Claude/Codex file reads inside workspace on non-secret files.
 - `Grep`/`Glob` inside workspace on non-secret paths.
-- `ls`, `pwd`, `find` with bounded workspace paths.
+- Workspace-scoped `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, and Codex `apply_patch` operations on non-secret paths.
+- `cat`, `sed`, `head`, `tail`, `wc`, `ls`, `pwd`, and `find` with bounded workspace paths.
 - `git status`, `git log`, and `git diff` without destructive or network flags.
 - Version checks such as `python --version`, `node --version`, `pytest --version`.
 
@@ -262,7 +267,7 @@ Retries, schema repair, and provider calls inside a synchronous hook must fit wi
 Timeout fallbacks:
 
 - Permission event: deny.
-- PreToolUse guardrail event: no-op unless instant-deny already applied.
+- PreToolUse guardrail event: deny. Codex exec has no interactive permission fallback, and Codex 0.130.0 treats PreToolUse as continue-or-block rather than as a deferred approval channel.
 - Observation event: no-op.
 - Kill-restart candidate: keep current generation alive.
 
@@ -277,7 +282,7 @@ The LLM supervisor always returns structured JSON validated by Pydantic and JSON
 Native enforcement:
 
 - Claude subscription mode uses `claude -p --json-schema`.
-- Codex subscription mode uses `codex exec --output-schema`.
+- Codex subscription mode uses `codex exec --output-schema`. Codex 0.130.0 forwards the schema into OpenAI structured outputs as `text.format.schema` with strict mode enabled, so the Codex schema file must use the OpenAI strict subset: object schemas include `additionalProperties: false`, every property is listed in `required`, nullable fields use a union with `null`, and arbitrary object payloads are avoided.
 - OpenRouter API mode uses provider structured-output support when available.
 
 If output is invalid:
@@ -297,10 +302,10 @@ The wrapper wakes the LLM supervisor only when deterministic code cannot safely 
 
 Trigger types:
 
-- Permission request that falls through fast-path policy.
-- Action/observation event selected for LLM evaluation.
+- Permission request or PreToolUse event that falls through fast-path policy.
 - Debounced timer tick when local state indicates risk or unresolved work.
 - Kill-restart candidate.
+- Action/observation events only when they are delivering an already queued intervention; otherwise PostToolUse, PostToolBatch, Stop, and SubagentStop return no-op synchronously so they do not burn a vendor hook deadline after successful work.
 
 Timer tick default is 120 seconds and resets after event-driven wake-ups. On each tick, the wrapper first checks local state. If health, progress, active tool calls, risk signals, and pending intervention state are unchanged, no LLM call is made.
 
@@ -389,14 +394,24 @@ Codex hooks are discovered from Codex hook configuration files, not from a `--se
 
 Registered hooks:
 
-- `PreToolUse`: instant-deny guardrails only, with the known caveat that Codex documents this as not a complete enforcement boundary.
-- `PermissionRequest`: primary permission decision channel.
+- `PreToolUse`: pre-dispatch guardrail. Deterministic fast-path policy handles obvious allow/deny, and gray-zone cases call the supervisor LLM inline because exec mode cannot rely on a later interactive permission fallback.
+- `PermissionRequest`: approval-time allow/deny channel when Codex's own tool policy requires approval.
 - `PostToolUse`: action observation and intervention delivery only if self-tested context injection works.
 - `Stop`: turn-end intervention delivery via `decision: "block"`.
-- `SubagentStop`: subagent turn-end observation and delivery when supported.
 - `PreCompact` and `PostCompact`: health signals.
 
-The MVP does not use Codex app-server or SDK steering. Codex process control is OS-level process group kill. `codex exec --json` may be consumed for observability and logging, but it is not the control path.
+Codex CLI 0.130.0 supports the hook event names `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`, `SessionStart`, `UserPromptSubmit`, and `Stop`. The MVP installs only the Supervisor-owned events listed above.
+
+Codex exec-mode hook protocol in 0.130.0:
+
+- `PreToolUse` runs before the tool is dispatched. Empty output or `{}` means continue. Supervisor emits empty stdout for allow/no-op. `hookSpecificOutput.permissionDecision: "deny"` with a non-empty `permissionDecisionReason` blocks the tool. `permissionDecision: "allow"` and legacy `decision: "approve"` are explicitly unsupported by Codex's parser.
+- `PermissionRequest` runs only inside Codex's approval path, before guardian/user approval. It accepts `hookSpecificOutput.decision.behavior` of `allow` or `deny`; a missing decision falls through to Codex's normal approval path.
+- `PostToolUse` accepts empty output for no-op, `hookSpecificOutput.additionalContext` for model-visible follow-up context, and legacy `decision: "block"` with `reason` for feedback/replacement output.
+- `Stop` accepts empty output for completion and `decision: "block"` with `reason` when the hook wants Codex to continue with an injected prompt fragment.
+- `PreCompact` and `PostCompact` accept empty output for no-op and universal `continue: false` plus `stopReason` if execution should stop.
+- `codex exec` defaults approval policy to `never`, and the exec front-end rejects interactive approval requests such as command, file-change, and apply-patch approvals. Therefore Supervisor must never rely on a non-decisive permission hook response in exec mode. Gray-zone `PreToolUse` and `PermissionRequest` callbacks call the supervisor LLM inline and are coerced to allow/deny; non-actionable LLM results and timeouts are denied.
+
+The MVP does not use Codex app-server or SDK steering. Codex process control is OS-level process group kill. Every noninteractive `codex exec` invocation owned by Supervisor includes `--skip-git-repo-check` so the supervised task, hook-fire self-test, and isolated supervisor LLM calls all share the same git-trust behavior. The supervised Codex command is launched as `codex exec --skip-git-repo-check --json --sandbox workspace-write ...` so ordinary workspace writes do not require unsupported interactive approvals and stdout contains an event stream. The child stdin is connected to `/dev/null`; Codex exec treats piped stdin as extra prompt context when a positional prompt is present, so leaving a pipe open can silently block startup or progress. Codex stdout and stderr are written to `.supervisor/codex-stdout.log` and `.supervisor/codex-stderr.log`; hook protocol traces are written to `.supervisor/codex-hook-trace.log`.
 
 ### Codex hook install, trust, and restore
 
@@ -432,11 +447,15 @@ Crash recovery:
 
 Trust preflight:
 
-1. After installing hooks, the wrapper runs a Codex hook trust preflight before the supervised task starts.
-2. If Codex reports hooks are untrusted or the hook-fire self-test fails, the wrapper instructs the user to approve the supervisor hook entries through Codex's native hook trust flow.
-3. This is a one-time onboarding step per project/hook configuration.
-4. After the user completes trust, the wrapper repeats the hook-fire self-test.
-5. If the expected hook event still does not reach IPC, startup fails. The supervised run never starts without working hooks.
+1. Before installing hooks, the wrapper computes the Supervisor hook keys and current hashes that Codex will derive after merge. Codex 0.130.0 keys hook trust as `<hook source path>:<event label>:<group index>:<handler index>`, where the source path for repo hooks is the absolute `<repo>/.codex/hooks.json` path and event labels are values such as `pre_tool_use`, `permission_request`, and `stop`.
+2. The wrapper reads Codex trust state from `$CODEX_HOME/config.toml` when `CODEX_HOME` is set, otherwise from `~/.codex/config.toml`. The trusted state lives under `hooks.state`, with per-hook entries containing `trusted_hash` and optional `enabled`. The wrapper only reads this file; it must not write or edit Codex trust state.
+3. If every planned Supervisor hook has a matching `trusted_hash` and is not explicitly disabled, the wrapper skips the trust preflight entirely, installs hooks, and proceeds silently. Repeat runs must not nag users.
+4. If any planned Supervisor hook is missing, modified, or disabled in Codex trust state, the wrapper prints one paragraph explaining the one-time setup and asks the user whether to continue.
+5. On `yes`, the wrapper installs `.codex/hooks.json`, prints a short instruction, then launches interactive `codex --no-alt-screen` attached to a pseudo-terminal even when the wrapper's own stdout is piped. This avoids Codex's "stdout is not a terminal" failure while keeping setup visible when a real terminal is available.
+6. The wrapper automates Codex's native review UI by typing `/hooks` through the PTY as real TUI input, pressing Enter after the slash-command popup recognizes it, then navigating the hooks browser. For each Supervisor-owned hook that is not yet ready, it opens that event, moves to the Supervisor handler row, presses `t` when the hook hash is untrusted or modified, presses Enter when a trusted hook is disabled, then returns to the event list. Hooks that already have the expected `trusted_hash` and are enabled are skipped.
+7. The wrapper polls Codex trust state in the background and prints progress such as `Waiting for hook trust approval in Codex... (0/6 hooks trusted)` as counts change. The setup wait is long-running, currently 10 minutes, so users can still complete review manually if automation lags.
+8. If trust is incomplete when setup exits or times out, startup fails cleanly but leaves the Supervisor hooks installed in `.codex/hooks.json` so the next wrapper run can resume from partial `hooks.state` progress. The normal cleanup path removes Supervisor hooks after a completed supervised run.
+9. When Codex records the expected trusted hashes and the hooks are enabled, the wrapper terminates the setup Codex session and runs the Codex hook-fire self-test. If no expected hook callback reaches Supervisor IPC, startup exits cleanly with the self-test failure detail. The supervised run never starts without working hooks.
 
 No human involvement is required after this preflight succeeds.
 
