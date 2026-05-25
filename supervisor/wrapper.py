@@ -100,7 +100,7 @@ class SupervisorWrapper:
                 raise RuntimeError("Claude hook-fire self-test failed")
             self.adapter = adapter
         elif self.config.platform == "codex":
-            adapter = CodexAdapter(self.store)
+            adapter = CodexAdapter(self.store, hook_timeout_seconds=self.config.hook_timeout_seconds)
             adapter.recover_stale_hooks()
             adapter.install()
             self.adapter = adapter
@@ -301,6 +301,7 @@ class SupervisorWrapper:
         env = {
             "SUPERVISOR_IPC_SOCKET": str(self.socket_path),
             "SUPERVISOR_IPC_TOKEN": self.auth_token,
+            "SUPERVISOR_HOOK_TIMEOUT": str(self.config.hook_timeout_seconds),
             "SUPERVISOR_HOOK_TRACE_PATH": str(self.store.path("codex-hook-trace.log")),
         }
         stdout_path = None

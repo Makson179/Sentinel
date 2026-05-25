@@ -172,7 +172,7 @@ class RunConfig(BaseModel):
     codex_hook_manifest: dict[str, Any] | None = None
     generation: int = 0
     restart_count: int = 0
-    hook_timeout_seconds: float = 10.0
+    hook_timeout_seconds: float = 15.0
 
     @field_validator("plan_file_path")
     @classmethod

@@ -85,7 +85,7 @@ def test_codex_hook_merge_cleanup_preserves_user_edits(store: StateStore) -> Non
 
 
 def test_codex_generated_hooks_match_codex_0130_schema(store: StateStore) -> None:
-    adapter = CodexAdapter(store, python_executable="/usr/bin/python3")
+    adapter = CodexAdapter(store, python_executable="/usr/bin/python3", hook_timeout_seconds=17.2)
 
     adapter.install()
 
@@ -101,6 +101,7 @@ def test_codex_generated_hooks_match_codex_0130_schema(store: StateStore) -> Non
         handler = group["hooks"][0]
         assert handler["type"] == "command"
         assert handler["command"] == f"/usr/bin/python3 -m supervisor.hooks.codex_hook --supervisor-hook-id {hook_id}"
+        assert handler["timeout"] == 18
         assert handler["statusMessage"] == f"Supervisor hook: {event}"
 
 
@@ -154,6 +155,7 @@ async def test_codex_hook_fire_self_test_uses_supported_exec_flags(store: StateS
     assert captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] == asyncio.subprocess.PIPE
     assert captured["kwargs"]["env"]["SUPERVISOR_HOOK_TRACE_PATH"] == str(store.path("codex-hook-trace.log"))
+    assert captured["kwargs"]["env"]["SUPERVISOR_HOOK_TIMEOUT"] == str(adapter.hook_timeout_seconds)
 
 
 @pytest.mark.asyncio

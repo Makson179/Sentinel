@@ -104,6 +104,7 @@ def test_codex_launch_routes_process_output_to_logs(workspace: Path, monkeypatch
     assert captured["stdout_path"] == stdout_path
     assert captured["stderr_path"] == stderr_path
     assert captured["env"]["SUPERVISOR_HOOK_TRACE_PATH"] == str(trace_path)
+    assert captured["env"]["SUPERVISOR_HOOK_TIMEOUT"] == str(wrapper.config.hook_timeout_seconds)
     assert stdout_path.read_text(encoding="utf-8") == ""
     assert stderr_path.read_text(encoding="utf-8") == ""
     assert trace_path.read_text(encoding="utf-8") == ""
@@ -395,8 +396,9 @@ async def test_codex_prepare_installs_hooks_directly(
         last_self_test_error = None
         last_trust_sync_error = None
 
-        def __init__(self, store):
+        def __init__(self, store, hook_timeout_seconds):
             self.store = store
+            events.append(("timeout", hook_timeout_seconds))
 
         def recover_stale_hooks(self) -> None:
             events.append("recover")
@@ -429,6 +431,7 @@ async def test_codex_prepare_installs_hooks_directly(
     await wrapper.prepare_platform()
 
     assert events == [
+        ("timeout", wrapper.config.hook_timeout_seconds),
         "recover",
         "install",
         "trust-sync",

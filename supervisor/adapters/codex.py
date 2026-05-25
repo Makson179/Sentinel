@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import shlex
 import signal
@@ -49,11 +50,18 @@ def _sha256_text(text: str) -> str:
 
 
 class CodexAdapter:
-    def __init__(self, store: StateStore, python_executable: str | None = None, codex_executable: str = "codex"):
+    def __init__(
+        self,
+        store: StateStore,
+        python_executable: str | None = None,
+        codex_executable: str = "codex",
+        hook_timeout_seconds: float = 15.0,
+    ):
         self.store = store
         self.workspace = store.workspace
         self.python_executable = python_executable or sys.executable
         self.codex_executable = codex_executable
+        self.hook_timeout_seconds = max(1, math.ceil(hook_timeout_seconds))
         self.codex_dir = self.workspace / ".codex"
         self.hooks_path = self.codex_dir / "hooks.json"
         self.lock_path = self.store.path("codex-hooks-install.lock")
@@ -139,6 +147,7 @@ class CodexAdapter:
                     {
                         "type": "command",
                         "command": self._supervisor_command(hook_id),
+                        "timeout": self.hook_timeout_seconds,
                         "statusMessage": f"{SUPERVISOR_STATUS_PREFIX} {event}",
                     }
                 ]
@@ -332,7 +341,7 @@ class CodexAdapter:
             {
                 "SUPERVISOR_IPC_SOCKET": str(ipc_socket_path),
                 "SUPERVISOR_IPC_TOKEN": auth_token,
-                "SUPERVISOR_HOOK_TIMEOUT": "10",
+                "SUPERVISOR_HOOK_TIMEOUT": str(self.hook_timeout_seconds),
                 "SUPERVISOR_HOOK_TRACE_PATH": str(self.store.path("codex-hook-trace.log")),
             }
         )

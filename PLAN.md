@@ -260,7 +260,7 @@ If the LLM returns a type-2 permission decision, the wrapper creates an in-memor
 
 Every synchronous hook-triggered LLM call runs under a deadline derived from the active vendor hook timeout.
 
-At startup, the wrapper discovers or configures the maximum supported hook timeout for the installed CLI. It verifies this with a hook self-test. For each hook callback, the wrapper computes remaining budget and aborts waiting for the LLM at 90 percent of that budget, leaving time to transmit a hook response.
+At startup, the wrapper discovers or configures the maximum supported hook timeout for the installed CLI. It verifies this with a hook self-test. The configured timeout is written into Codex hook handlers and passed to hook subprocesses through `SUPERVISOR_HOOK_TIMEOUT`; the default is 15 seconds. For each hook callback, the wrapper computes remaining budget and aborts waiting for the LLM at 90 percent of that budget, leaving time to transmit a hook response.
 
 Retries, schema repair, and provider calls inside a synchronous hook must fit within the same deadline. There is no independent retry schedule that can exceed the hook budget.
 
