@@ -10,7 +10,9 @@ def test_codex_probe_requires_exec_flags(monkeypatch) -> None:
         if args == ["codex", "--version"]:
             return True, "codex 0.130.0"
         if args == ["codex", "exec", "--help"]:
-            return True, "Usage: codex exec\n--ignore-user-config\n--skip-git-repo-check\n--sandbox\n--json"
+            return True, "Usage: codex exec\n--ignore-user-config\n--skip-git-repo-check\n--dangerously-bypass-hook-trust\n--sandbox\n--json"
+        if args == ["codex", "app-server", "--help"]:
+            return True, "Usage: codex app-server\n--listen <URL>"
         raise AssertionError(args)
 
     monkeypatch.setattr(shutil, "which", lambda executable: "/usr/bin/codex")
@@ -27,5 +29,7 @@ def test_codex_probe_reports_missing_exec_flags(monkeypatch) -> None:
 
     assert "codex exec --ignore-user-config" in report.missing
     assert "codex exec --skip-git-repo-check" in report.missing
+    assert "codex exec --dangerously-bypass-hook-trust" in report.missing
     assert "codex exec --sandbox" in report.missing
     assert "codex exec --json" in report.missing
+    assert "codex app-server --listen stdio://" in report.missing

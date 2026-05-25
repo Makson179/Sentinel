@@ -52,9 +52,7 @@ async def _run(platform: str, plan_path: Path, mode: str, model: str | None, sta
             if wrapper.process:
                 while wrapper.process.poll() is None:
                     await asyncio.sleep(1)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            wrapper.preserve_codex_hooks_on_cleanup = False
-            raise
+                await asyncio.sleep(0.5)
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
     finally:

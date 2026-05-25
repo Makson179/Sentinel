@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from supervisor.adapters import ClaudeAdapter, CodexAdapter
-from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS
+from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS, codex_exec_sandbox_flags
 from supervisor.health import kill_restart_candidate, patch_health
 from supervisor.ipc import IPCServer
 from supervisor.llm_driver import ClaudeSubscriptionDriver, CodexSubscriptionDriver, LLMDriver, LLMDriverError, OpenRouterDriver, ParseFailure
@@ -63,7 +63,6 @@ class SupervisorWrapper:
         self.termination_reason: str | None = None
         self.adapter: ClaudeAdapter | CodexAdapter | None = None
         self.claude_settings_path: Path | None = None
-        self.preserve_codex_hooks_on_cleanup = False
 
     def _make_llm_driver(self, config: RunConfig) -> LLMDriver:
         if config.mode == "api":
@@ -103,55 +102,22 @@ class SupervisorWrapper:
         elif self.config.platform == "codex":
             adapter = CodexAdapter(self.store)
             adapter.recover_stale_hooks()
-            planned_hooks = adapter.planned_supervisor_hooks()
-            if not adapter.supervisor_hooks_trusted(planned_hooks):
-                self._confirm_codex_trust_setup()
-                adapter.install()
-                self.adapter = adapter
-                self.preserve_codex_hooks_on_cleanup = True
-                self._print_codex_trust_setup_instruction()
-                if not await adapter.trust_preflight(planned_hooks, self.socket_path, self.auth_token):
-                    raise RuntimeError(
-                        "Codex hook trust setup did not complete. The supervised task was not started. "
-                        "The Supervisor hooks were left installed so the next run can resume from the current trust state."
-                    )
-                self.preserve_codex_hooks_on_cleanup = False
-            else:
-                adapter.install()
-                self.adapter = adapter
-                self.preserve_codex_hooks_on_cleanup = False
+            adapter.install()
+            self.adapter = adapter
+            trust_synced = await adapter.sync_supervisor_hook_trust()
             if not await adapter.hook_fire_self_test(self.socket_path, self.auth_token):
                 detail = f": {adapter.last_self_test_error}" if adapter.last_self_test_error else ""
+                if not trust_synced and adapter.last_trust_sync_error:
+                    separator = "; " if detail else ": "
+                    detail = f"{detail}{separator}{adapter.last_trust_sync_error}"
                 raise RuntimeError(f"Codex hook-fire self-test failed{detail}")
             if not await adapter.supervisor_isolation_self_test():
                 raise RuntimeError("Codex supervisor-call isolation self-test failed")
-
-    def _confirm_codex_trust_setup(self) -> None:
-        print(
-            "Codex needs a one-time trust setup before Supervisor can run this task: Supervisor will add its project hooks to .codex/hooks.json, open Codex's built-in trust UI, approve Codex's project-directory trust prompt if it appears so project hooks can load, then wait until Codex records that those exact hooks are trusted; Supervisor will not write Codex's trust file directly. Continue with hook installation and trust setup? [y/N] ",
-            end="",
-            flush=True,
-        )
-        try:
-            answer = input()
-        except EOFError as exc:
-            raise RuntimeError("Codex hook trust setup was cancelled because no answer was provided") from exc
-        if answer.strip().lower() not in {"y", "yes"}:
-            raise RuntimeError("Codex hook trust setup was cancelled; the supervised task was not started")
-
-    @staticmethod
-    def _print_codex_trust_setup_instruction() -> None:
-        print(
-            "\nOpening Codex hook review now. Supervisor will answer Codex's project-directory trust prompt if it appears, then type /hooks and trust the Supervisor-owned hook entries through Codex's own UI. You do not need to type anything; this wrapper will close the setup Codex session automatically once trust is recorded.\n",
-            flush=True,
-        )
 
     def cleanup_platform(self) -> None:
         if isinstance(self.adapter, ClaudeAdapter):
             self.adapter.cleanup()
         elif isinstance(self.adapter, CodexAdapter):
-            if self.preserve_codex_hooks_on_cleanup:
-                return
             self.adapter.cleanup()
 
     def snapshot(self) -> StateSnapshot:
@@ -359,7 +325,15 @@ class SupervisorWrapper:
                 command.extend(["--settings", str(self.claude_settings_path)])
             return command
         if self.config.platform == "codex":
-            return ["codex", "exec", *CODEX_EXEC_GIT_TRUST_FLAGS, "--json", "--sandbox", "workspace-write", instruction]
+            return [
+                "codex",
+                "exec",
+                *CODEX_EXEC_GIT_TRUST_FLAGS,
+                "--dangerously-bypass-hook-trust",
+                "--json",
+                *codex_exec_sandbox_flags(),
+                instruction,
+            ]
         return [os.environ.get("PYTHON", "python3"), "-m", "tests.fake_agent.agent"]
 
     async def timer_tick(self, sequence: int) -> IPCResponse | None:

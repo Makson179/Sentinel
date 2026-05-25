@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 
 import pytest
 
 from supervisor.adapters.codex import (
     CODEX_HOOK_EVENTS,
-    KEY_ARROW_DOWN,
-    KEY_ARROW_UP,
-    KEY_ENTER,
-    KEY_ESCAPE,
     CodexAdapter,
     CodexHookConfigError,
     MARKER,
@@ -63,21 +60,6 @@ def assert_matches_codex_0130_hooks_file_schema(data: dict) -> None:
                 assert "supervisor_owned" not in handler
 
 
-def toml_quote(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def codex_hook_state_toml(trusted_hashes: dict[str, str], *, disabled_key: str | None = None) -> str:
-    parts = []
-    for key, trusted_hash in trusted_hashes.items():
-        parts.append(f'[hooks.state."{toml_quote(key)}"]')
-        parts.append(f'trusted_hash = "{trusted_hash}"')
-        if key == disabled_key:
-            parts.append("enabled = false")
-        parts.append("")
-    return "\n".join(parts)
-
-
 def test_codex_hook_merge_cleanup_preserves_user_edits(store: StateStore) -> None:
     adapter = CodexAdapter(store)
     adapter.codex_dir.mkdir()
@@ -122,106 +104,18 @@ def test_codex_generated_hooks_match_codex_0130_schema(store: StateStore) -> Non
         assert handler["statusMessage"] == f"Supervisor hook: {event}"
 
 
-def test_codex_planned_hooks_match_codex_0130_trust_keys(store: StateStore) -> None:
-    adapter = CodexAdapter(store, python_executable="/usr/bin/python3")
-    adapter.codex_dir.mkdir()
-    adapter.hooks_path.write_text(
-        json.dumps({"hooks": {"Stop": [command_group("echo user")], "PostToolUse": [command_group("echo one"), command_group("echo two")]}}),
-        encoding="utf-8",
-    )
-
-    planned = adapter.planned_supervisor_hooks()
-
-    assert len(planned) == len(CODEX_HOOK_EVENTS)
-    by_event = {hook.event: hook for hook in planned}
-    assert by_event["PreToolUse"].key == f"{adapter.hooks_path}:pre_tool_use:0:0"
-    assert by_event["PermissionRequest"].key == f"{adapter.hooks_path}:permission_request:0:0"
-    assert by_event["PostToolUse"].key == f"{adapter.hooks_path}:post_tool_use:2:0"
-    assert by_event["PostToolUse"].display_index == 2
-    assert by_event["PreCompact"].key == f"{adapter.hooks_path}:pre_compact:0:0"
-    assert by_event["PostCompact"].key == f"{adapter.hooks_path}:post_compact:0:0"
-    assert by_event["Stop"].key == f"{adapter.hooks_path}:stop:1:0"
-    assert by_event["Stop"].display_index == 1
-    assert all(hook.current_hash.startswith("sha256:") and len(hook.current_hash) == 71 for hook in planned)
-
-
-def test_codex_trust_state_reads_codex_home_config_toml(store: StateStore, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    adapter = CodexAdapter(store, python_executable="/usr/bin/python3")
-    planned = adapter.planned_supervisor_hooks()
-    trusted_hashes = {hook.key: hook.current_hash for hook in planned}
-    config_path = codex_home / "config.toml"
-    config_path.write_text(codex_hook_state_toml(trusted_hashes), encoding="utf-8")
-
-    assert adapter.trust_config_path() == config_path
-    assert adapter.supervisor_hooks_trusted(planned) is True
-
-    first = planned[0]
-    stale_hashes = dict(trusted_hashes)
-    stale_hashes[first.key] = "sha256:" + ("0" * 64)
-    config_path.write_text(codex_hook_state_toml(stale_hashes), encoding="utf-8")
-    assert adapter.supervisor_hooks_trusted(planned) is False
-
-    config_path.write_text(codex_hook_state_toml(trusted_hashes, disabled_key=first.key), encoding="utf-8")
-    assert adapter.supervisor_hooks_trusted(planned) is False
-
-
-def test_codex_hook_review_keystrokes_resume_partial_trust(store: StateStore, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    adapter = CodexAdapter(store, python_executable="/usr/bin/python3")
-    adapter.codex_dir.mkdir()
-    adapter.hooks_path.write_text(json.dumps({"hooks": {"Stop": [command_group("echo user")]}}), encoding="utf-8")
-    planned = adapter.planned_supervisor_hooks()
-    by_event = {hook.event: hook for hook in planned}
-    config_path = codex_home / "config.toml"
-    config_path.write_text(
-        codex_hook_state_toml(
-            {
-                by_event["PreToolUse"].key: by_event["PreToolUse"].current_hash,
-                by_event["PermissionRequest"].key: by_event["PermissionRequest"].current_hash,
-            },
-            disabled_key=by_event["PermissionRequest"].key,
-        ),
-        encoding="utf-8",
-    )
-
-    keystrokes = adapter.hook_review_keystrokes(planned)
-    key_data = [keystroke.data for keystroke in keystrokes]
-
-    assert key_data[:7] == [b"/", b"h", b"o", b"o", b"k", b"s", KEY_ENTER]
-    assert b"t" in key_data
-    assert key_data.count(b"t") == len(CODEX_HOOK_EVENTS) - 2
-    assert KEY_ARROW_UP in key_data
-    assert KEY_ARROW_DOWN in key_data
-    assert key_data.count(KEY_ESCAPE) == len(CODEX_HOOK_EVENTS) - 1
-
-
-def test_codex_directory_trust_prompt_detection(store: StateStore) -> None:
-    adapter = CodexAdapter(store)
-
-    assert adapter._directory_trust_prompt_seen(b"Do you trust the contents of this directory?")
-    assert not adapter._directory_trust_prompt_seen(b"Waiting for hook trust approval")
-
-
 def test_codex_hook_install_hashes_and_json_are_stable(store: StateStore) -> None:
     adapter = CodexAdapter(store, python_executable="/usr/bin/python3")
     adapter.codex_dir.mkdir()
     adapter.hooks_path.write_text(json.dumps({"hooks": {"Stop": [command_group("echo user")]}}), encoding="utf-8")
 
-    first_planned = adapter.planned_supervisor_hooks()
     adapter.install()
     first_text = adapter.hooks_path.read_text(encoding="utf-8")
     adapter.cleanup()
-    second_planned = adapter.planned_supervisor_hooks()
     adapter.install()
     second_text = adapter.hooks_path.read_text(encoding="utf-8")
 
     assert first_text == second_text
-    assert [(hook.key, hook.current_hash) for hook in first_planned] == [(hook.key, hook.current_hash) for hook in second_planned]
 
 
 @pytest.mark.asyncio
@@ -230,7 +124,7 @@ async def test_codex_hook_fire_self_test_uses_supported_exec_flags(store: StateS
     captured: dict[str, object] = {}
 
     class FakeProcess:
-        returncode = None
+        returncode = 0
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         captured["args"] = args
@@ -238,19 +132,137 @@ async def test_codex_hook_fire_self_test_uses_supported_exec_flags(store: StateS
         return FakeProcess()
 
     async def fake_wait(process):
-        return None, b""
+        stdout = b'{"type":"item.completed","item":{"type":"command_execution","exit_code":0}}\n'
+        return stdout, b""
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(adapter, "_new_hook_log_seen", lambda offset: True)
-    monkeypatch.setattr(adapter, "_terminate_async_process_group", lambda process: None)
     monkeypatch.setattr(adapter, "_wait_async_process", fake_wait)
 
     assert await adapter.hook_fire_self_test(store.workspace / "ipc.sock", "token") is True
     args = captured["args"]
-    assert args[:5] == ("codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write")
+    assert args[:7] == (
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-hook-trust",
+        "--json",
+        "--sandbox",
+        "danger-full-access",
+    )
     assert "--ask-for-approval" not in args
     assert captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
+    assert captured["kwargs"]["stdout"] == asyncio.subprocess.PIPE
     assert captured["kwargs"]["env"]["SUPERVISOR_HOOK_TRACE_PATH"] == str(store.path("codex-hook-trace.log"))
+
+
+@pytest.mark.asyncio
+async def test_codex_hook_fire_self_test_requires_successful_command(store: StateStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = CodexAdapter(store)
+
+    class FakeProcess:
+        returncode = 0
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def fake_wait(process):
+        stdout = b'{"type":"item.completed","item":{"type":"agent_message","text":"bwrap failed"}}\n'
+        return stdout, b""
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(adapter, "_new_hook_log_seen", lambda offset: True)
+    monkeypatch.setattr(adapter, "_wait_async_process", fake_wait)
+
+    assert await adapter.hook_fire_self_test(store.workspace / "ipc.sock", "token") is False
+    assert "shell command did not complete successfully" in (adapter.last_self_test_error or "")
+
+
+@pytest.mark.asyncio
+async def test_codex_sync_supervisor_hook_trust_uses_app_server(store: StateStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = CodexAdapter(store)
+    key = f"{adapter.hooks_path}:pre_tool_use:0:0"
+    current_hash = "sha256:abc123"
+    messages = [
+        {"id": 1, "result": {"codexHome": "/home/alex/.codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex"}},
+        {
+            "method": "remoteControl/status/changed",
+            "params": {"status": "disabled"},
+        },
+        {
+            "id": 2,
+            "result": {
+                "data": [
+                    {
+                        "cwd": str(store.workspace),
+                        "hooks": [
+                            {
+                                "key": key,
+                                "sourcePath": str(adapter.hooks_path),
+                                "command": adapter._supervisor_command("supervisor-pre-tool-use"),
+                                "currentHash": current_hash,
+                                "trustStatus": "modified",
+                            }
+                        ],
+                        "warnings": [],
+                        "errors": [],
+                    }
+                ]
+            },
+        },
+        {"id": 3, "result": {"status": "ok", "version": "sha256:config", "filePath": "/home/alex/.codex/config.toml"}},
+    ]
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = deque((json.dumps(message) + "\n").encode("utf-8") for message in messages)
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.popleft()
+            return b""
+
+    class FakeStdin:
+        def __init__(self):
+            self.requests = []
+
+        def write(self, data):
+            self.requests.append(json.loads(data.decode("utf-8")))
+
+        async def drain(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = None
+
+    process = FakeProcess()
+    captured: dict[str, object] = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return process
+
+    async def fake_wait(_process):
+        return b"", b""
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(adapter, "_terminate_async_process_group", lambda _process: None)
+    monkeypatch.setattr(adapter, "_wait_async_process", fake_wait)
+
+    assert await adapter.sync_supervisor_hook_trust() is True
+
+    assert captured["args"] == ("codex", "app-server", "--listen", "stdio://")
+    assert [request["method"] for request in process.stdin.requests] == ["initialize", "hooks/list", "config/batchWrite"]
+    edit = process.stdin.requests[2]["params"]["edits"][0]
+    assert edit == {
+        "keyPath": f'hooks.state."{key}".trusted_hash',
+        "value": current_hash,
+        "mergeStrategy": "upsert",
+    }
 
 
 def test_codex_malformed_json_aborts(store: StateStore) -> None:

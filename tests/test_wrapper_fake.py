@@ -54,12 +54,29 @@ def make_codex_wrapper(workspace: Path) -> SupervisorWrapper:
     return wrapper
 
 
-def test_codex_exec_command_uses_workspace_sandbox_and_logs(workspace: Path) -> None:
+def test_codex_exec_command_uses_configured_sandbox_and_logs(workspace: Path) -> None:
     wrapper = make_codex_wrapper(workspace)
 
     command = wrapper.default_supervisee_command()
 
-    assert command[:6] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write"]
+    assert command[:7] == [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-hook-trust",
+        "--json",
+        "--sandbox",
+        "danger-full-access",
+    ]
+
+
+def test_codex_exec_command_honors_sandbox_env(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPERVISOR_CODEX_SANDBOX", "workspace-write")
+    wrapper = make_codex_wrapper(workspace)
+
+    command = wrapper.default_supervisee_command()
+
+    assert command[command.index("--sandbox") + 1] == "workspace-write"
 
 
 def test_codex_launch_routes_process_output_to_logs(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,7 +126,15 @@ def test_codex_restart_uses_default_handoff_command(workspace: Path, monkeypatch
     wrapper.apply_kill_restart("handoff for next generation")
 
     command = captured["command"]
-    assert command[:6] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write"]
+    assert command[:7] == [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-hook-trust",
+        "--json",
+        "--sandbox",
+        "danger-full-access",
+    ]
     assert ".supervisor/DECISIONS.md" in command[-1]
     assert ".supervisor/HANDOFF.md" in command[-1]
     assert captured["stdout_path"] == wrapper.store.path("codex-stdout.log")
@@ -361,11 +386,14 @@ async def test_ipc_malformed_json_denies_without_crashing_server(workspace: Path
 
 
 @pytest.mark.asyncio
-async def test_codex_prepare_skips_trust_prompt_when_hooks_already_trusted(workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+async def test_codex_prepare_installs_hooks_directly(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     events: list[object] = []
 
     class FakeCodexAdapter:
         last_self_test_error = None
+        last_trust_sync_error = None
 
         def __init__(self, store):
             self.store = store
@@ -373,16 +401,12 @@ async def test_codex_prepare_skips_trust_prompt_when_hooks_already_trusted(works
         def recover_stale_hooks(self) -> None:
             events.append("recover")
 
-        def planned_supervisor_hooks(self) -> list[str]:
-            events.append("planned")
-            return ["planned-hook"]
-
-        def supervisor_hooks_trusted(self, planned_hooks) -> bool:
-            events.append(("trusted", planned_hooks))
-            return True
-
         def install(self) -> None:
             events.append("install")
+
+        async def sync_supervisor_hook_trust(self) -> bool:
+            events.append("trust-sync")
+            return True
 
         async def hook_fire_self_test(self, ipc_socket_path, auth_token) -> bool:
             events.append(("hook-fire", ipc_socket_path is not None, bool(auth_token)))
@@ -396,7 +420,7 @@ async def test_codex_prepare_skips_trust_prompt_when_hooks_already_trusted(works
             events.append("cleanup")
 
     def fail_input() -> str:
-        raise AssertionError("trusted Codex startup must not prompt")
+        raise AssertionError("Codex startup must not prompt for hook trust")
 
     monkeypatch.setattr("supervisor.wrapper.CodexAdapter", FakeCodexAdapter)
     monkeypatch.setattr("builtins.input", fail_input)
@@ -406,147 +430,12 @@ async def test_codex_prepare_skips_trust_prompt_when_hooks_already_trusted(works
 
     assert events == [
         "recover",
-        "planned",
-        ("trusted", ["planned-hook"]),
         "install",
+        "trust-sync",
         ("hook-fire", True, True),
         "isolation",
     ]
     assert capsys.readouterr().out == ""
-
-
-@pytest.mark.asyncio
-async def test_codex_prepare_guides_first_run_trust_setup(workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    events: list[object] = []
-
-    class FakeCodexAdapter:
-        last_self_test_error = None
-
-        def __init__(self, store):
-            self.store = store
-
-        def recover_stale_hooks(self) -> None:
-            events.append("recover")
-
-        def planned_supervisor_hooks(self) -> list[str]:
-            events.append("planned")
-            return ["planned-hook"]
-
-        def supervisor_hooks_trusted(self, planned_hooks) -> bool:
-            events.append(("trusted", planned_hooks))
-            return False
-
-        def install(self) -> None:
-            events.append("install")
-
-        async def trust_preflight(self, planned_hooks, ipc_socket_path, auth_token) -> bool:
-            events.append(("trust-preflight", planned_hooks, ipc_socket_path is not None, bool(auth_token)))
-            return True
-
-        async def hook_fire_self_test(self, ipc_socket_path, auth_token) -> bool:
-            events.append(("hook-fire", ipc_socket_path is not None, bool(auth_token)))
-            return True
-
-        async def supervisor_isolation_self_test(self) -> bool:
-            events.append("isolation")
-            return True
-
-        def cleanup(self) -> None:
-            events.append("cleanup")
-
-    monkeypatch.setattr("supervisor.wrapper.CodexAdapter", FakeCodexAdapter)
-    monkeypatch.setattr("builtins.input", lambda: "y")
-    wrapper = make_codex_wrapper(workspace)
-
-    await wrapper.prepare_platform()
-
-    assert events == [
-        "recover",
-        "planned",
-        ("trusted", ["planned-hook"]),
-        "install",
-        ("trust-preflight", ["planned-hook"], True, True),
-        ("hook-fire", True, True),
-        "isolation",
-    ]
-    output = capsys.readouterr().out
-    assert "one-time trust setup" in output
-    assert "Opening Codex hook review now" in output
-    assert "You do not need to type anything" in output
-
-
-@pytest.mark.asyncio
-async def test_codex_prepare_cancelled_trust_setup_does_not_install(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[object] = []
-
-    class FakeCodexAdapter:
-        def __init__(self, store):
-            self.store = store
-
-        def recover_stale_hooks(self) -> None:
-            events.append("recover")
-
-        def planned_supervisor_hooks(self) -> list[str]:
-            events.append("planned")
-            return ["planned-hook"]
-
-        def supervisor_hooks_trusted(self, planned_hooks) -> bool:
-            events.append(("trusted", planned_hooks))
-            return False
-
-        def install(self) -> None:
-            events.append("install")
-
-    monkeypatch.setattr("supervisor.wrapper.CodexAdapter", FakeCodexAdapter)
-    monkeypatch.setattr("builtins.input", lambda: "n")
-    wrapper = make_codex_wrapper(workspace)
-
-    with pytest.raises(RuntimeError, match="cancelled"):
-        await wrapper.prepare_platform()
-
-    assert events == ["recover", "planned", ("trusted", ["planned-hook"])]
-
-
-@pytest.mark.asyncio
-async def test_codex_prepare_incomplete_trust_setup_preserves_installed_hooks(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[object] = []
-
-    class FakeCodexAdapter:
-        last_self_test_error = None
-
-        def __init__(self, store):
-            self.store = store
-
-        def recover_stale_hooks(self) -> None:
-            events.append("recover")
-
-        def planned_supervisor_hooks(self) -> list[str]:
-            events.append("planned")
-            return ["planned-hook"]
-
-        def supervisor_hooks_trusted(self, planned_hooks) -> bool:
-            events.append(("trusted", planned_hooks))
-            return False
-
-        def install(self) -> None:
-            events.append("install")
-
-        async def trust_preflight(self, planned_hooks, ipc_socket_path, auth_token) -> bool:
-            events.append("trust-preflight")
-            return False
-
-        def cleanup(self) -> None:
-            events.append("cleanup")
-
-    monkeypatch.setattr("supervisor.wrapper.CodexAdapter", FakeCodexAdapter)
-    monkeypatch.setattr("builtins.input", lambda: "y")
-    wrapper = make_codex_wrapper(workspace)
-
-    with pytest.raises(RuntimeError, match="left installed"):
-        await wrapper.prepare_platform()
-    wrapper.cleanup_platform()
-
-    assert events == ["recover", "planned", ("trusted", ["planned-hook"]), "install", "trust-preflight"]
 
 
 @pytest.mark.asyncio

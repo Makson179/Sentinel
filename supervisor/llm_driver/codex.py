@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS
+from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS, DEFAULT_SUPERVISOR_CODEX_SANDBOX_MODE, codex_exec_sandbox_flags
 from supervisor.llm_driver.base import LLMDriver, run_command_json
 from supervisor.schemas.models import openai_strict_json_schema_for_decision
 
@@ -26,6 +26,7 @@ class CodexSubscriptionDriver(LLMDriver):
             self.executable,
             "exec",
             *CODEX_EXEC_GIT_TRUST_FLAGS,
+            *codex_exec_sandbox_flags(DEFAULT_SUPERVISOR_CODEX_SANDBOX_MODE),
             "--ignore-user-config",
             "--output-schema",
             str(self.output_schema_path),

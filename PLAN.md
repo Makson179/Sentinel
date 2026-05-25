@@ -411,9 +411,9 @@ Codex exec-mode hook protocol in 0.130.0:
 - `PreCompact` and `PostCompact` accept empty output for no-op and universal `continue: false` plus `stopReason` if execution should stop.
 - `codex exec` defaults approval policy to `never`, and the exec front-end rejects interactive approval requests such as command, file-change, and apply-patch approvals. Therefore Supervisor must never rely on a non-decisive permission hook response in exec mode. Gray-zone `PreToolUse` and `PermissionRequest` callbacks call the supervisor LLM inline and are coerced to allow/deny; non-actionable LLM results and timeouts are denied.
 
-The MVP does not use Codex app-server or SDK steering. Codex process control is OS-level process group kill. Every noninteractive `codex exec` invocation owned by Supervisor includes `--skip-git-repo-check` so the supervised task, hook-fire self-test, and isolated supervisor LLM calls all share the same git-trust behavior. The supervised Codex command is launched as `codex exec --skip-git-repo-check --json --sandbox workspace-write ...` so ordinary workspace writes do not require unsupported interactive approvals and stdout contains an event stream. The child stdin is connected to `/dev/null`; Codex exec treats piped stdin as extra prompt context when a positional prompt is present, so leaving a pipe open can silently block startup or progress. Codex stdout and stderr are written to `.supervisor/codex-stdout.log` and `.supervisor/codex-stderr.log`; hook protocol traces are written to `.supervisor/codex-hook-trace.log`.
+The MVP does not use Codex app-server or SDK steering for agent control. Codex process control is OS-level process group kill. Supervisor uses Codex app-server only during startup to read Codex's hook metadata and synchronize trust hashes for Supervisor-owned hook entries. Every noninteractive `codex exec` invocation owned by Supervisor includes `--skip-git-repo-check` so the supervised task, hook-fire self-test, and isolated supervisor LLM calls all share the same git-trust behavior. The supervised Codex command is launched as `codex exec --skip-git-repo-check --dangerously-bypass-hook-trust --json --sandbox danger-full-access ...` so Supervisor-owned project hooks load without an interactive review while Codex stdout contains an event stream and Linux bubblewrap setup is not on the execution path. Supervisor's hooks remain the command approval gate; the run still aborts before the task starts if the hook-fire self-test cannot prove that hooks execute. The child stdin is connected to `/dev/null`; Codex exec treats piped stdin as extra prompt context when a positional prompt is present, so leaving a pipe open can silently block startup or progress. Codex stdout and stderr are written to `.supervisor/codex-stdout.log` and `.supervisor/codex-stderr.log`; hook protocol traces are written to `.supervisor/codex-hook-trace.log`.
 
-### Codex hook install, trust, and restore
+### Codex hook install, trust bypass, and restore
 
 Codex hook install must not clobber user hook configuration.
 
@@ -445,21 +445,17 @@ Crash recovery:
 - If `config.json` is missing but supervisor-owned hook markers exist, remove those markers conservatively and preserve all other entries.
 - Never restore an entire old file over the current file.
 
-Trust preflight:
+Hook trust bypass:
 
-1. Before installing hooks, the wrapper computes the Supervisor hook keys and current hashes that Codex will derive after merge. Codex 0.130.0 keys hook trust as `<hook source path>:<event label>:<group index>:<handler index>`, where the source path for repo hooks is the absolute `<repo>/.codex/hooks.json` path and event labels are values such as `pre_tool_use`, `permission_request`, and `stop`.
-2. The wrapper reads Codex trust state from `$CODEX_HOME/config.toml` when `CODEX_HOME` is set, otherwise from `~/.codex/config.toml`. The trusted state lives under `hooks.state`, with per-hook entries containing `trusted_hash` and optional `enabled`. The wrapper only reads this file; it must not write or edit Codex trust state.
-3. If every planned Supervisor hook has a matching `trusted_hash` and is not explicitly disabled, the wrapper skips the trust preflight entirely, installs hooks, and proceeds silently. Repeat runs must not nag users.
-4. If any planned Supervisor hook is missing, modified, or disabled in Codex trust state, the wrapper prints one paragraph explaining the one-time setup and asks the user whether to continue.
-5. On `yes`, the wrapper installs `.codex/hooks.json`, prints a short instruction, then launches interactive `codex --no-alt-screen` attached to a pseudo-terminal even when the wrapper's own stdout is piped. This avoids Codex's "stdout is not a terminal" failure while keeping setup visible when a real terminal is available.
-6. The wrapper automates Codex's native review UI by typing `/hooks` through the PTY as real TUI input, pressing Enter after the slash-command popup recognizes it, then navigating the hooks browser. For each Supervisor-owned hook that is not yet ready, it opens that event, moves to the Supervisor handler row, presses `t` when the hook hash is untrusted or modified, presses Enter when a trusted hook is disabled, then returns to the event list. Hooks that already have the expected `trusted_hash` and are enabled are skipped.
-7. The wrapper polls Codex trust state in the background and prints progress such as `Waiting for hook trust approval in Codex... (0/6 hooks trusted)` as counts change. The setup wait is long-running, currently 10 minutes, so users can still complete review manually if automation lags.
-8. If trust is incomplete when setup exits or times out, startup fails cleanly but leaves the Supervisor hooks installed in `.codex/hooks.json` so the next wrapper run can resume from partial `hooks.state` progress. The normal cleanup path removes Supervisor hooks after a completed supervised run.
-9. When Codex records the expected trusted hashes and the hooks are enabled, the wrapper terminates the setup Codex session and runs the Codex hook-fire self-test. If no expected hook callback reaches Supervisor IPC, startup exits cleanly with the self-test failure detail. The supervised run never starts without working hooks.
+1. Supervisor writes only the hook entries it owns into `<repo>/.codex/hooks.json` and treats those generated hook commands as vetted automation input.
+2. The supervised Codex command and hook-fire self-test include `--dangerously-bypass-hook-trust`, the Codex exec flag intended for automation that vets its own hook sources.
+3. After writing hooks, the wrapper asks Codex app-server for hook metadata and writes `trusted_hash` only for Supervisor-owned hook keys whose command exactly matches the generated Supervisor hook commands. It does not launch Codex's interactive hook review UI, use PTY keystroke automation, prompt the user, or preserve hooks for partial trust resumability.
+4. Supervised Codex exec invocations default to `--sandbox danger-full-access` because Codex `workspace-write` can fail on Linux while initializing bubblewrap loopback networking. This does not change Supervisor's approval logic: startup still requires the hook-fire self-test, and every supervised command is routed through Supervisor's hook policy before the task begins. `SUPERVISOR_CODEX_SANDBOX` can override the sandbox mode for diagnostics or local deployments that intentionally choose another Codex sandbox profile.
+5. Startup capability probing requires `codex exec --help` to advertise `--dangerously-bypass-hook-trust` and `codex app-server --help` to advertise `--listen`. Older CLIs without these capabilities should be upgraded before automated supervision.
+6. After installing and synchronizing hook trust, the wrapper runs the Codex hook-fire self-test. Startup requires both an expected hook callback to reach Supervisor IPC and a successful Codex `command_execution` event from a trivial `pwd` command. If either side fails, startup exits cleanly with the self-test failure detail. The supervised run never starts without working hooks and a working Codex exec path.
+7. If a local Codex CLI advertises `--dangerously-bypass-hook-trust` but does not activate project hooks in `codex exec`, app-server trust synchronization is the noninteractive fallback. If that also fails, the self-test reports the failed trust sync and hook-fire details before the supervised run starts.
 
-No human involvement is required after this preflight succeeds.
-
-Codex supervisor calls in subscription mode run from a temporary working directory that has no `.codex/hooks.json`, with `--ignore-user-config` enabled. Startup self-test must prove the headless supervisor call does not trigger project/user hooks.
+Codex supervisor calls in subscription mode run from a temporary working directory that has no `.codex/hooks.json`, with `--ignore-user-config` enabled. They default to `--sandbox danger-full-access` because they are structured-output decision calls, not supervised workspace tool execution, and this avoids Codex Linux sandbox initialization failures in the supervisor sidecar path. Startup self-test must prove the headless supervisor call does not trigger project/user hooks.
 
 ## Process lifecycle
 
@@ -472,7 +468,7 @@ Kill escalation:
 3. Send `SIGTERM` to process group.
 4. Wait configured timeout, default 5 seconds.
 5. Send `SIGKILL` to process group.
-6. Close pty/pipe descriptors.
+6. Close pipe descriptors.
 7. Drain remaining stdout/stderr.
 8. Reap child processes.
 
@@ -530,7 +526,7 @@ Key modules:
 - `state.py`: locked state file operations and atomic writes.
 - `timing.py`: hook budget computation and timeout fallbacks.
 - `version.py`: capability probes and startup self-tests.
-- `adapters/codex.py`: hook merge/restore/trust preflight.
+- `adapters/codex.py`: hook merge/restore and hook-fire self-test.
 - `adapters/claude.py`: session settings and hook schema mapping.
 
 Dependencies:
@@ -539,7 +535,6 @@ Dependencies:
 - `click` or `typer`
 - `httpx`
 - `filelock` or equivalent
-- `pexpect` or `ptyprocess` only for fallback lifecycle handling
 - `openai` and/or direct HTTP for OpenRouter-compatible calls
 
 ## Implementation sequence
@@ -552,7 +547,7 @@ Dependencies:
 6. LLM drivers: headless Claude, headless Codex, OpenRouter API, schema enforcement.
 7. Fake agent harness: concurrent hooks, timeouts, pending intervention, kill-restart.
 8. Claude adapter: settings file, hooks, isolation self-test.
-9. Codex adapter: hook install/cleanup, trust preflight, hook-fire self-test, isolation self-test.
+9. Codex adapter: hook install/cleanup, hook trust sync, hook trust bypass flag, hook-fire self-test, isolation self-test.
 10. Process lifecycle: launch, kill escalation, generation restart.
 11. Wrapper event loop: wake-up routing, state assembly, decision application.
 12. CLI UX: plan selection, resume/start-over, final report.
@@ -586,7 +581,7 @@ Integration smoke tests:
 - Claude hook fire.
 - Claude supervisor-call isolation.
 - Claude additionalContext delivery.
-- Codex hook trust preflight.
+- Codex hook trust bypass flag and app-server startup support.
 - Codex hook fire.
 - Codex hook cleanup after normal exit.
 - Codex hook cleanup after simulated crash.
@@ -599,7 +594,7 @@ Integration smoke tests:
 The MVP is implementation-complete when:
 
 - A user can run a supervised Claude Code task without approving actions mid-run.
-- A user can run a supervised Codex task after one-time hook trust preflight without approving actions mid-run.
+- A user can run a supervised Codex task with Supervisor-owned hooks loaded through app-server trust sync plus `--dangerously-bypass-hook-trust` without approving actions mid-run.
 - Fast-path allow/deny works without LLM calls for obvious cases.
 - Gray-zone permission requests receive LLM decisions under hook deadlines.
 - Timer wake-ups do not call the LLM when state is unchanged.

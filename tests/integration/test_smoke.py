@@ -26,9 +26,17 @@ def test_claude_additional_context_delivery_smoke() -> None:
 
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI not installed")
-def test_codex_hook_trust_preflight_smoke() -> None:
-    completed = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10)
+def test_codex_hook_trust_bypass_flag_smoke() -> None:
+    completed = subprocess.run(["codex", "exec", "--help"], capture_output=True, text=True, timeout=10)
     assert completed.returncode == 0
+    assert "--dangerously-bypass-hook-trust" in completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI not installed")
+def test_codex_app_server_listen_smoke() -> None:
+    completed = subprocess.run(["codex", "app-server", "--help"], capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0
+    assert "--listen" in completed.stdout + completed.stderr
 
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI not installed")
@@ -58,4 +66,3 @@ def test_codex_json_observability_smoke() -> None:
 @pytest.mark.skipif(not os.environ.get("OPENROUTER_API_KEY"), reason="OPENROUTER_API_KEY not set")
 def test_openrouter_structured_output_smoke() -> None:
     assert os.environ["OPENROUTER_API_KEY"]
-

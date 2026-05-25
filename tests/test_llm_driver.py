@@ -53,8 +53,16 @@ async def test_codex_driver_writes_real_output_schema_file(monkeypatch: pytest.M
     decision = await driver.decide("decide", timeout_seconds=1)
 
     args = captured["args"]
-    assert args[:5] == ("codex", "exec", "--skip-git-repo-check", "--ignore-user-config", "--output-schema")
-    assert Path(args[5]) == tmp_path / "supervisor-output-schema.json"
+    assert args[:7] == (
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "danger-full-access",
+        "--ignore-user-config",
+        "--output-schema",
+    )
+    assert Path(args[7]) == tmp_path / "supervisor-output-schema.json"
     assert args[-1] == "-"
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert decision.decision_type == DecisionType.ALLOW
