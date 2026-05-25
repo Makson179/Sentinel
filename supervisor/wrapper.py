@@ -328,8 +328,7 @@ class SupervisorWrapper:
         )
         self.allow_rules.reset_generation(new_generation)
         self.store.write_text_locked("PENDING_INTERVENTION.md", "")
-        if self.supervisee_command:
-            self.launch_supervisee(restart=True)
+        self.launch_supervisee(restart=True)
 
     def launch_supervisee(self, restart: bool = False) -> None:
         command = self.supervisee_command or self.default_supervisee_command(restart=restart)

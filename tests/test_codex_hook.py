@@ -73,3 +73,23 @@ def test_codex_hook_allow_writes_empty_stdout_and_trace(tmp_path, monkeypatch) -
     assert stdout.getvalue() == ""
     trace_entries = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert [entry["stage"] for entry in trace_entries] == ["received", "ipc-response", "stdout-empty"]
+
+
+def test_codex_hook_ipc_setup_failure_denies_permission_and_traces_error(tmp_path, monkeypatch) -> None:
+    trace_path = tmp_path / "hook-trace.log"
+    monkeypatch.delenv("SUPERVISOR_IPC_SOCKET", raising=False)
+    monkeypatch.delenv("SUPERVISOR_IPC_TOKEN", raising=False)
+    monkeypatch.setenv("SUPERVISOR_HOOK_TRACE_PATH", str(trace_path))
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"hook_event_name":"PreToolUse","event_id":"event-1"}'))
+    stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert run_hook(format_codex_response) == 0
+
+    output = json.loads(stdout.getvalue())
+    hook_output = output["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == "PreToolUse"
+    assert hook_output["permissionDecision"] == "deny"
+    assert "SUPERVISOR_IPC_SOCKET" in hook_output["permissionDecisionReason"]
+    trace_entries = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert [entry["stage"] for entry in trace_entries] == ["received", "error", "stdout-json"]

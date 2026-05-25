@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import socket
 from pathlib import Path
 
 import pytest
 
 from supervisor.llm_driver import LLMDriver, LLMDriverError, ParseFailure
-from supervisor.schemas import DecisionType, EventType, HealthDelta, HookEvent, IPCRequest, LLMDecision, RunConfig
+from supervisor.schemas import DecisionType, EventType, HealthDelta, HookEvent, IPCRequest, LLMDecision, PermissionDecisionKind, RunConfig
 from supervisor.health import patch_health
-from supervisor.state import HANDOFF
+from supervisor.state import DECISIONS, HANDOFF, LAST_ACTION, PROGRESS
 from supervisor.wrapper import SupervisorWrapper
 from tests.fake_agent.driver import FakeAgentHarness
 
@@ -88,6 +90,30 @@ def test_codex_launch_routes_process_output_to_logs(workspace: Path, monkeypatch
     assert stdout_path.read_text(encoding="utf-8") == ""
     assert stderr_path.read_text(encoding="utf-8") == ""
     assert trace_path.read_text(encoding="utf-8") == ""
+
+
+def test_codex_restart_uses_default_handoff_command(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = make_codex_wrapper(workspace)
+    captured: dict[str, object] = {}
+
+    def fake_launch_process(command, cwd, env=None, stdout_path=None, stderr_path=None):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        captured["env"] = env
+        captured["stdout_path"] = stdout_path
+        captured["stderr_path"] = stderr_path
+        return object()
+
+    monkeypatch.setattr("supervisor.wrapper.launch_process", fake_launch_process)
+
+    wrapper.apply_kill_restart("handoff for next generation")
+
+    command = captured["command"]
+    assert command[:6] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write"]
+    assert ".supervisor/DECISIONS.md" in command[-1]
+    assert ".supervisor/HANDOFF.md" in command[-1]
+    assert captured["stdout_path"] == wrapper.store.path("codex-stdout.log")
+    assert captured["stderr_path"] == wrapper.store.path("codex-stderr.log")
 
 
 @pytest.mark.asyncio
@@ -183,6 +209,56 @@ async def test_fake_harness_models_codex_exec_without_permission_fallback(worksp
 
 
 @pytest.mark.asyncio
+async def test_allow_class_creates_session_rule_for_later_fast_path(workspace: Path) -> None:
+    command = "python -c 'open(\"hello.py\", \"w\").write(\"hi\")'"
+    wrapper = make_wrapper(
+        workspace,
+        StubDriver(
+            [
+                LLMDecision(
+                    decision_type=DecisionType.ALLOW,
+                    permission_kind=PermissionDecisionKind.ALLOW_CLASS,
+                    reason="safe repeated workspace write",
+                    allow_rule={"tool_name": "Bash", "command": command},
+                )
+            ]
+        ),
+    )
+    event = HookEvent(event_type=EventType.PRE_TOOL_USE, payload={"tool_name": "Bash", "command": command}, generation=0)
+
+    first = await wrapper.handle_event(event, 1)
+    second = await wrapper.handle_event(event, 2)
+
+    assert first.decision_type == DecisionType.ALLOW
+    assert second.decision_type == DecisionType.ALLOW
+    assert second.payload["reason"] == "session allow rule matched"
+    assert wrapper.llm_driver.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_decision_updates_persistent_state(workspace: Path) -> None:
+    wrapper = make_wrapper(workspace, StubDriver())
+    decision = LLMDecision(
+        decision_type=DecisionType.NOOP,
+        reason="state updated",
+        decision_entry="Keep API compatibility.",
+        completed_step="Added wrapper tests.",
+        last_action="Ran pytest.",
+        risk_signals=["bypass_after_denial"],
+    )
+
+    response = wrapper.apply_llm_decision(HookEvent(event_type=EventType.TIMER, generation=0), decision, 7)
+
+    assert response.decision_type == DecisionType.NOOP
+    assert "Keep API compatibility." in wrapper.store.read_text(DECISIONS)
+    assert "Added wrapper tests." in wrapper.store.read_text(PROGRESS)
+    assert wrapper.store.read_text(LAST_ACTION) == "Ran pytest.\n"
+    health = wrapper.store.get_health()
+    assert health.last_progress_sequence == 7
+    assert health.risk_signals == ["bypass_after_denial"]
+
+
+@pytest.mark.asyncio
 async def test_observation_hooks_noop_without_llm_when_no_pending_intervention(workspace: Path) -> None:
     wrapper = make_wrapper(workspace, StubDriver([LLMDecision(decision_type=DecisionType.INTERVENE, reason="not needed")]))
 
@@ -205,8 +281,10 @@ async def test_timer_pending_intervention_and_later_delivery(workspace: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_kill_restart_generation_reset(workspace: Path) -> None:
+async def test_kill_restart_generation_reset(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper = make_wrapper(workspace, StubDriver())
+    relaunches: list[bool] = []
+    monkeypatch.setattr(wrapper, "launch_supervisee", lambda restart=False: relaunches.append(restart))
     patch_health(wrapper.store, HealthDelta(generation=0, interventions=2, denied_requests=1))
     wrapper.apply_kill_restart("handoff")
     health = wrapper.store.get_health()
@@ -214,6 +292,7 @@ async def test_kill_restart_generation_reset(workspace: Path) -> None:
     assert health.restart_count == 1
     assert health.denied_requests == 0
     assert wrapper.store.path(HANDOFF).read_text(encoding="utf-8") == "handoff"
+    assert relaunches == [True]
 
 
 @pytest.mark.asyncio
@@ -247,6 +326,38 @@ async def test_ipc_parallel_hook_callbacks(workspace: Path) -> None:
         await wrapper.stop_ipc()
     assert len({response.sequence for response in responses}) == 10
     assert all(response.decision_type == DecisionType.ALLOW for response in responses)
+
+
+def send_raw_ipc(socket_path: Path, payload: bytes) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(10.0)
+        client.connect(str(socket_path))
+        client.sendall(payload + b"\n")
+        chunks: list[bytes] = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+    return json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_ipc_malformed_json_denies_without_crashing_server(workspace: Path) -> None:
+    wrapper = make_wrapper(workspace, StubDriver())
+    await wrapper.start_ipc()
+    try:
+        response = await asyncio.to_thread(send_raw_ipc, wrapper.socket_path, b"{bad")
+        harness = FakeAgentHarness(wrapper.socket_path, wrapper.auth_token)
+        followup = await harness.send_hook(EventType.PERMISSION_REQUEST, {"tool_name": "Read", "path": "TASK.md"}, "after-bad-json")
+    finally:
+        await wrapper.stop_ipc()
+
+    assert response["decision_type"] == DecisionType.DENY.value
+    assert "IPC failure" in response["payload"]["reason"]
+    assert followup.decision_type == DecisionType.ALLOW
 
 
 @pytest.mark.asyncio
