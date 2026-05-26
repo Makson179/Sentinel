@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from supervisor.schemas.models import LLMDecision, openai_strict_json_schema_for_decision
+from supervisor.schemas.models import LLMDecision, SupervisorDecision, openai_strict_json_schema_for_decision, openai_strict_json_schema_for_supervisor_decision
 
 
 def _walk_schema(node: Any) -> Iterator[dict[str, Any]]:
@@ -44,3 +44,29 @@ def test_llm_decision_allow_rule_accepts_structured_payload() -> None:
 
     assert decision.allow_rule is not None
     assert decision.allow_rule.model_dump(exclude_none=True) == {"tool_name": "Bash", "command": "pwd"}
+
+
+def test_supervisor_decision_schema_is_strict() -> None:
+    schema = openai_strict_json_schema_for_supervisor_decision()
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_supervisor_decision_accepts_expected_shape() -> None:
+    decision = SupervisorDecision.model_validate(
+        {
+            "decision": "approve",
+            "approval_decision": "accept",
+            "execpolicy_amendment": None,
+            "reason": "ok",
+            "message_to_coder": None,
+            "persistent_decision": None,
+            "progress_update": None,
+            "health_delta": None,
+            "display_message": None,
+        }
+    )
+
+    assert decision.decision == "approve"

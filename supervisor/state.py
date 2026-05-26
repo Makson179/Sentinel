@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterator, TypeVar
 import fcntl
 from pydantic import BaseModel
 
-from supervisor.schemas import DecisionLogEntry, HealthState, PendingIntervention, RunConfig
+from supervisor.schemas import AppEvent, DecisionLogEntry, FinalReport, HealthState, PendingIntervention, RunConfig, SentinelConfig
 
 T = TypeVar("T")
 
@@ -22,7 +22,9 @@ LAST_ACTION = "LAST_ACTION.md"
 PENDING = "PENDING_INTERVENTION.md"
 HEALTH = "HEALTH.json"
 HANDOFF = "HANDOFF.md"
+FINAL_REPORT = "FINAL_REPORT.md"
 LOG = "log.jsonl"
+EVENTS = "events.jsonl"
 AGENT_SETTINGS = "agent-settings.json"
 
 
@@ -125,7 +127,10 @@ class StateStore:
             DECISIONS: "# Decisions\n\n",
             LAST_ACTION: "",
             PENDING: "",
+            HANDOFF: "",
+            FINAL_REPORT: "",
             LOG: "",
+            EVENTS: "",
         }
         for name, value in files.items():
             path = self.path(name)
@@ -188,3 +193,77 @@ class StateStore:
     def write_handoff(self, content: str) -> None:
         self.write_text_locked(HANDOFF, content)
 
+    def initialize_sentinel(self, config: SentinelConfig, overwrite: bool = False) -> None:
+        files = {
+            CONFIG: config,
+            HEALTH: HealthState(generation=config.generation, restart_count=config.restart_count),
+            PROGRESS: "# Progress\n\n- Current step: not started\n- Completed steps: none\n- Known issues: none\n",
+            DECISIONS: "# Decisions\n\n",
+            LAST_ACTION: "",
+            HANDOFF: "",
+            FINAL_REPORT: "",
+            LOG: "",
+            EVENTS: "",
+        }
+        for name, value in files.items():
+            path = self.path(name)
+            if path.exists() and not overwrite:
+                continue
+            if isinstance(value, BaseModel):
+                self.atomic_write_json(path, value)
+            else:
+                self.atomic_write_text(path, value)
+
+    def get_sentinel_config(self) -> SentinelConfig:
+        return SentinelConfig.model_validate(self.read_json(CONFIG, {}))
+
+    def update_sentinel_config(self, patcher: Callable[[SentinelConfig], SentinelConfig]) -> SentinelConfig:
+        with self.locked(CONFIG):
+            config = self.get_sentinel_config()
+            updated = patcher(config)
+            self.atomic_write_json(self.path(CONFIG), updated)
+            return updated
+
+    def append_event(self, event: AppEvent) -> None:
+        self.append_text_locked(EVENTS, event.model_dump_json() + "\n")
+
+    def append_raw_log(self, entry: dict[str, Any]) -> None:
+        self.append_text_locked(LOG, json.dumps(entry, default=str, sort_keys=True) + "\n")
+
+    def read_recent_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        raw = self.read_text(EVENTS, "")
+        lines = [line for line in raw.splitlines() if line.strip()]
+        selected = lines[-limit:]
+        events: list[dict[str, Any]] = []
+        for line in selected:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
+
+    def write_final_report(self, report: FinalReport | str) -> None:
+        if isinstance(report, FinalReport):
+            status = report.status.value if hasattr(report.status, "value") else str(report.status)
+            lines = [
+                "# Final Report",
+                "",
+                f"- Task: {report.task_path}",
+                f"- Status: {status}",
+                f"- Result: {report.result}",
+                f"- Restarts: {report.restarts}",
+                f"- Interventions: {report.interventions}",
+            ]
+            if report.files_changed:
+                lines.extend(["", "## Files Changed", *[f"- {path}" for path in report.files_changed]])
+            if report.validations:
+                lines.extend(["", "## Validations", *[f"- {item}" for item in report.validations]])
+            if report.denied_actions:
+                lines.extend(["", "## Denied Actions", *[f"- {item}" for item in report.denied_actions]])
+            if report.remaining_risks:
+                lines.extend(["", "## Remaining Risks", *[f"- {item}" for item in report.remaining_risks]])
+            if report.diff_summary:
+                lines.extend(["", "## Diff Summary", "", "```text", report.diff_summary.strip(), "```"])
+            self.write_text_locked(FINAL_REPORT, "\n".join(lines).rstrip() + "\n")
+        else:
+            self.write_text_locked(FINAL_REPORT, report)
