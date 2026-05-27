@@ -57,6 +57,9 @@ supervisor
 When `--task` is omitted, Sentinel scans for markdown task files and shows a
 selector if there is more than one candidate.
 
+Use `--clean` in a disposable task directory to remove every file and
+directory except the selected task file before Sentinel starts.
+
 Task selection rules:
 
 - explicit `--task` must exist and end in `.md`;

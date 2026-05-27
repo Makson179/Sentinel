@@ -16,19 +16,41 @@ from supervisor.wrapper import SupervisorWrapper
 @click.option("--task", "task_path", type=click.Path(exists=False, dir_okay=False, path_type=Path))
 @click.option("--model", default=None, help="Model to use for coder and supervisor turns.")
 @click.option("--start-over", is_flag=True, help="Reinitialize .supervisor state files.")
+@click.option(
+    "--clean",
+    is_flag=True,
+    help="Delete everything in the current folder except the selected task file before starting.",
+)
 @click.pass_context
-def cli(ctx: click.Context, task_path: Path | None, model: str | None, start_over: bool) -> None:
+def cli(
+    ctx: click.Context,
+    task_path: Path | None,
+    model: str | None,
+    start_over: bool,
+    clean: bool,
+) -> None:
     if ctx.invoked_subcommand is None:
         try:
-            asyncio.run(_run_sentinel(task_path, model, start_over))
+            asyncio.run(_run_sentinel(task_path, model, start_over, clean))
         except TaskSelectionError as exc:
             raise click.ClickException(str(exc)) from exc
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
 
 
-async def _run_sentinel(task_path: Path | None, model: str | None, start_over: bool) -> None:
-    controller = SentinelController(Path.cwd(), task_path=task_path, model=model, overwrite_state=start_over)
+async def _run_sentinel(
+    task_path: Path | None,
+    model: str | None,
+    start_over: bool,
+    clean: bool,
+) -> None:
+    controller = SentinelController(
+        Path.cwd(),
+        task_path=task_path,
+        model=model,
+        overwrite_state=start_over,
+        clean_workspace=clean,
+    )
     await controller.run()
 
 

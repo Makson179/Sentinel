@@ -29,6 +29,7 @@ from supervisor.state import DECISIONS, HANDOFF, LAST_ACTION, PROGRESS, StateSto
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.task_select import resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
+from supervisor.workspace_clean import clean_workspace_except_task
 
 
 @dataclass(frozen=True)
@@ -48,9 +49,12 @@ class SentinelController:
         tui: TerminalTUI | None = None,
         model: str | None = None,
         overwrite_state: bool = False,
+        clean_workspace: bool = False,
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
+        if clean_workspace:
+            clean_workspace_except_task(self.project_root, self.task_path)
         self.store = StateStore(self.project_root)
         self.model = model
         self.overwrite_state = overwrite_state
