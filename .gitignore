@@ -2,5 +2,6 @@
 __pycache__/
 .pytest_cache/
 .test-runtime/
+TESTS/
 *.py[cod]
 *.egg-info/

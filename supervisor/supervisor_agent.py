@@ -31,21 +31,27 @@ class StatelessSupervisorAgent:
         *,
         model: str | None = None,
         timeout_seconds: float = 180.0,
+        bench_recorder: Any | None = None,
     ):
         self.client = client
         self.store = store
         self.task_path = task_path.resolve()
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.bench_recorder = bench_recorder
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
         thread_id: str | None = None
+        supervisor_call_id = self._bench_supervisor_context(packet)
+        self._bench_record("supervisor_call_started", supervisor_call_id=supervisor_call_id)
         try:
             thread_response = await self.client.thread_start(self._thread_params())
             thread = thread_response.get("thread", {})
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str):
                 raise SupervisorAgentError("supervisor thread/start did not return thread id")
+            self._bench_register_supervisor_thread(supervisor_call_id, thread_id)
+            self._bench_record_token_usage(thread_response, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
             prompt = build_stateless_supervisor_prompt(packet)
             turn_response = await self.client.turn_start(
                 {
@@ -58,6 +64,7 @@ class StatelessSupervisorAgent:
                 }
             )
             turn = turn_response.get("turn", {})
+            self._bench_record_token_usage(turn_response, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
             turn_id = turn.get("id")
             if not isinstance(turn_id, str):
                 raise SupervisorAgentError("supervisor turn/start did not return turn id")
@@ -70,9 +77,11 @@ class StatelessSupervisorAgent:
                     timeout=self.timeout_seconds,
                 )
                 turn = completed.params.get("turn", {})
+                self._bench_record_token_usage(completed.raw, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
             text = last_agent_message_text(turn)
             if text is None:
                 turns = await self.client.thread_turns_list(thread_id, limit=1, items_view="full")
+                self._bench_record_token_usage(turns, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
                 data = turns.get("data", [])
                 if data and isinstance(data[0], dict):
                     text = last_agent_message_text(data[0])
@@ -85,6 +94,11 @@ class StatelessSupervisorAgent:
         except (ValidationError, json.JSONDecodeError) as exc:
             raise SupervisorAgentError(f"invalid supervisor decision: {exc}") from exc
         finally:
+            self._bench_record(
+                "supervisor_call_finished",
+                supervisor_call_id=supervisor_call_id,
+                thread_id=thread_id,
+            )
             if thread_id:
                 try:
                     await self.client.thread_archive(thread_id)
@@ -148,6 +162,49 @@ class StatelessSupervisorAgent:
         if self.model:
             params["model"] = self.model
         return params
+
+    def _bench_supervisor_context(self, packet: SupervisorWakePacket) -> str | None:
+        if self.bench_recorder is None:
+            return None
+        try:
+            return self.bench_recorder.record_supervisor_context(packet)
+        except Exception:
+            return None
+
+    def _bench_record(self, event: str, **payload: Any) -> None:
+        if self.bench_recorder is None:
+            return
+        try:
+            self.bench_recorder.record(event, **payload)
+        except Exception:
+            pass
+
+    def _bench_register_supervisor_thread(self, supervisor_call_id: str | None, thread_id: str) -> None:
+        if self.bench_recorder is None or supervisor_call_id is None:
+            return
+        try:
+            self.bench_recorder.register_supervisor_thread(supervisor_call_id, thread_id)
+        except Exception:
+            pass
+
+    def _bench_record_token_usage(
+        self,
+        usage_source: Any,
+        *,
+        thread_id: str | None,
+        supervisor_call_id: str | None,
+    ) -> None:
+        if self.bench_recorder is None or supervisor_call_id is None:
+            return
+        try:
+            self.bench_recorder.record_token_usage(
+                role="supervisor",
+                usage_source=usage_source,
+                thread_id=thread_id,
+                supervisor_call_id=supervisor_call_id,
+            )
+        except Exception:
+            pass
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

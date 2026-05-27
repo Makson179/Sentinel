@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,8 @@ class SentinelController:
         model: str | None = None,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
+        bench_recorder: Any | None = None,
+        use_git_diff: bool = True,
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
@@ -58,6 +61,8 @@ class SentinelController:
         self.store = StateStore(self.project_root)
         self.model = model
         self.overwrite_state = overwrite_state
+        self.bench_recorder = bench_recorder
+        self.use_git_diff = use_git_diff
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
             cwd=self.project_root,
@@ -78,21 +83,34 @@ class SentinelController:
     async def run(self) -> None:
         self.initialize_state()
         await self.client.start()
+        self._bench_record("appserver_started")
         await self.client.initialize()
+        self._bench_record("appserver_initialized")
         await self.tui.start()
         self.running = True
         try:
             await self.preflight()
-            self.supervisor = StatelessSupervisorAgent(self.client, self.store, self.task_path, model=self.model)
+            self.supervisor = StatelessSupervisorAgent(
+                self.client,
+                self.store,
+                self.task_path,
+                model=self.model,
+                bench_recorder=self.bench_recorder,
+            )
             self.approvals = ApprovalManager(self.project_root, supervisor=self.supervisor)
             self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
             await self.coder.start_thread()
+            if self.bench_recorder is not None and self.coder.thread_id:
+                self.bench_recorder.set_coder_thread(self.coder.thread_id)
+            self._bench_record("coder_thread_started", thread_id=self.coder.thread_id)
             await self.coder.start_initial_turn()
+            self._bench_record("coder_turn_started", thread_id=self.coder.thread_id, turn_id=self.coder.active_turn_id)
             self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
             self.tui.status("supervised coder started")
             await self.event_loop()
         finally:
             self.running = False
+            await self._stop_supervisor_task()
             await self.tui.stop()
             await self.client.stop()
 
@@ -201,6 +219,14 @@ class SentinelController:
 
     async def handle_server_request(self, message: AppServerMessage) -> None:
         context = normalize_approval_request(message)
+        self._bench_record(
+            "approval_requested",
+            approval_request_id=context.server_request_id,
+            method=context.server_request_method,
+            thread_id=context.thread_id,
+            turn_id=context.turn_id,
+            item_id=context.item_id,
+        )
         self.pending_approvals[context.server_request_id] = context
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
@@ -219,6 +245,12 @@ class SentinelController:
         else:
             resolution = await self.approvals.decide(context)
             response = self.approvals.response_payload(context, resolution)
+        self._bench_record(
+            "approval_decided",
+            approval_request_id=context.server_request_id,
+            decision=resolution.decision,
+            from_supervisor=resolution.from_supervisor,
+        )
         await self.client.respond(context.server_request_id, response)
         self.tui.render("APPROVAL" if str(resolution.decision).startswith("accept") else "DENIED", f"{resolution.decision}: {resolution.reason}")
         if resolution.persistent_decision:
@@ -227,6 +259,8 @@ class SentinelController:
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
 
     async def handle_notification(self, message: AppServerMessage) -> None:
+        if self.bench_recorder is not None:
+            self.bench_recorder.record_message_token_usage(message)
         params = message.params
         method = message.method or "notification"
         thread_id = params.get("threadId")
@@ -237,6 +271,10 @@ class SentinelController:
         self._append_event(AppEventSource.APP_SERVER, method, thread_id=thread_id, turn_id=turn_id, item_id=item_id)
 
         cfg = self.store.get_sentinel_config()
+        if thread_id == cfg.coder_thread_id and method in {"item/started", "item/updated"}:
+            item = params.get("item")
+            if _is_completed_action(item):
+                self._bench_first_coder_action(thread_id=thread_id, turn_id=turn_id, item_id=item_id)
         if method == "serverRequest/resolved":
             request_id = params.get("requestId")
             self.pending_approvals.pop(request_id, None)
@@ -257,6 +295,14 @@ class SentinelController:
                 self.tui.render("CODER", item["text"].strip())
                 return
             if _is_completed_action(item):
+                self._bench_first_coder_action(thread_id=thread_id, turn_id=turn_id, item_id=item_id)
+                self._bench_record(
+                    "coder_action_completed",
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    summary=summary,
+                )
                 self.store.write_text_locked(LAST_ACTION, summary + "\n")
                 self.tui.render("TOOL", summary)
                 self._schedule_supervisor_check(f"Coder completed action: {summary}", triggering_item_id=item_id)
@@ -282,6 +328,8 @@ class SentinelController:
         if cfg.restart_count >= cfg.max_restarts:
             await self.finalize("restart cap reached", status=SentinelStatus.STUCK)
             return
+        restart_id = self.bench_recorder.next_restart_id() if self.bench_recorder is not None else None
+        self._bench_record("restart_started", restart_id=restart_id, reason=reason)
         self.store.update_sentinel_config(lambda current: current.model_copy(update={"status": SentinelStatus.RESTARTING}))
         if self.coder:
             try:
@@ -331,7 +379,12 @@ class SentinelController:
         )
         self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
         await self.coder.start_thread()
+        if self.bench_recorder is not None and self.coder.thread_id:
+            self.bench_recorder.set_coder_thread(self.coder.thread_id)
+        self._bench_record("coder_thread_started", thread_id=self.coder.thread_id)
         await self.coder.start_restart_turn()
+        self._bench_record("coder_turn_started", thread_id=self.coder.thread_id, turn_id=self.coder.active_turn_id)
+        self._bench_record("restart_finished", restart_id=restart_id, reason=reason)
         self.tui.render("SYSTEM", "restart complete")
 
     async def finalize(self, result: str, *, status: SentinelStatus = SentinelStatus.COMPLETE) -> None:
@@ -354,7 +407,7 @@ class SentinelController:
         self.running = False
 
     def _schedule_supervisor_check(self, summary: str, *, triggering_item_id: str | None = None) -> None:
-        if self.paused or self.supervisor is None:
+        if not self.running or self.paused or self.supervisor is None:
             return
         if self._supervisor_task and not self._supervisor_task.done():
             self._supervisor_dirty = True
@@ -396,6 +449,12 @@ class SentinelController:
             return
         if decision.wake_sequence is not None and decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
             return
+        self._bench_record(
+            "supervisor_decision_applied",
+            decision=decision.decision.value,
+            wake_sequence=decision.wake_sequence,
+            generation=decision.generation,
+        )
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence or current.last_applied_supervisor_sequence})
         )
@@ -445,7 +504,21 @@ class SentinelController:
             self.pending_approvals.pop(request_id, None)
         self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"pending_server_request_ids": []}))
 
+    async def _stop_supervisor_task(self) -> None:
+        task = self._supervisor_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
     async def diff_summary(self) -> str:
+        if not self.use_git_diff:
+            return "benchmark mode: git diff summary disabled"
         commands = [["git", "status", "--short"], ["git", "diff", "--stat"], ["git", "diff", "--name-only"]]
         parts: list[str] = []
         for command in commands:
@@ -496,34 +569,65 @@ class SentinelController:
         self.store.append_event(event)
         self.store.update_sentinel_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
 
+    def _bench_record(self, event: str, **payload: Any) -> None:
+        if self.bench_recorder is None:
+            return
+        try:
+            self.bench_recorder.record(event, **payload)
+        except Exception:
+            pass
+
+    def _bench_first_coder_action(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+    ) -> None:
+        if self.bench_recorder is None:
+            return
+        try:
+            self.bench_recorder.record_first_coder_action_started(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+            )
+        except Exception:
+            pass
+
     def _generate_schema_hash(self) -> str:
         if shutil.which("codex") is None:
             raise RuntimeError("codex executable not found")
-        out_dir = self.store.state_dir / "appserver-schema"
-        if out_dir.exists():
-            shutil.rmtree(out_dir)
-        out_dir.mkdir(parents=True)
-        completed = subprocess.run(
-            ["codex", "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError((completed.stdout + completed.stderr).strip() or "app-server schema generation failed")
-        required = ["ClientRequest.json", "ServerRequest.json", "TurnStartParams.json", "CommandExecutionRequestApprovalParams.json"]
-        for rel in required:
-            if not _schema_file_exists(out_dir, rel):
-                raise RuntimeError(f"app-server schema missing required file: {rel}")
-        digest = hashlib.sha256()
-        for path in sorted(out_dir.rglob("*.json")):
-            digest.update(str(path.relative_to(out_dir)).encode("utf-8"))
-            digest.update(path.read_bytes())
-        return digest.hexdigest()
+        with tempfile.TemporaryDirectory(prefix="sentinel-appserver-schema-") as tmp_dir:
+            out_dir = Path(tmp_dir)
+            completed = subprocess.run(
+                ["codex", "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError((completed.stdout + completed.stderr).strip() or "app-server schema generation failed")
+            required = ["ClientRequest.json", "ServerRequest.json", "TurnStartParams.json", "CommandExecutionRequestApprovalParams.json"]
+            for rel in required:
+                if not _schema_file_exists(out_dir, rel):
+                    raise RuntimeError(f"app-server schema missing required file: {rel}")
+            digest = hashlib.sha256()
+            for path in sorted(out_dir.rglob("*.json")):
+                digest.update(str(path.relative_to(out_dir)).encode("utf-8"))
+                digest.update(path.read_bytes())
+            return digest.hexdigest()
 
     async def _structured_output_self_test(self) -> None:
-        agent = StatelessSupervisorAgent(self.client, self.store, self.task_path, model=self.model, timeout_seconds=45)
+        agent = StatelessSupervisorAgent(
+            self.client,
+            self.store,
+            self.task_path,
+            model=self.model,
+            timeout_seconds=45,
+            bench_recorder=self.bench_recorder,
+        )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
             wake_sequence=1,

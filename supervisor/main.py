@@ -16,6 +16,7 @@ from supervisor.wrapper import SupervisorWrapper
 @click.option("--task", "task_path", type=click.Path(exists=False, dir_okay=False, path_type=Path))
 @click.option("--model", default=None, help="Model to use for coder and supervisor turns.")
 @click.option("--start-over", is_flag=True, help="Reinitialize .supervisor state files.")
+@click.option("--bench", is_flag=True, help="Run the TESTS benchmark suite.")
 @click.option(
     "--clean",
     is_flag=True,
@@ -27,9 +28,24 @@ def cli(
     task_path: Path | None,
     model: str | None,
     start_over: bool,
+    bench: bool,
     clean: bool,
 ) -> None:
     if ctx.invoked_subcommand is None:
+        if bench:
+            if task_path is not None:
+                raise click.ClickException("--bench cannot be combined with --task")
+            if clean:
+                raise click.ClickException("--bench cannot be combined with --clean")
+            try:
+                result = asyncio.run(_run_bench(model))
+            except RuntimeError as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.echo(
+                f"benchmark complete: {result['completed_count']}/{result['test_count']} tests, "
+                f"success_rate={result['means'].get('success')}"
+            )
+            return
         try:
             asyncio.run(_run_sentinel(task_path, model, start_over, clean))
         except TaskSelectionError as exc:
@@ -52,6 +68,12 @@ async def _run_sentinel(
         clean_workspace=clean,
     )
     await controller.run()
+
+
+async def _run_bench(model: str | None) -> dict:
+    from supervisor.bench import run_benchmark
+
+    return await run_benchmark(Path.cwd(), model=model)
 
 
 @cli.command()

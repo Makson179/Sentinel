@@ -67,6 +67,63 @@ Task selection rules:
   `build`, `target`, `.venv`, and `venv`;
 - `TASK.md`, `task.md`, `PLAN.md`, `plan.md`, and `TODO.md` rank first.
 
+## Benchmark Mode
+
+Sentinel can run a local benchmark suite:
+
+```bash
+supervisor --bench
+```
+
+Benchmark prompts live in the source-controlled file:
+
+```text
+tests/TEST_PROMPTS.json
+```
+
+The generated benchmark workspaces live under `TESTS/`. That directory is
+ignored by git because Sentinel recreates and mutates it during benchmark runs.
+
+`TEST_PROMPTS.json` is a JSON object keyed by numeric test id. Each value can
+be either a string or a list of lines:
+
+```json
+{
+  "1": [
+    "# Task",
+    "",
+    "Create hello.py with one line: hello sentinel"
+  ],
+  "2": "# Task\n\nCreate math_utils.py with add and subtract functions.\n"
+}
+```
+
+When `supervisor --bench` starts, Sentinel:
+
+1. creates `TESTS/` if it is missing;
+2. creates `tests/TEST_PROMPTS.json` if it is missing, then stops because the
+   empty file has no prompts yet;
+3. creates every `TESTS/<n>/` directory referenced by prompt keys;
+4. checks that every existing numeric `TESTS/<n>/` directory has a prompt;
+5. clears each benchmark directory, preserving only `TASK.md`;
+6. writes every `TESTS/<n>/TASK.md` from `tests/TEST_PROMPTS.json` before the
+   first benchmark case starts;
+7. runs Sentinel once inside each numeric test directory in numeric order.
+
+Each case runs with `TESTS/<n>/` as the project root and `TASK.md` as the
+selected task. Benchmark mode disables git diff summarization for the coder
+workspace, records extra performance telemetry, and writes results to:
+
+```text
+TESTS/<n>/result.json
+TESTS/<n>/.supervisor/perf.jsonl
+TESTS/result.json
+```
+
+`TESTS/result.json` contains the aggregate run id, success rate, counts, and
+mean timing/token metrics. Per-test `result.json` files contain status,
+success, validation, error, and metric details for that case.
+
 ## What You See
 
 The terminal stream is chronological and lane-based:
