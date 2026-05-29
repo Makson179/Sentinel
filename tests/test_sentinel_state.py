@@ -10,6 +10,7 @@ from supervisor.appserver import AppServerMessage
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
+    ApprovalDecisionKind,
     CoderMessage,
     FinalReport,
     PriorIntervention,
@@ -321,6 +322,70 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
     )
 
     assert controller.client.responses == [(53, {"decision": "accept"})]
+    assert controller.coder.messages == []
+
+
+async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        overwrite=True,
+    )
+    amendment = ["/bin/zsh", "-lc", "printf 'hello sentinel\\n' > hello.txt"]
+    offered_decision = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}}
+
+    class FakeSupervisor:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.APPROVE,
+                approval_decision=ApprovalDecisionKind.ACCEPT,
+                execpolicy_amendment=amendment,
+                reason="scoped task file write",
+            )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = []
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def steer_or_start(self, message):
+            self.messages.append(message)
+            return "turn"
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.store = store
+    controller.client = FakeClient()
+    controller.approvals = ApprovalManager(tmp_path, supervisor=FakeSupervisor())
+    controller.coder = FakeCoder()
+    controller.pending_approvals = {}
+    controller.tui = _FakeTUI()
+    controller._sequence = 0
+
+    await controller.handle_server_request(
+        AppServerMessage(
+            {
+                "id": 54,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "command": "printf 'hello sentinel\\n' > hello.txt",
+                    "cwd": str(tmp_path),
+                    "availableDecisions": [offered_decision, "decline"],
+                },
+            }
+        )
+    )
+
+    assert controller.client.responses == [(54, {"decision": offered_decision})]
+    assert controller.tui.messages[0][0] == "APPROVAL"
     assert controller.coder.messages == []
 
 

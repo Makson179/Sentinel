@@ -244,10 +244,11 @@ class SentinelController:
             resolution = await self.approvals.decide(context)
             response = self.approvals.response_payload(context, resolution)
         await self.client.respond(context.server_request_id, response)
-        self.tui.render("APPROVAL" if str(resolution.decision).startswith("accept") else "DENIED", f"{resolution.decision}: {resolution.reason}")
+        is_denial = _approval_resolution_is_denial(resolution.decision)
+        self.tui.render("DENIED" if is_denial else "APPROVAL", f"{resolution.decision}: {resolution.reason}")
         if resolution.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {resolution.persistent_decision}\n")
-        if str(resolution.decision) in {"decline", "cancel", "denied", "abort"}:
+        if is_denial:
             if self.coder is not None:
                 await self.coder.steer_or_start(resolution.reason)
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
@@ -880,6 +881,10 @@ def _sandbox_is_read_only(value: Any) -> bool:
     if isinstance(value, dict):
         return value.get("type") == "readOnly"
     return False
+
+
+def _approval_resolution_is_denial(decision: str | dict[str, Any]) -> bool:
+    return isinstance(decision, str) and decision in {"decline", "cancel", "denied", "abort"}
 
 
 def _turn_id_from_params(params: dict[str, Any]) -> str | None:
