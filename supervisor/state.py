@@ -19,6 +19,7 @@ CONFIG = "config.json"
 PROGRESS = "PROGRESS.md"
 DECISIONS = "DECISIONS.md"
 LAST_ACTION = "LAST_ACTION.md"
+ACTION_HISTORY_LIMIT = 10
 PENDING = "PENDING_INTERVENTION.md"
 HEALTH = "HEALTH.json"
 HANDOFF = "HANDOFF.md"
@@ -108,6 +109,20 @@ class StateStore:
         with self.locked(name):
             current = self.read_text(name, "")
             self.atomic_write_text(self.path(name), current + text)
+
+    def read_recent_actions(self, limit: int = ACTION_HISTORY_LIMIT) -> list[str]:
+        return _recent_action_lines(self.read_text(LAST_ACTION, ""), limit=limit)
+
+    def append_recent_action(self, summary: str, limit: int = ACTION_HISTORY_LIMIT) -> None:
+        if limit <= 0:
+            return
+        summary = " ".join(summary.strip().split())[:500]
+        if not summary:
+            return
+        with self.locked(LAST_ACTION):
+            actions = _recent_action_lines(self.read_text(LAST_ACTION, ""), limit=limit - 1)
+            actions.append(summary)
+            self.atomic_write_text(self.path(LAST_ACTION), "\n".join(actions[-limit:]) + "\n")
 
     def read_json(self, name: str, default: Any) -> Any:
         path = self.path(name)
@@ -267,3 +282,9 @@ class StateStore:
             self.write_text_locked(FINAL_REPORT, "\n".join(lines).rstrip() + "\n")
         else:
             self.write_text_locked(FINAL_REPORT, report)
+
+
+def _recent_action_lines(text: str, *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()][-limit:]

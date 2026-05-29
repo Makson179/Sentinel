@@ -43,6 +43,7 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
     command: str | None = None
     cwd: str | None = _string(params.get("cwd"))
     paths: list[str] = []
+    file_changes: list[dict[str, Any]] = []
     diff: str | None = None
     grant_root: str | None = _string(params.get("grantRoot"))
     approval_id = _string(params.get("approvalId"))
@@ -58,12 +59,14 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
     elif request_type in {ApprovalRequestType.FILE_CHANGE, ApprovalRequestType.LEGACY_APPLY_PATCH}:
         if grant_root:
             paths.append(grant_root)
-        file_changes = params.get("fileChanges")
-        if isinstance(file_changes, dict):
-            paths.extend(str(path) for path in file_changes)
+        raw_file_changes = params.get("fileChanges")
+        if isinstance(raw_file_changes, dict):
+            paths.extend(str(path) for path in raw_file_changes)
+            file_changes.extend({"path": str(path), "change": change} for path, change in raw_file_changes.items())
         raw_changes = params.get("changes")
         if isinstance(raw_changes, list):
             paths.extend(_paths_from_changes(raw_changes))
+            file_changes.extend(change for change in raw_changes if isinstance(change, dict))
 
     network = None
     raw_network = params.get("networkApprovalContext")
@@ -85,9 +88,16 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
         command=command,
         cwd=cwd,
         paths=paths,
+        file_changes=file_changes,
         diff=diff,
         grant_root=grant_root,
         network_approval_context=network,
+        proposed_execpolicy_amendment=_list_of_strings(
+            params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
+        ),
+        proposed_network_policy_amendments=_list_or_none(
+            params.get("proposedNetworkPolicyAmendments") or params.get("proposed_network_policy_amendments")
+        ),
         available_decisions=params.get("availableDecisions") if isinstance(params.get("availableDecisions"), list) else None,
         raw_params=params,
     )
@@ -165,17 +175,25 @@ class ApprovalManager:
             return self._deny(context, f"supervisor approval fallback failed: {exc.__class__.__name__}")
         if decision.decision == SupervisorDecisionKind.APPROVE and decision.approval_decision:
             approval = decision.approval_decision.value
+            if approval not in {"accept", "acceptForSession"}:
+                return self._deny(context, "supervisor approve used a denial decision")
             if decision.execpolicy_amendment:
                 protocol_decision = {
                     "acceptWithExecpolicyAmendment": {"execpolicy_amendment": decision.execpolicy_amendment}
                 }
-                if self._is_allowed(context, protocol_decision) and context.request_type == ApprovalRequestType.COMMAND:
+                if (
+                    approval == "accept"
+                    and context.request_type == ApprovalRequestType.COMMAND
+                    and self._is_exact_execpolicy_amendment_allowed(context, decision.execpolicy_amendment)
+                ):
                     return ApprovalResolution(
                         decision=protocol_decision,
                         reason=decision.reason,
                         persistent_decision=decision.persistent_decision,
                         from_supervisor=True,
                     )
+            if approval == "acceptForSession" and _accept_for_session_forbidden(context, self.workspace):
+                return self._deny(context, "acceptForSession is forbidden for this approval class")
             if self._is_allowed(context, approval):
                 return ApprovalResolution(
                     decision=approval,
@@ -185,6 +203,8 @@ class ApprovalManager:
                 )
         if decision.decision == SupervisorDecisionKind.DENY and decision.approval_decision:
             denial = decision.approval_decision.value
+            if denial not in {"decline", "cancel"}:
+                return self._deny(context, "supervisor deny used an approval decision")
             if self._is_allowed(context, denial):
                 return ApprovalResolution(decision=denial, reason=decision.reason, from_supervisor=True)
         return self._deny(context, decision.reason or "supervisor did not return an applicable approval decision")
@@ -210,7 +230,10 @@ class ApprovalManager:
         if context.request_type in {ApprovalRequestType.LEGACY_EXEC_COMMAND, ApprovalRequestType.LEGACY_APPLY_PATCH}:
             decision = "approved"
         if not self._is_allowed(context, decision):
-            decision = self._first_allowed(context, ["accept", "approved", "acceptForSession", "approved_for_session"]) or self._deny_decision(context)
+            choices = ["accept", "approved"]
+            if not _accept_for_session_forbidden(context, self.workspace):
+                choices.extend(["acceptForSession", "approved_for_session"])
+            decision = self._first_allowed(context, choices) or self._deny_decision(context)
         return ApprovalResolution(decision=decision, reason=reason)
 
     def _deny(self, context: ApprovalContext, reason: str) -> ApprovalResolution:
@@ -235,6 +258,24 @@ class ApprovalManager:
             return decision in keys
         return any(key in keys for key in decision)
 
+    def _is_exact_execpolicy_amendment_allowed(self, context: ApprovalContext, amendment: list[str]) -> bool:
+        if context.proposed_execpolicy_amendment == amendment:
+            return True
+        if context.available_decisions is None:
+            return False
+        for decision in context.available_decisions:
+            if not isinstance(decision, dict):
+                continue
+            payload = decision.get("acceptWithExecpolicyAmendment")
+            if not isinstance(payload, dict):
+                continue
+            offered = payload.get("execpolicy_amendment")
+            if offered is None:
+                offered = payload.get("proposed_execpolicy_amendment")
+            if offered == amendment:
+                return True
+        return False
+
 
 def _request_type(method: str) -> ApprovalRequestType:
     return {
@@ -251,6 +292,16 @@ def _request_type(method: str) -> ApprovalRequestType:
 
 def _string(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _list_of_strings(value: Any) -> list[str] | None:
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    return None
+
+
+def _list_or_none(value: Any) -> list[Any] | None:
+    return list(value) if isinstance(value, list) else None
 
 
 def _paths_from_changes(changes: list[Any]) -> list[str]:
@@ -279,3 +330,48 @@ def _to_legacy_decision(decision: str | dict[str, Any]) -> str | dict[str, Any]:
         "approved": "approved",
         "denied": "denied",
     }.get(decision, decision)
+
+
+def _accept_for_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
+    if context.network_approval_context is not None:
+        return True
+    if context.request_type in {ApprovalRequestType.FILE_CHANGE, ApprovalRequestType.LEGACY_APPLY_PATCH}:
+        return _file_change_session_forbidden(context, workspace)
+    if context.command:
+        return _command_session_forbidden(context.command)
+    return False
+
+
+def _file_change_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
+    paths = list(context.paths)
+    if context.grant_root and context.grant_root not in paths:
+        paths.append(context.grant_root)
+    if not paths:
+        return True
+    for raw in paths:
+        path = normalize_path(workspace, raw)
+        if path is None:
+            return True
+        if ".supervisor" in path.parts or is_secret_path(path):
+            return True
+    return False
+
+
+def _command_session_forbidden(command: str) -> bool:
+    lowered = command.lower()
+    destructive = ("rm -rf", "rm -fr", "rmdir", "unlink", "del /", "remove-item")
+    deploy_publish = ("deploy", "publish", "release", "npm publish", "twine upload", "docker push")
+    git_mutation = (
+        "git push",
+        "git commit",
+        "git reset",
+        "git checkout",
+        "git switch",
+        "git rebase",
+        "git merge",
+        "git tag",
+        "git branch",
+        "git clean",
+    )
+    secret_terms = ("secret", ".env", "credential", "token", "password", "private_key", "id_rsa")
+    return any(term in lowered for term in destructive + deploy_publish + git_mutation + secret_terms)

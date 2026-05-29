@@ -32,7 +32,7 @@ from supervisor.schemas import (
     RunConfig,
     StateSnapshot,
 )
-from supervisor.state import DECISIONS, LAST_ACTION, PROGRESS, StateStore
+from supervisor.state import DECISIONS, PROGRESS, StateStore
 from supervisor.timing import DebouncedTimer, HookBudget, fallback_response
 
 
@@ -157,12 +157,14 @@ class SupervisorWrapper:
     def snapshot(self) -> StateSnapshot:
         config = self.store.get_config()
         health = self.store.get_health()
+        last_actions = self.store.read_recent_actions()
         return StateSnapshot(
             config=config,
             health=health,
             progress=self.store.read_text(PROGRESS, ""),
             decisions=self.store.read_text(DECISIONS, ""),
-            last_action=self.store.read_text(LAST_ACTION, ""),
+            last_action=last_actions[-1] if last_actions else "",
+            last_actions=last_actions,
             pending_intervention=self.store.read_pending(),
         )
 
@@ -258,7 +260,7 @@ class SupervisorWrapper:
             self.store.append_text_locked(PROGRESS, f"- Completed: {decision.completed_step}\n")
             patch_health(self.store, HealthDelta(generation=current_generation, last_progress_sequence=sequence))
         if decision.last_action:
-            self.store.write_text_locked(LAST_ACTION, decision.last_action.strip()[:500] + "\n")
+            self.store.append_recent_action(decision.last_action)
         if decision.risk_signals:
             patch_health(self.store, HealthDelta(generation=current_generation, add_risk_signals=decision.risk_signals))
 

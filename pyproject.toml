@@ -26,7 +26,9 @@ supervisor = "supervisor.main:cli"
 [tool.setuptools.packages.find]
 include = ["supervisor*"]
 
+[tool.setuptools.package-data]
+"supervisor.prompts" = ["*.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-

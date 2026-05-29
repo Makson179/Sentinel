@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
+import tomllib
+from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 from supervisor.schemas import HookEvent, StateSnapshot, SupervisorWakePacket
+
+
+PROMPTS_ENV_VAR = "SENTINEL_PROMPTS_FILE"
+PROMPTS_RESOURCE = "prompts.toml"
+
+
+def clear_prompt_cache() -> None:
+    """Compatibility hook; prompts are loaded fresh on every build."""
+    return None
 
 
 def build_supervisor_prompt(event: HookEvent, snapshot: StateSnapshot, sequence: int, objective: str) -> str:
@@ -13,60 +26,108 @@ def build_supervisor_prompt(event: HookEvent, snapshot: StateSnapshot, sequence:
         "generation": snapshot.health.generation,
         "event": event.model_dump(mode="json"),
         "state": snapshot.model_dump(mode="json"),
-        "instructions": [
-            "Return only JSON matching the supervisor decision schema.",
-            "Prefer minimum human involvement and robust autonomous supervision.",
-            "For gray-zone permissions, choose allow_once, allow_class, or deny.",
-            "Confirm kill_restart only when deterministic evidence shows the current generation is stuck.",
-        ],
+        "instructions": _instructions("legacy_supervisor"),
     }
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
 def build_coder_prompt(task_path: Path) -> str:
-    return f"""You are the coding agent for this supervised run.
-
-Read the selected task file first:
-{task_path.resolve()}
-
-Complete the task autonomously. When a command, file edit, network access, MCP/app action, or other operation requires approval, request permission through Codex's normal approval flow. Do not ask the human in chat.
-
-The supervisor/controller is the approval authority. It may approve, deny, steer, interrupt, or restart you.
-
-Use minimal changes. Prefer project conventions. Validate your work before claiming completion.
-"""
+    return _template("coder_initial").replace("{task_path}", str(task_path.resolve()))
 
 
 def build_restart_prompt(task_path: Path) -> str:
-    return f"""You are the coding agent for a restarted supervised run.
-
-Read the selected task file first:
-{task_path.resolve()}
-
-Then read these supervisor state files before making changes:
-.supervisor/DECISIONS.md
-.supervisor/PROGRESS.md
-.supervisor/HANDOFF.md
-
-Continue the task from the handoff. Do not ask the human in chat. Request permissions only through Codex's normal approval flow.
-"""
+    return _template("coder_restart").replace("{task_path}", str(task_path.resolve()))
 
 
 def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
     payload = packet.model_dump(mode="json")
-    payload["instructions"] = [
-        "You are a stateless supervisor for an autonomous Codex coder.",
-        "Return only JSON matching the provided output schema.",
-        "Choose exactly one decision: noop, approve, deny, intervene, restart, complete, or pause.",
-        "Human input is advisory context; do not route messages directly to the coder unless you choose intervene/restart/pause.",
-        "For approvals, choose only an offered approval_decision. Do not invent app-server decisions.",
-        "Your own supervisor turn runs read-only with approvalPolicy never; do not confuse that with the coder.",
-        "The coder runs with on-request approvals, so safe workspace writes can be approved by Sentinel.",
-        "A completed file-change item or approved request is evidence that a workspace write happened.",
-        "Do not approve unsafe network, secrets, broad deletes, permission changes, deploy/publish, git force operations, or supervisor state edits.",
-        "Use message_to_coder for concise operational steering.",
-        "Do not restart just because tests are currently failing, implementation is pending, or the coder has not finished yet.",
-        "Choose restart only when health evidence shows the current generation is stuck or unsafe to continue.",
-        "Complete only when validation evidence or explicit validation unavailability is present.",
-    ]
+    section_names = _stateless_supervisor_section_names(packet)
+    payload["prompt_sections"] = section_names
+    payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _load_prompt_config() -> dict[str, Any]:
+    override = os.environ.get(PROMPTS_ENV_VAR)
+    if override:
+        raw = Path(override).read_bytes()
+    else:
+        raw = files("supervisor.prompts").joinpath(PROMPTS_RESOURCE).read_bytes()
+    data = tomllib.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("prompt config must be a TOML table")
+    return data
+
+
+def _section(name: str) -> dict[str, Any]:
+    value = _load_prompt_config().get(name)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"missing prompt section [{name}] in {PROMPTS_RESOURCE}")
+    return value
+
+
+def _template(name: str) -> str:
+    value = _section(name).get("template")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"prompt section [{name}] must define a non-empty template")
+    return value
+
+
+def _instructions(name: str) -> list[str]:
+    value = _section(name).get("instructions")
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise RuntimeError(f"prompt section [{name}] must define non-empty string instructions")
+    return list(value)
+
+
+def _stateless_supervisor_section_names(packet: SupervisorWakePacket) -> list[str]:
+    root = _section("stateless_supervisor")
+    legacy = root.get("instructions")
+    if isinstance(legacy, list):
+        return ["stateless_supervisor"]
+    body_sections = root.get("body_sections")
+    if not isinstance(body_sections, list) or not body_sections:
+        raise RuntimeError("[stateless_supervisor] must define body_sections")
+    names = [str(name) for name in body_sections]
+    if packet.handoff is not None:
+        names.append("handoff")
+    if packet.approval_context is not None or packet.triggering_server_request_id is not None:
+        names.append("approval")
+    if _include_action_review(packet):
+        names.append("action_review")
+    if packet.human_message is not None:
+        names.append("human_message")
+    return names
+
+
+def _stateless_supervisor_section_text(name: str) -> str:
+    if name == "stateless_supervisor":
+        return "\n\n".join(_instructions("stateless_supervisor"))
+    root = _section("stateless_supervisor")
+    sections = root.get("sections")
+    if not isinstance(sections, dict):
+        raise RuntimeError("[stateless_supervisor] must define [stateless_supervisor.sections.*] tables")
+    section = sections.get(name)
+    if not isinstance(section, dict):
+        raise RuntimeError(f"missing stateless supervisor prompt block: {name}")
+    text = section.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError(f"stateless supervisor prompt block {name} must define non-empty text")
+    return text.strip()
+
+
+def _include_action_review(packet: SupervisorWakePacket) -> bool:
+    if packet.triggering_item_id is not None or packet.triggering_action is not None:
+        return True
+    summary = packet.current_summary.lower()
+    return any(
+        marker in summary
+        for marker in (
+            "progress check",
+            "dirty",
+            "reviewing latest state",
+            "turn completed",
+            "coder completed action",
+            "supervisor check",
+        )
+    )

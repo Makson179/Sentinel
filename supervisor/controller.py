@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,15 +19,23 @@ from supervisor.schemas import (
     AppEvent,
     AppEventSource,
     ApprovalContext,
+    ApprovalWakeContext,
+    ChangedFile,
+    CoderMessage,
     FinalReport,
     HealthDelta,
+    HumanMessage,
+    PriorIntervention,
+    RestartHandoff,
     SentinelConfig,
     SentinelStatus,
     SupervisorDecision,
     SupervisorDecisionKind,
     SupervisorWakePacket,
+    TriggeringAction,
+    ValidationRun,
 )
-from supervisor.state import DECISIONS, HANDOFF, LAST_ACTION, PROGRESS, StateStore
+from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.task_select import resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
@@ -51,7 +60,6 @@ class SentinelController:
         model: str | None = None,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
-        bench_recorder: Any | None = None,
         use_git_diff: bool = True,
     ):
         self.project_root = project_root.resolve()
@@ -61,7 +69,6 @@ class SentinelController:
         self.store = StateStore(self.project_root)
         self.model = model
         self.overwrite_state = overwrite_state
-        self.bench_recorder = bench_recorder
         self.use_git_diff = use_git_diff
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
@@ -74,6 +81,9 @@ class SentinelController:
         self.approvals: ApprovalManager | None = None
         self.coder: CoderSession | None = None
         self.pending_approvals: dict[int | str, ApprovalContext] = {}
+        self.last_coder_message: CoderMessage | None = None
+        self.validations: list[ValidationRun] = []
+        self.prior_interventions: list[PriorIntervention] = []
         self.running = False
         self.paused = False
         self._sequence = 0
@@ -83,9 +93,7 @@ class SentinelController:
     async def run(self) -> None:
         self.initialize_state()
         await self.client.start()
-        self._bench_record("appserver_started")
         await self.client.initialize()
-        self._bench_record("appserver_initialized")
         await self.tui.start()
         self.running = True
         try:
@@ -95,16 +103,11 @@ class SentinelController:
                 self.store,
                 self.task_path,
                 model=self.model,
-                bench_recorder=self.bench_recorder,
             )
-            self.approvals = ApprovalManager(self.project_root, supervisor=self.supervisor)
+            self.approvals = ApprovalManager(self.project_root, supervisor=self)
             self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
             await self.coder.start_thread()
-            if self.bench_recorder is not None and self.coder.thread_id:
-                self.bench_recorder.set_coder_thread(self.coder.thread_id)
-            self._bench_record("coder_thread_started", thread_id=self.coder.thread_id)
             await self.coder.start_initial_turn()
-            self._bench_record("coder_turn_started", thread_id=self.coder.thread_id, turn_id=self.coder.active_turn_id)
             self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
             self.tui.status("supervised coder started")
             await self.event_loop()
@@ -215,18 +218,13 @@ class SentinelController:
             health = self.store.get_health()
             self.tui.render("SYSTEM", f"task={Path(cfg.task_path).name} generation={cfg.generation} active_turn={cfg.active_coder_turn_id} pending_approvals={len(self.pending_approvals)} restarts={health.restart_count}")
             return
-        self._schedule_supervisor_check(f"Human message to supervisor: {text}")
+        self._schedule_supervisor_check(
+            f"Human message to supervisor: {text}",
+            human_message=HumanMessage(text=command.text, sequence=self._sequence),
+        )
 
     async def handle_server_request(self, message: AppServerMessage) -> None:
         context = normalize_approval_request(message)
-        self._bench_record(
-            "approval_requested",
-            approval_request_id=context.server_request_id,
-            method=context.server_request_method,
-            thread_id=context.thread_id,
-            turn_id=context.turn_id,
-            item_id=context.item_id,
-        )
         self.pending_approvals[context.server_request_id] = context
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
@@ -245,22 +243,40 @@ class SentinelController:
         else:
             resolution = await self.approvals.decide(context)
             response = self.approvals.response_payload(context, resolution)
-        self._bench_record(
-            "approval_decided",
-            approval_request_id=context.server_request_id,
-            decision=resolution.decision,
-            from_supervisor=resolution.from_supervisor,
-        )
         await self.client.respond(context.server_request_id, response)
         self.tui.render("APPROVAL" if str(resolution.decision).startswith("accept") else "DENIED", f"{resolution.decision}: {resolution.reason}")
         if resolution.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {resolution.persistent_decision}\n")
         if str(resolution.decision) in {"decline", "cancel", "denied", "abort"}:
+            if self.coder is not None:
+                await self.coder.steer_or_start(resolution.reason)
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
 
+    async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
+        if self.supervisor is None:
+            raise SupervisorAgentError("supervisor not ready")
+        cfg = self.store.get_sentinel_config()
+        wake_sequence = cfg.last_event_sequence + 1
+        approval_context = _approval_wake_context(context, reason)
+        packet = self.supervisor.build_packet(
+            wake_sequence=wake_sequence,
+            current_summary=f"Approval request needs judgment: {reason}",
+            diff_summary=await self.diff_summary(),
+            triggering_server_request_id=context.server_request_id,
+            approval_context=approval_context,
+            pending_approvals=[
+                _approval_wake_context(pending, reason if pending.server_request_id == context.server_request_id else None)
+                for pending in self.pending_approvals.values()
+            ],
+            last_coder_message=self.last_coder_message,
+            validations=list(self.validations),
+            prior_interventions=list(self.prior_interventions),
+            changed_files=await self.changed_files(),
+            patch_summary=_patch_summary_from_approval_context(context) or await self.patch_summary(),
+        )
+        return await self.supervisor.decide(packet)
+
     async def handle_notification(self, message: AppServerMessage) -> None:
-        if self.bench_recorder is not None:
-            self.bench_recorder.record_message_token_usage(message)
         params = message.params
         method = message.method or "notification"
         thread_id = params.get("threadId")
@@ -271,10 +287,6 @@ class SentinelController:
         self._append_event(AppEventSource.APP_SERVER, method, thread_id=thread_id, turn_id=turn_id, item_id=item_id)
 
         cfg = self.store.get_sentinel_config()
-        if thread_id == cfg.coder_thread_id and method in {"item/started", "item/updated"}:
-            item = params.get("item")
-            if _is_completed_action(item):
-                self._bench_first_coder_action(thread_id=thread_id, turn_id=turn_id, item_id=item_id)
         if method == "serverRequest/resolved":
             request_id = params.get("requestId")
             self.pending_approvals.pop(request_id, None)
@@ -292,20 +304,25 @@ class SentinelController:
             summary = _item_summary(params.get("item"))
             item = params.get("item")
             if isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
-                self.tui.render("CODER", item["text"].strip())
+                text = item["text"].strip()
+                if text:
+                    self.last_coder_message = CoderMessage(text=text, sequence=self._sequence)
+                self.tui.render("CODER", text)
                 return
             if _is_completed_action(item):
-                self._bench_first_coder_action(thread_id=thread_id, turn_id=turn_id, item_id=item_id)
-                self._bench_record(
-                    "coder_action_completed",
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    item_id=item_id,
-                    summary=summary,
-                )
-                self.store.write_text_locked(LAST_ACTION, summary + "\n")
+                self.store.append_recent_action(summary)
+                triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=summary)
+                validation = _validation_from_action(triggering_action, sequence=self._sequence)
+                if validation is not None:
+                    self.validations.append(validation)
+                    self.validations = self.validations[-10:]
                 self.tui.render("TOOL", summary)
-                self._schedule_supervisor_check(f"Coder completed action: {summary}", triggering_item_id=item_id)
+                self._schedule_supervisor_check(
+                    f"Coder completed action: {summary}",
+                    triggering_item_id=item_id,
+                    triggering_action=triggering_action,
+                    patch_summary=_patch_summary_from_item(item),
+                )
             return
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
             if self.coder and isinstance(turn_id, str):
@@ -323,13 +340,11 @@ class SentinelController:
         await self._resolve_pending_approvals("paused")
         self.tui.status("paused")
 
-    async def restart(self, reason: str) -> None:
+    async def restart(self, reason: str, *, handoff: RestartHandoff | None = None) -> None:
         cfg = self.store.get_sentinel_config()
         if cfg.restart_count >= cfg.max_restarts:
             await self.finalize("restart cap reached", status=SentinelStatus.STUCK)
             return
-        restart_id = self.bench_recorder.next_restart_id() if self.bench_recorder is not None else None
-        self._bench_record("restart_started", restart_id=restart_id, reason=reason)
         self.store.update_sentinel_config(lambda current: current.model_copy(update={"status": SentinelStatus.RESTARTING}))
         if self.coder:
             try:
@@ -337,26 +352,13 @@ class SentinelController:
             except Exception:
                 pass
         await self._resolve_pending_approvals("restart")
-        diff_summary = await self.diff_summary()
-        handoff = "\n".join(
-            [
-                f"# Handoff generation {cfg.generation}",
-                "",
-                f"- Task: {cfg.task_path}",
-                f"- Reason: {reason}",
-                f"- Diff summary:",
-                "```text",
-                diff_summary or "diff unavailable",
-                "```",
-                "",
-                "## Progress",
-                self.store.read_text(PROGRESS, ""),
-                "",
-                "## Last Action",
-                self.store.read_text(LAST_ACTION, ""),
-            ]
+        handoff = handoff or _fallback_restart_handoff(
+            task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else cfg.task_path,
+            reason=reason,
+            last_actions=self.store.read_recent_actions(10),
         )
-        self.store.write_handoff(handoff)
+        self.store.write_handoff(handoff.model_dump_json(indent=2) + "\n")
+        self.prior_interventions = []
         patch_health(
             self.store,
             HealthDelta(
@@ -379,12 +381,7 @@ class SentinelController:
         )
         self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
         await self.coder.start_thread()
-        if self.bench_recorder is not None and self.coder.thread_id:
-            self.bench_recorder.set_coder_thread(self.coder.thread_id)
-        self._bench_record("coder_thread_started", thread_id=self.coder.thread_id)
         await self.coder.start_restart_turn()
-        self._bench_record("coder_turn_started", thread_id=self.coder.thread_id, turn_id=self.coder.active_turn_id)
-        self._bench_record("restart_finished", restart_id=restart_id, reason=reason)
         self.tui.render("SYSTEM", "restart complete")
 
     async def finalize(self, result: str, *, status: SentinelStatus = SentinelStatus.COMPLETE) -> None:
@@ -406,24 +403,51 @@ class SentinelController:
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
         self.running = False
 
-    def _schedule_supervisor_check(self, summary: str, *, triggering_item_id: str | None = None) -> None:
+    def _schedule_supervisor_check(
+        self,
+        summary: str,
+        *,
+        triggering_item_id: str | None = None,
+        triggering_action: TriggeringAction | None = None,
+        human_message: HumanMessage | None = None,
+        patch_summary: str | None = None,
+    ) -> None:
         if not self.running or self.paused or self.supervisor is None:
             return
         if self._supervisor_task and not self._supervisor_task.done():
             self._supervisor_dirty = True
             return
-        self._supervisor_task = asyncio.create_task(self._supervisor_check_loop(summary, triggering_item_id))
+        self._supervisor_task = asyncio.create_task(
+            self._supervisor_check_loop(summary, triggering_item_id, triggering_action, human_message, patch_summary)
+        )
 
-    async def _supervisor_check_loop(self, summary: str, triggering_item_id: str | None) -> None:
+    async def _supervisor_check_loop(
+        self,
+        summary: str,
+        triggering_item_id: str | None,
+        triggering_action: TriggeringAction | None,
+        human_message: HumanMessage | None,
+        patch_summary: str | None,
+    ) -> None:
         while True:
             self._supervisor_dirty = False
-            await self._run_supervisor_check(summary, triggering_item_id)
+            await self._run_supervisor_check(summary, triggering_item_id, triggering_action, human_message, patch_summary)
             if not self._supervisor_dirty:
                 return
             summary = "Supervisor check was dirty; reviewing latest state"
             triggering_item_id = None
+            triggering_action = None
+            human_message = None
+            patch_summary = None
 
-    async def _run_supervisor_check(self, summary: str, triggering_item_id: str | None) -> None:
+    async def _run_supervisor_check(
+        self,
+        summary: str,
+        triggering_item_id: str | None,
+        triggering_action: TriggeringAction | None,
+        human_message: HumanMessage | None,
+        patch_summary: str | None,
+    ) -> None:
         if self.supervisor is None:
             return
         cfg = self.store.get_sentinel_config()
@@ -433,6 +457,14 @@ class SentinelController:
             current_summary=summary,
             diff_summary=await self.diff_summary(),
             triggering_item_id=triggering_item_id,
+            pending_approvals=[_approval_wake_context(pending) for pending in self.pending_approvals.values()],
+            triggering_action=triggering_action,
+            last_coder_message=self.last_coder_message,
+            validations=list(self.validations),
+            human_message=human_message,
+            prior_interventions=list(self.prior_interventions),
+            changed_files=await self.changed_files(),
+            patch_summary=patch_summary or await self.patch_summary(),
         )
         try:
             decision = await self.supervisor.decide(packet)
@@ -449,12 +481,6 @@ class SentinelController:
             return
         if decision.wake_sequence is not None and decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
             return
-        self._bench_record(
-            "supervisor_decision_applied",
-            decision=decision.decision.value,
-            wake_sequence=decision.wake_sequence,
-            generation=decision.generation,
-        )
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence or current.last_applied_supervisor_sequence})
         )
@@ -463,12 +489,23 @@ class SentinelController:
         if decision.progress_update:
             self.store.append_text_locked(PROGRESS, f"- {decision.progress_update}\n")
             patch_health(self.store, HealthDelta(generation=cfg.generation, last_progress_sequence=cfg.last_event_sequence))
+        if decision.clear_handoff:
+            self.store.write_text_locked(HANDOFF, "")
         if decision.display_message:
             self.tui.render("SUPERVISOR", decision.display_message)
         if decision.decision == SupervisorDecisionKind.NOOP:
             return
         if decision.decision == SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.coder:
             self.tui.render("SUPERVISOR", f"steering coder: {decision.reason}")
+            self.prior_interventions.append(
+                PriorIntervention(
+                    reason=decision.reason,
+                    message_to_coder=decision.message_to_coder,
+                    sequence=decision.wake_sequence or cfg.last_event_sequence,
+                )
+            )
+            self.prior_interventions = self.prior_interventions[-20:]
+            patch_health(self.store, HealthDelta(generation=cfg.generation, interventions=1))
             await self.coder.steer_or_start(decision.message_to_coder)
             return
         if decision.decision == SupervisorDecisionKind.RESTART:
@@ -483,7 +520,7 @@ class SentinelController:
                 return
             if candidate_reason:
                 self.tui.render("SUPERVISOR", f"restart candidate: {candidate_reason}")
-            await self.restart(decision.reason or "supervisor requested restart")
+            await self.restart(decision.reason or "supervisor requested restart", handoff=decision.handoff)
             return
         if decision.decision == SupervisorDecisionKind.PAUSE:
             await self.pause()
@@ -518,7 +555,7 @@ class SentinelController:
 
     async def diff_summary(self) -> str:
         if not self.use_git_diff:
-            return "benchmark mode: git diff summary disabled"
+            return "git diff summary disabled"
         commands = [["git", "status", "--short"], ["git", "diff", "--stat"], ["git", "diff", "--name-only"]]
         parts: list[str] = []
         for command in commands:
@@ -535,6 +572,66 @@ class SentinelController:
             except Exception as exc:
                 parts.append(f"$ {' '.join(command)}\ndiff unavailable: {exc}")
         return "\n\n".join(parts)
+
+    async def changed_files(self) -> list[ChangedFile]:
+        if not self.use_git_diff:
+            return []
+        status_text = await self._git_output(["git", "status", "--short"])
+        numstat_text = await self._git_output(["git", "diff", "--numstat", "HEAD", "--"])
+        if status_text is None and numstat_text is None:
+            return []
+        files: dict[str, ChangedFile] = {}
+        for line in (status_text or "").splitlines():
+            if not line.strip():
+                continue
+            status = line[:2].strip() or "modified"
+            path = line[3:].strip() if len(line) > 3 else line.strip()
+            if " -> " in path:
+                path = path.rsplit(" -> ", 1)[1].strip()
+            if path:
+                files[path] = ChangedFile(path=path, status=status)
+        for line in (numstat_text or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            additions = _parse_numstat(parts[0])
+            deletions = _parse_numstat(parts[1])
+            path = parts[2].strip()
+            if " => " in path:
+                path = path.rsplit(" => ", 1)[1].strip("{}")
+            if not path:
+                continue
+            existing = files.get(path)
+            status = existing.status if existing else "modified"
+            files[path] = ChangedFile(path=path, status=status, additions=additions, deletions=deletions)
+        return list(files.values())[:200]
+
+    async def _git_output(self, command: list[str]) -> str | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self.project_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode != 0:
+                return None
+            return (stdout + stderr).decode("utf-8", errors="replace").strip()
+        except Exception:
+                return None
+
+    async def patch_summary(self, limit: int = 4000) -> str | None:
+        if not self.use_git_diff:
+            return None
+        parts: list[str] = []
+        for command in (["git", "diff", "--unified=2", "--"], ["git", "diff", "--cached", "--unified=2", "--"]):
+            output = await self._git_output(command)
+            if output:
+                parts.append(f"$ {' '.join(command)}\n{output}")
+        if not parts:
+            return None
+        return _bounded_text("\n\n".join(parts), limit=limit)
 
     async def _on_notification(self, message: AppServerMessage) -> None:
         await self.event_queue.put(ControllerEvent(kind="notification", message=message))
@@ -569,32 +666,6 @@ class SentinelController:
         self.store.append_event(event)
         self.store.update_sentinel_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
 
-    def _bench_record(self, event: str, **payload: Any) -> None:
-        if self.bench_recorder is None:
-            return
-        try:
-            self.bench_recorder.record(event, **payload)
-        except Exception:
-            pass
-
-    def _bench_first_coder_action(
-        self,
-        *,
-        thread_id: str | None = None,
-        turn_id: str | None = None,
-        item_id: str | None = None,
-    ) -> None:
-        if self.bench_recorder is None:
-            return
-        try:
-            self.bench_recorder.record_first_coder_action_started(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                item_id=item_id,
-            )
-        except Exception:
-            pass
-
     def _generate_schema_hash(self) -> str:
         if shutil.which("codex") is None:
             raise RuntimeError("codex executable not found")
@@ -626,7 +697,6 @@ class SentinelController:
             self.task_path,
             model=self.model,
             timeout_seconds=45,
-            bench_recorder=self.bench_recorder,
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -638,7 +708,7 @@ class SentinelController:
             task_contents="Structured output self-test. Return noop.",
             progress="",
             decisions="",
-            last_action="",
+            last_actions=[],
             health=self.store.get_health().model_dump(mode="json"),
             recent_events=[],
             current_summary="Startup structured-output self-test. Return decision noop.",
@@ -648,6 +718,130 @@ class SentinelController:
         decision = await asyncio.wait_for(agent.decide(packet), timeout=120)
         if decision.decision not in {SupervisorDecisionKind.NOOP, SupervisorDecisionKind.PAUSE}:
             raise RuntimeError("structured-output supervisor self-test returned an unexpected decision")
+
+
+def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:
+    return ApprovalWakeContext(
+        request_type=context.request_type.value,
+        server_request_id=context.server_request_id,
+        method=context.server_request_method,
+        available_decisions=context.available_decisions,
+        command=context.command,
+        file_changes=context.file_changes,
+        paths=context.paths,
+        cwd=context.cwd,
+        grant_root=context.grant_root,
+        network_approval_context=context.network_approval_context,
+        proposed_execpolicy_amendment=context.proposed_execpolicy_amendment,
+        proposed_network_policy_amendments=context.proposed_network_policy_amendments,
+        reason=reason,
+    )
+
+
+def _fallback_restart_handoff(*, task_contents: str, reason: str, last_actions: list[str]) -> RestartHandoff:
+    objective = " ".join(task_contents.strip().split())[:1000] or "Continue the selected task."
+    known_evidence = "; ".join(last_actions[-5:]) or "No completed coder actions are recorded."
+    return RestartHandoff(
+        objective=objective,
+        restart_reason=reason,
+        bad_pattern="The previous generation was interrupted or judged unreliable before completing the task.",
+        known_evidence=known_evidence,
+        next_step="Read the task, progress, decisions, and this handoff, then take the next concrete task step.",
+        recovery_signal="The new generation makes task-relevant progress without repeating the prior failure mode.",
+    )
+
+
+def _triggering_action_from_item(item: Any, *, item_id: str | None, summary: str) -> TriggeringAction:
+    if not isinstance(item, dict):
+        return TriggeringAction(item_id=item_id, kind="item", status="completed", summary=summary)
+    kind = str(item.get("type") or "item")
+    exit_code = item.get("exitCode")
+    return TriggeringAction(
+        item_id=item_id,
+        kind=kind,
+        command=item.get("command") if isinstance(item.get("command"), str) else None,
+        paths=_paths_from_item(item),
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+        status=item.get("status") if isinstance(item.get("status"), str) else "completed",
+        summary=summary,
+    )
+
+
+def _validation_from_action(action: TriggeringAction, *, sequence: int) -> ValidationRun | None:
+    if action.kind != "commandExecution" or not action.command:
+        return None
+    if not _is_validation_command(action.command):
+        return None
+    passed = action.exit_code == 0
+    return ValidationRun(
+        command=action.command,
+        exit_code=action.exit_code,
+        passed=passed,
+        summary=action.summary,
+        sequence=sequence,
+    )
+
+
+def _is_validation_command(command: str) -> bool:
+    lowered = command.lower()
+    patterns = (
+        r"(^|[\s;&|()])(pytest|tox|ruff|mypy|eslint|tsc|vitest|jest|playwright|rspec)(\s|$)",
+        r"(^|[\s;&|()])(npm|pnpm|yarn)\s+(run\s+)?test(\s|$)",
+        r"(^|[\s;&|()])(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _paths_from_item(item: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    raw_paths = item.get("paths")
+    if isinstance(raw_paths, list):
+        paths.extend(str(path) for path in raw_paths if isinstance(path, str))
+    file_changes = item.get("fileChanges")
+    if isinstance(file_changes, dict):
+        paths.extend(str(path) for path in file_changes)
+    changes = item.get("changes")
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            for key in ("path", "filePath", "file_path", "filepath"):
+                value = change.get(key)
+                if isinstance(value, str):
+                    paths.append(value)
+    return list(dict.fromkeys(paths))
+
+
+def _patch_summary_from_item(item: Any, limit: int = 4000) -> str | None:
+    if not isinstance(item, dict) or item.get("type") != "fileChange":
+        return None
+    changes = item.get("changes") or item.get("fileChanges")
+    if changes is None:
+        return None
+    return _bounded_json(changes, limit=limit)
+
+
+def _patch_summary_from_approval_context(context: ApprovalContext, limit: int = 4000) -> str | None:
+    if context.diff:
+        return _bounded_text(context.diff, limit=limit)
+    if context.file_changes:
+        return _bounded_json(context.file_changes, limit=limit)
+    return None
+
+
+def _bounded_text(text: str, *, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + "\n...<truncated>"
+
+
+def _bounded_json(value: Any, *, limit: int) -> str:
+    text = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+    return _bounded_text(text, limit=limit)
+
+
+def _parse_numstat(value: str) -> int | None:
+    return int(value) if value.isdigit() else None
 
 
 def _hash_file(path: Path) -> str:

@@ -46,3 +46,9 @@ def test_atomic_write_behavior(store: StateStore) -> None:
     assert json.loads(store.path(HEALTH).read_text(encoding="utf-8"))["restart_count"] == 2
     assert not list(store.state_dir.glob("*.tmp"))
 
+
+def test_recent_action_history_is_capped(store: StateStore) -> None:
+    for index in range(12):
+        store.append_recent_action(f"action {index}")
+
+    assert store.read_recent_actions() == [f"action {index}" for index in range(2, 12)]

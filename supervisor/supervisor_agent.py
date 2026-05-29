@@ -10,12 +10,20 @@ from supervisor.appserver import AppServerClient, last_agent_message_text, text_
 from supervisor.prompts import build_stateless_supervisor_prompt
 from supervisor.schemas import (
     ApprovalContext,
+    ApprovalWakeContext,
+    ChangedFile,
+    CoderMessage,
+    HumanMessage,
+    PriorIntervention,
+    RestartHandoff,
     SupervisorDecision,
     SupervisorDecisionKind,
     SupervisorWakePacket,
+    TriggeringAction,
+    ValidationRun,
 )
 from supervisor.schemas.models import openai_strict_json_schema_for_supervisor_decision
-from supervisor.state import DECISIONS, HANDOFF, LAST_ACTION, PROGRESS, StateStore
+from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 
 
 class SupervisorAgentError(RuntimeError):
@@ -31,27 +39,21 @@ class StatelessSupervisorAgent:
         *,
         model: str | None = None,
         timeout_seconds: float = 180.0,
-        bench_recorder: Any | None = None,
     ):
         self.client = client
         self.store = store
         self.task_path = task_path.resolve()
         self.model = model
         self.timeout_seconds = timeout_seconds
-        self.bench_recorder = bench_recorder
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
         thread_id: str | None = None
-        supervisor_call_id = self._bench_supervisor_context(packet)
-        self._bench_record("supervisor_call_started", supervisor_call_id=supervisor_call_id)
         try:
             thread_response = await self.client.thread_start(self._thread_params())
             thread = thread_response.get("thread", {})
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str):
                 raise SupervisorAgentError("supervisor thread/start did not return thread id")
-            self._bench_register_supervisor_thread(supervisor_call_id, thread_id)
-            self._bench_record_token_usage(thread_response, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
             prompt = build_stateless_supervisor_prompt(packet)
             turn_response = await self.client.turn_start(
                 {
@@ -64,7 +66,6 @@ class StatelessSupervisorAgent:
                 }
             )
             turn = turn_response.get("turn", {})
-            self._bench_record_token_usage(turn_response, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
             turn_id = turn.get("id")
             if not isinstance(turn_id, str):
                 raise SupervisorAgentError("supervisor turn/start did not return turn id")
@@ -77,11 +78,9 @@ class StatelessSupervisorAgent:
                     timeout=self.timeout_seconds,
                 )
                 turn = completed.params.get("turn", {})
-                self._bench_record_token_usage(completed.raw, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
             text = last_agent_message_text(turn)
             if text is None:
                 turns = await self.client.thread_turns_list(thread_id, limit=1, items_view="full")
-                self._bench_record_token_usage(turns, thread_id=thread_id, supervisor_call_id=supervisor_call_id)
                 data = turns.get("data", [])
                 if data and isinstance(data[0], dict):
                     text = last_agent_message_text(data[0])
@@ -94,11 +93,6 @@ class StatelessSupervisorAgent:
         except (ValidationError, json.JSONDecodeError) as exc:
             raise SupervisorAgentError(f"invalid supervisor decision: {exc}") from exc
         finally:
-            self._bench_record(
-                "supervisor_call_finished",
-                supervisor_call_id=supervisor_call_id,
-                thread_id=thread_id,
-            )
             if thread_id:
                 try:
                     await self.client.thread_archive(thread_id)
@@ -113,6 +107,8 @@ class StatelessSupervisorAgent:
             wake_sequence=self.store.get_sentinel_config().last_event_sequence + 1,
             current_summary=f"Approval request needs judgment: {reason}",
             triggering_server_request_id=context.server_request_id,
+            approval_context=_approval_wake_context(context, reason),
+            pending_approvals=[_approval_wake_context(context, reason)],
         )
         return await self.decide(packet)
 
@@ -124,6 +120,15 @@ class StatelessSupervisorAgent:
         diff_summary: str | None = None,
         triggering_item_id: str | None = None,
         triggering_server_request_id: int | str | None = None,
+        approval_context: ApprovalWakeContext | None = None,
+        pending_approvals: list[ApprovalWakeContext] | None = None,
+        triggering_action: TriggeringAction | None = None,
+        last_coder_message: CoderMessage | None = None,
+        validations: list[ValidationRun] | None = None,
+        human_message: HumanMessage | None = None,
+        prior_interventions: list[PriorIntervention] | None = None,
+        changed_files: list[ChangedFile] | None = None,
+        patch_summary: str | None = None,
     ) -> SupervisorWakePacket:
         cfg = self.store.get_sentinel_config()
         health = self.store.get_health()
@@ -136,9 +141,9 @@ class StatelessSupervisorAgent:
             task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else "",
             progress=self.store.read_text(PROGRESS, ""),
             decisions=self.store.read_text(DECISIONS, ""),
-            last_action=self.store.read_text(LAST_ACTION, ""),
+            last_actions=self.store.read_recent_actions(10),
             health=health.model_dump(mode="json"),
-            handoff=self.store.read_text(HANDOFF, "") or None,
+            handoff=_read_handoff(self.store),
             recent_events=self.store.read_recent_events(40),
             current_summary=current_summary,
             diff_summary=diff_summary,
@@ -146,6 +151,15 @@ class StatelessSupervisorAgent:
             active_coder_turn_id=cfg.active_coder_turn_id,
             triggering_item_id=triggering_item_id,
             triggering_server_request_id=triggering_server_request_id,
+            approval_context=approval_context,
+            pending_approvals=pending_approvals or [],
+            triggering_action=triggering_action,
+            last_coder_message=last_coder_message,
+            validations=validations or [],
+            human_message=human_message,
+            prior_interventions=prior_interventions or [],
+            changed_files=changed_files or [],
+            patch_summary=patch_summary,
         )
 
     def _thread_params(self) -> dict[str, Any]:
@@ -163,50 +177,6 @@ class StatelessSupervisorAgent:
             params["model"] = self.model
         return params
 
-    def _bench_supervisor_context(self, packet: SupervisorWakePacket) -> str | None:
-        if self.bench_recorder is None:
-            return None
-        try:
-            return self.bench_recorder.record_supervisor_context(packet)
-        except Exception:
-            return None
-
-    def _bench_record(self, event: str, **payload: Any) -> None:
-        if self.bench_recorder is None:
-            return
-        try:
-            self.bench_recorder.record(event, **payload)
-        except Exception:
-            pass
-
-    def _bench_register_supervisor_thread(self, supervisor_call_id: str | None, thread_id: str) -> None:
-        if self.bench_recorder is None or supervisor_call_id is None:
-            return
-        try:
-            self.bench_recorder.register_supervisor_thread(supervisor_call_id, thread_id)
-        except Exception:
-            pass
-
-    def _bench_record_token_usage(
-        self,
-        usage_source: Any,
-        *,
-        thread_id: str | None,
-        supervisor_call_id: str | None,
-    ) -> None:
-        if self.bench_recorder is None or supervisor_call_id is None:
-            return
-        try:
-            self.bench_recorder.record_token_usage(
-                role="supervisor",
-                usage_source=usage_source,
-                thread_id=thread_id,
-                supervisor_call_id=supervisor_call_id,
-            )
-        except Exception:
-            pass
-
-
 def _parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -217,6 +187,34 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
     return json.loads(stripped)
+
+
+def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:
+    return ApprovalWakeContext(
+        request_type=context.request_type.value,
+        server_request_id=context.server_request_id,
+        method=context.server_request_method,
+        available_decisions=context.available_decisions,
+        command=context.command,
+        file_changes=context.file_changes,
+        paths=context.paths,
+        cwd=context.cwd,
+        grant_root=context.grant_root,
+        network_approval_context=context.network_approval_context,
+        proposed_execpolicy_amendment=context.proposed_execpolicy_amendment,
+        proposed_network_policy_amendments=context.proposed_network_policy_amendments,
+        reason=reason,
+    )
+
+
+def _read_handoff(store: StateStore) -> RestartHandoff | None:
+    raw = store.read_text(HANDOFF, "").strip()
+    if not raw:
+        return None
+    try:
+        return RestartHandoff.model_validate_json(raw)
+    except Exception:
+        return None
 
 
 def fallback_supervisor_decision(reason: str, *, decision: SupervisorDecisionKind = SupervisorDecisionKind.NOOP) -> SupervisorDecision:

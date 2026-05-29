@@ -130,3 +130,103 @@ async def test_file_change_without_exposed_paths_allows_workspace_edit(tmp_path:
     decision = await ApprovalManager(tmp_path).decide(ctx)
 
     assert decision.decision == "accept"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_approve_with_denial_choice_fails_closed(tmp_path: Path) -> None:
+    class Reviewer:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.APPROVE,
+                approval_decision=ApprovalDecisionKind.DECLINE,
+                reason="wrong shape",
+            )
+
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            15,
+            {"command": "pytest", "availableDecisions": ["accept", "decline", "cancel"]},
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_supervisor_deny_with_approval_choice_fails_closed(tmp_path: Path) -> None:
+    class Reviewer:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.DENY,
+                approval_decision=ApprovalDecisionKind.ACCEPT,
+                reason="wrong shape",
+            )
+
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            16,
+            {"command": "pytest", "availableDecisions": ["accept", "decline", "cancel"]},
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_accept_for_session_rejected_for_forbidden_classes(tmp_path: Path) -> None:
+    class Reviewer:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.APPROVE,
+                approval_decision=ApprovalDecisionKind.ACCEPT_FOR_SESSION,
+                reason="repeatable",
+            )
+
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            17,
+            {"command": "git push origin main", "availableDecisions": ["acceptForSession", "decline", "cancel"]},
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_execpolicy_amendment_requires_exact_offer(tmp_path: Path) -> None:
+    class Reviewer:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.APPROVE,
+                approval_decision=ApprovalDecisionKind.ACCEPT,
+                execpolicy_amendment=["pytest tests/other.py"],
+                reason="safe repeated validation",
+            )
+
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            18,
+            {
+                "command": "pytest tests/test_x.py",
+                "availableDecisions": [
+                    "accept",
+                    {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["pytest tests/test_x.py"]}},
+                    "decline",
+                ],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+
+    assert decision.decision == "accept"

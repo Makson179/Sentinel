@@ -188,9 +188,12 @@ class ApprovalContext(BaseModel):
     command: str | None = None
     cwd: str | None = None
     paths: list[str] = Field(default_factory=list)
+    file_changes: list[dict[str, Any]] = Field(default_factory=list)
     diff: str | None = None
     grant_root: str | None = None
     network_approval_context: NetworkApprovalContext | None = None
+    proposed_execpolicy_amendment: list[str] | None = None
+    proposed_network_policy_amendments: list[Any] | None = None
     available_decisions: list[Any] | None = None
     raw_params: dict[str, Any] = Field(default_factory=dict)
 
@@ -214,6 +217,17 @@ class ApprovalResolution(BaseModel):
     from_supervisor: bool = False
 
 
+class RestartHandoff(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str
+    restart_reason: str
+    bad_pattern: str
+    known_evidence: str
+    next_step: str
+    recovery_signal: str
+
+
 class SupervisorDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -225,9 +239,68 @@ class SupervisorDecision(BaseModel):
     persistent_decision: str | None = None
     progress_update: str | None = None
     health_delta: dict[str, Any] | None = None
+    clear_handoff: bool = False
     display_message: str | None = None
+    handoff: RestartHandoff | None = None
     wake_sequence: int | None = None
     generation: int | None = None
+
+
+class ApprovalWakeContext(BaseModel):
+    request_type: str
+    server_request_id: int | str
+    method: str
+    available_decisions: list[Any] | None = None
+    command: str | None = None
+    file_changes: list[dict[str, Any]] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    grant_root: str | None = None
+    network_approval_context: NetworkApprovalContext | None = None
+    proposed_execpolicy_amendment: list[str] | None = None
+    proposed_network_policy_amendments: list[Any] | None = None
+    reason: str | None = None
+
+
+class TriggeringAction(BaseModel):
+    item_id: str | None = None
+    kind: str
+    command: str | None = None
+    paths: list[str] = Field(default_factory=list)
+    exit_code: int | None = None
+    status: str | None = None
+    summary: str
+
+
+class CoderMessage(BaseModel):
+    text: str
+    sequence: int
+
+
+class ValidationRun(BaseModel):
+    command: str
+    exit_code: int | None = None
+    passed: bool
+    summary: str
+    sequence: int
+
+
+class HumanMessage(BaseModel):
+    text: str
+    sequence: int
+
+
+class PriorIntervention(BaseModel):
+    reason: str
+    message_to_coder: str
+    sequence: int
+
+
+class ChangedFile(BaseModel):
+    path: str
+    status: str
+    additions: int | None = None
+    deletions: int | None = None
 
 
 class SupervisorWakePacket(BaseModel):
@@ -239,9 +312,9 @@ class SupervisorWakePacket(BaseModel):
     task_contents: str
     progress: str = ""
     decisions: str = ""
-    last_action: str = ""
+    last_actions: list[str] = Field(default_factory=list)
     health: dict[str, Any] = Field(default_factory=dict)
-    handoff: str | None = None
+    handoff: RestartHandoff | None = None
     recent_events: list[dict[str, Any]] = Field(default_factory=list)
     current_summary: str = ""
     diff_summary: str | None = None
@@ -249,6 +322,15 @@ class SupervisorWakePacket(BaseModel):
     active_coder_turn_id: str | None = None
     triggering_item_id: str | None = None
     triggering_server_request_id: int | str | None = None
+    approval_context: ApprovalWakeContext | None = None
+    pending_approvals: list[ApprovalWakeContext] = Field(default_factory=list)
+    triggering_action: TriggeringAction | None = None
+    last_coder_message: CoderMessage | None = None
+    validations: list[ValidationRun] = Field(default_factory=list)
+    human_message: HumanMessage | None = None
+    prior_interventions: list[PriorIntervention] = Field(default_factory=list)
+    changed_files: list[ChangedFile] = Field(default_factory=list)
+    patch_summary: str | None = None
 
 
 class FinalReport(BaseModel):
@@ -363,6 +445,7 @@ class StateSnapshot(BaseModel):
     progress: str = ""
     decisions: str = ""
     last_action: str = ""
+    last_actions: list[str] = Field(default_factory=list)
     pending_intervention: PendingIntervention | None = None
 
 
