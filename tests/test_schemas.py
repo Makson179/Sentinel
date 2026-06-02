@@ -5,27 +5,26 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from supervisor.prompts import (
     PROMPTS_ENV_VAR,
+    build_completion_review_prompt,
     build_coder_prompt,
     build_restart_prompt,
     build_stateless_supervisor_prompt,
-    build_supervisor_prompt,
     clear_prompt_cache,
 )
 from supervisor.schemas.models import (
-    EventType,
-    HealthState,
-    HookEvent,
     HumanMessage,
     LLMDecision,
+    CompletionReviewDecision,
     RestartHandoff,
-    RunConfig,
-    StateSnapshot,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
     openai_strict_json_schema_for_decision,
+    openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
 
@@ -79,6 +78,67 @@ def test_supervisor_decision_schema_is_strict() -> None:
     assert "handoff" in schema["properties"]
     handoff_schema = schema["$defs"]["RestartHandoff"]
     assert set(handoff_schema["required"]) == set(handoff_schema["properties"])
+    assert "complete" not in schema["$defs"]["SupervisorDecisionKind"]["enum"]
+
+
+def test_completion_review_decision_schema_is_strict() -> None:
+    schema = openai_strict_json_schema_for_completion_review_decision()
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+    assert schema["$defs"]["CompletionReviewDecisionKind"]["enum"] == ["accept", "return", "restart"]
+    assert "ReviewedFile" in schema["$defs"]
+    assert "BehaviorEvidence" in schema["$defs"]
+    assert "EvidenceItem" in schema["$defs"]
+    assert "validation_id" in schema["$defs"]["EvidenceItem"]["properties"]
+
+
+def test_completion_review_decision_accepts_expected_shapes() -> None:
+    accept = CompletionReviewDecision.model_validate(
+        {
+            "decision": "accept",
+            "reason": "validated",
+            "files_reviewed": [
+                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
+            ],
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "returns configured value",
+                    "task_basis": "TASK.md",
+                    "files_considered": ["src/app.py", "tests/test_app.py"],
+                    "evidence": [
+                        {
+                            "validation_id": "validation-9",
+                            "command": "pytest tests/test_app.py",
+                            "sequence": 9,
+                            "validation_type": "behavioral",
+                            "outcome": "pass",
+                            "freshness": "fresh",
+                            "why_it_covers_behavior": "executes the changed code path",
+                        }
+                    ],
+                    "status": "covered",
+                    "gap": None,
+                }
+            ],
+            "uncovered_behaviors": [],
+            "validation_gaps": [],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": None,
+            "persistent_decision": None,
+            "progress_update": "Accepted by completion review.",
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 10,
+            "generation": 0,
+        }
+    )
+
+    assert accept.decision == "accept"
 
 
 def test_supervisor_decision_accepts_expected_shape() -> None:
@@ -188,6 +248,8 @@ def test_stateless_prompt_assembles_blocks_from_packet() -> None:
     )
     payload = json.loads(build_stateless_supervisor_prompt(base))
     assert payload["prompt_sections"] == ["role", "output_contract", "decisions", "inputs", "state_writes", "invariants"]
+    assert "completion_review" not in payload["prompt_sections"]
+    assert "completion_output_contract" not in payload["prompt_sections"]
 
     approval_with_handoff = base.model_copy(
         update={
@@ -213,6 +275,23 @@ def test_stateless_prompt_assembles_blocks_from_packet() -> None:
     human = base.model_copy(update={"human_message": HumanMessage(text="stop", sequence=2)})
     assert "human_message" in json.loads(build_stateless_supervisor_prompt(human))["prompt_sections"]
 
+    completion_payload = json.loads(build_completion_review_prompt(approval_with_handoff))
+    assert completion_payload["prompt_sections"] == [
+        "completion_role",
+        "completion_output_contract",
+        "completion_inputs",
+        "completion_state_writes",
+        "completion_review",
+        "completion_invariants",
+    ]
+    assert "role" not in completion_payload["prompt_sections"]
+    assert "inputs" not in completion_payload["prompt_sections"]
+    assert "state_writes" not in completion_payload["prompt_sections"]
+    assert "invariants" not in completion_payload["prompt_sections"]
+    assert "handoff" not in completion_payload["prompt_sections"]
+    assert "approval" not in completion_payload["prompt_sections"]
+    assert "action_review" not in completion_payload["prompt_sections"]
+
 
 def test_prompts_are_loaded_from_single_toml_file(monkeypatch, tmp_path: Path) -> None:
     prompt_file = tmp_path / "prompts.toml"
@@ -224,11 +303,15 @@ template = '''initial {task_path}'''
 [coder_restart]
 template = '''restart {task_path}'''
 
-[legacy_supervisor]
-instructions = ["legacy instruction"]
-
 [stateless_supervisor]
-instructions = ["stateless instruction"]
+body_sections = ["role"]
+completion_body_sections = ["completion_role"]
+
+[stateless_supervisor.sections.role]
+text = '''stateless instruction'''
+
+[stateless_supervisor.sections.completion_role]
+text = '''completion instruction'''
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -255,18 +338,54 @@ instructions = ["stateless instruction"]
         assert supervisor_payload["instructions"] == ["stateless instruction"]
         assert supervisor_payload["last_actions"] == ["command completed: pytest exit=1", "file change completed: 1 changes"]
         assert "last_action" not in supervisor_payload
-
-        legacy_payload = json.loads(
-            build_supervisor_prompt(
-                HookEvent(event_type=EventType.TIMER),
-                StateSnapshot(
-                    config=RunConfig(platform="fake", plan_file_path=str(task)),
-                    health=HealthState(),
-                ),
-                sequence=1,
-                objective="# Task",
-            )
-        )
-        assert legacy_payload["instructions"] == ["legacy instruction"]
+        completion_payload = json.loads(build_completion_review_prompt(packet))
+        assert completion_payload["instructions"] == ["completion instruction"]
     finally:
         clear_prompt_cache()
+
+
+def test_missing_stateless_prompt_block_fails_fast(monkeypatch, tmp_path: Path) -> None:
+    prompt_file = tmp_path / "prompts.toml"
+    prompt_file.write_text(
+        """
+[coder_initial]
+template = '''initial {task_path}'''
+
+[coder_restart]
+template = '''restart {task_path}'''
+
+[stateless_supervisor]
+body_sections = ["role", "missing_runtime"]
+completion_body_sections = ["completion_role"]
+
+[stateless_supervisor.sections.role]
+text = '''runtime'''
+
+[stateless_supervisor.sections.completion_role]
+text = '''completion'''
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(PROMPTS_ENV_VAR, str(prompt_file))
+    packet = SupervisorWakePacket(
+        wake_sequence=1,
+        latest_event_sequence=1,
+        generation=0,
+        restart_count=0,
+        task_path="TASK.md",
+        task_contents="# Task",
+    )
+
+    with pytest.raises(RuntimeError, match="missing_runtime"):
+        build_stateless_supervisor_prompt(packet)
+
+    prompt_file.write_text(
+        prompt_file.read_text(encoding="utf-8").replace(
+            'completion_body_sections = ["completion_role"]',
+            'completion_body_sections = ["missing_completion"]',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="missing_completion"):
+        build_completion_review_prompt(packet)

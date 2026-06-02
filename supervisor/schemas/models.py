@@ -7,7 +7,7 @@ from copy import deepcopy
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventType(str, Enum):
@@ -52,6 +52,7 @@ class SentinelStatus(str, Enum):
     PAUSED = "paused"
     RESTARTING = "restarting"
     COMPLETE = "complete"
+    ESCALATED = "escalated"
     STUCK = "stuck"
     PROVIDER_FAILURE = "provider_failure"
     EXITED = "exited"
@@ -85,8 +86,13 @@ class SupervisorDecisionKind(str, Enum):
     DENY = "deny"
     INTERVENE = "intervene"
     RESTART = "restart"
-    COMPLETE = "complete"
     PAUSE = "pause"
+
+
+class CompletionReviewDecisionKind(str, Enum):
+    ACCEPT = "accept"
+    RETURN = "return"
+    RESTART = "restart"
 
 
 class ApprovalDecisionKind(str, Enum):
@@ -155,6 +161,12 @@ class SentinelConfig(BaseModel):
     pending_server_request_ids: list[int | str] = Field(default_factory=list)
     status: SentinelStatus = SentinelStatus.STARTING
     model: str | None = None
+    max_no_marker_idle_nudges: int = 2
+    max_completion_returns_per_generation: int = 2
+    accept_gate_rejections: int = 0
+    accept_gate_reviewer_reruns: int = 0
+    accept_gate_coder_returns: int = 0
+    accept_gate_audit_failures: int = 0
 
 
 class AppEvent(BaseModel):
@@ -246,6 +258,96 @@ class SupervisorDecision(BaseModel):
     generation: int | None = None
 
 
+class ReviewedFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    reason: str
+    kind: Literal["source", "test", "config", "docs", "other"]
+    inspected: bool
+    limitation: str | None = None
+
+
+class EvidenceItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    validation_id: str | None = None
+    command: str
+    sequence: int | None = None
+    validation_type: Literal["static", "behavioral", "unknown"]
+    outcome: Literal["pass", "fail", "unknown"]
+    freshness: Literal["fresh", "stale", "unknown"]
+    why_it_covers_behavior: str
+
+
+class BehaviorEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    behavior: str
+    task_basis: str
+    files_considered: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    status: Literal["covered", "partial", "uncovered"]
+    gap: str | None = None
+
+
+class CompletionReviewDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: CompletionReviewDecisionKind
+    reason: str
+    files_reviewed: list[ReviewedFile] = Field(default_factory=list)
+    behavior_evidence_matrix: list[BehaviorEvidence] = Field(default_factory=list)
+    uncovered_behaviors: list[str] = Field(default_factory=list)
+    validation_gaps: list[str] = Field(default_factory=list)
+    claim_evidence_mismatches: list[str] = Field(default_factory=list)
+    packet_or_access_limitations: list[str] = Field(default_factory=list)
+    changed_test_risks: list[str] = Field(default_factory=list)
+    message_to_coder: str | None
+    persistent_decision: str | None
+    progress_update: str | None
+    clear_handoff: bool
+    display_message: str | None
+    handoff: RestartHandoff | None
+    wake_sequence: int
+    generation: int
+
+    @model_validator(mode="after")
+    def validate_decision_shape(self) -> "CompletionReviewDecision":
+        if self.decision == CompletionReviewDecisionKind.ACCEPT:
+            if self.message_to_coder is not None:
+                raise ValueError("accept must not set message_to_coder")
+            if self.handoff is not None:
+                raise ValueError("accept must not set handoff")
+            if self.uncovered_behaviors or self.validation_gaps:
+                raise ValueError("accept must use empty uncovered_behaviors and validation_gaps")
+        elif self.decision == CompletionReviewDecisionKind.RETURN:
+            if not self.message_to_coder or not self.message_to_coder.strip():
+                raise ValueError("return requires message_to_coder")
+            if self.handoff is not None:
+                raise ValueError("return must not set handoff")
+            if not _completion_review_has_return_issue(self):
+                raise ValueError("return requires an uncovered behavior, validation gap, mismatch, risk, or access limitation")
+        elif self.decision == CompletionReviewDecisionKind.RESTART:
+            if self.handoff is None:
+                raise ValueError("restart requires handoff")
+            if self.message_to_coder is not None:
+                raise ValueError("restart must not set message_to_coder")
+        return self
+
+
+def _completion_review_has_return_issue(decision: CompletionReviewDecision) -> bool:
+    if (
+        decision.uncovered_behaviors
+        or decision.validation_gaps
+        or decision.claim_evidence_mismatches
+        or decision.packet_or_access_limitations
+        or decision.changed_test_risks
+    ):
+        return True
+    return any(row.status != "covered" for row in decision.behavior_evidence_matrix)
+
+
 class ApprovalWakeContext(BaseModel):
     request_type: str
     server_request_id: int | str
@@ -278,11 +380,44 @@ class CoderMessage(BaseModel):
 
 
 class ValidationRun(BaseModel):
+    validation_id: str
     command: str
     exit_code: int | None = None
+    type: Literal["static", "behavioral"] = "behavioral"
+    outcome: Literal["pass", "fail"] = "fail"
     passed: bool
     summary: str
     sequence: int
+    was_filtered: bool = False
+    raw_selector: str | None = None
+    executed_test_names: list[str] = Field(default_factory=list)
+    passed_count: int | None = None
+    failed_count: int | None = None
+    target_files_or_test_files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_legacy_validation_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "outcome" not in data:
+            if "passed" in data:
+                data["outcome"] = "pass" if data["passed"] else "fail"
+            elif data.get("exit_code") == 0:
+                data["outcome"] = "pass"
+            else:
+                data["outcome"] = "fail"
+        if "passed" not in data:
+            data["passed"] = data.get("outcome") == "pass"
+        if "type" not in data:
+            data["type"] = "behavioral"
+        if "validation_id" not in data:
+            sequence = data.get("sequence")
+            command = data.get("command")
+            if isinstance(sequence, int) and isinstance(command, str):
+                data["validation_id"] = f"validation-{sequence}"
+        return data
 
 
 class HumanMessage(BaseModel):
@@ -296,11 +431,74 @@ class PriorIntervention(BaseModel):
     sequence: int
 
 
+class CompletionReturnRecord(BaseModel):
+    reason: str
+    uncovered_behaviors: list[str] = Field(default_factory=list)
+    validation_gaps: list[str] = Field(default_factory=list)
+    claim_evidence_mismatches: list[str] = Field(default_factory=list)
+    packet_or_access_limitations: list[str] = Field(default_factory=list)
+    message_to_coder: str | None = None
+    sequence: int
+    generation: int
+
+
 class ChangedFile(BaseModel):
     path: str
     status: str
     additions: int | None = None
     deletions: int | None = None
+    sequence: int | None = None
+
+
+class ChangedFileDiff(BaseModel):
+    path: str
+    file_kind: Literal["source", "test", "config", "docs", "unknown"]
+    change_kind: Literal["modified", "added", "deleted", "renamed", "unknown"]
+    diff: str
+    diff_truncated: bool = False
+    omitted_reason: str | None = None
+
+
+class ChangedFileContext(BaseModel):
+    path: str
+    final_snippets_around_changed_hunks: str
+    context_truncated: bool = False
+
+
+class ChangedTestsSummary(BaseModel):
+    path: str
+    added_or_modified_test_names: list[str] = Field(default_factory=list)
+    changed_assertion_snippets: list[str] = Field(default_factory=list)
+    grep_or_test_selection_relevant_to_validations: list[str] = Field(default_factory=list)
+    summary_truncated: bool = False
+
+
+class ValidationOutput(BaseModel):
+    validation_id: str
+    command: str
+    exit_code: int | None = None
+    type: Literal["static", "behavioral"]
+    outcome: Literal["pass", "fail"]
+    passed: bool
+    sequence: int
+    stdout_or_summary: str
+    stderr_or_summary: str | None = None
+    output_truncated: bool = False
+    detected_test_names: list[str] = Field(default_factory=list)
+    target_files_or_test_files: list[str] = Field(default_factory=list)
+    was_filtered: bool = False
+    raw_selector: str | None = None
+    executed_test_names: list[str] = Field(default_factory=list)
+    passed_count: int | None = None
+    failed_count: int | None = None
+
+
+class DiffPacketLimits(BaseModel):
+    total_diff_chars: int = 0
+    total_context_chars: int = 0
+    omitted_changed_files: list[str] = Field(default_factory=list)
+    materially_truncated: bool = False
+    truncation_reason: str | None = None
 
 
 class SupervisorWakePacket(BaseModel):
@@ -331,6 +529,18 @@ class SupervisorWakePacket(BaseModel):
     prior_interventions: list[PriorIntervention] = Field(default_factory=list)
     changed_files: list[ChangedFile] = Field(default_factory=list)
     patch_summary: str | None = None
+    completion_attempt_count: int = 0
+    completion_returns_this_generation: int = 0
+    previous_completion_returns: list[CompletionReturnRecord] = Field(default_factory=list)
+    last_readiness_marker_sequence: int | None = None
+    no_marker_idle_nudge_count: int = 0
+    latest_relevant_change_sequence: int | None = None
+    validation_freshness_summary: str | None = None
+    changed_file_diffs: list[ChangedFileDiff] = Field(default_factory=list)
+    changed_file_contexts: list[ChangedFileContext] = Field(default_factory=list)
+    changed_tests_summary: list[ChangedTestsSummary] = Field(default_factory=list)
+    validation_outputs: list[ValidationOutput] = Field(default_factory=list)
+    diff_packet_limits: DiffPacketLimits = Field(default_factory=DiffPacketLimits)
 
 
 class FinalReport(BaseModel):
@@ -342,7 +552,14 @@ class FinalReport(BaseModel):
     denied_actions: list[str] = Field(default_factory=list)
     interventions: int = 0
     restarts: int = 0
+    completion_review_accepted: bool = False
+    completion_returns: int = 0
+    completion_restarts: int = 0
+    no_marker_idle_nudges: int = 0
     remaining_risks: list[str] = Field(default_factory=list)
+    behavior_evidence_summary: list[str] = Field(default_factory=list)
+    files_reviewed_summary: list[str] = Field(default_factory=list)
+    packet_or_access_limitations: list[str] = Field(default_factory=list)
     diff_summary: str | None = None
 
 
@@ -477,6 +694,14 @@ def json_schema_for_supervisor_decision() -> dict[str, Any]:
 
 def openai_strict_json_schema_for_supervisor_decision() -> dict[str, Any]:
     return openai_strict_json_schema(json_schema_for_supervisor_decision())
+
+
+def json_schema_for_completion_review_decision() -> dict[str, Any]:
+    return CompletionReviewDecision.model_json_schema()
+
+
+def openai_strict_json_schema_for_completion_review_decision() -> dict[str, Any]:
+    return openai_strict_json_schema(json_schema_for_completion_review_decision())
 
 
 def openai_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:

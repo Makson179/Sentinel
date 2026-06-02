@@ -1,12 +1,47 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from supervisor.appserver import AppServerClient, text_input
+from supervisor.appserver import (
+    APP_SERVER_CODER_RPC_TIMEOUT_SECONDS,
+    APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    AppServerClient,
+    AppServerError,
+    text_input,
+)
 from supervisor.prompts import build_coder_prompt, build_restart_prompt
 from supervisor.state import StateStore
+
+
+CODER_SANDBOX_ENV = "SENTINEL_CODER_SANDBOX"
+CODER_SANDBOX_READ_ONLY = "read-only"
+CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
+
+
+def coder_sandbox_mode() -> str:
+    raw = os.environ.get(CODER_SANDBOX_ENV, CODER_SANDBOX_READ_ONLY).strip().lower()
+    aliases = {
+        "read-only": CODER_SANDBOX_READ_ONLY,
+        "readonly": CODER_SANDBOX_READ_ONLY,
+        "read_only": CODER_SANDBOX_READ_ONLY,
+        "danger-full-access": CODER_SANDBOX_DANGER_FULL_ACCESS,
+        "danger_full_access": CODER_SANDBOX_DANGER_FULL_ACCESS,
+        "danger": CODER_SANDBOX_DANGER_FULL_ACCESS,
+    }
+    try:
+        return aliases[raw]
+    except KeyError as exc:
+        supported = f"{CODER_SANDBOX_READ_ONLY}, {CODER_SANDBOX_DANGER_FULL_ACCESS}"
+        raise RuntimeError(f"unsupported {CODER_SANDBOX_ENV}={raw!r}; expected one of: {supported}") from exc
+
+
+def coder_turn_sandbox_policy() -> dict[str, Any]:
+    if coder_sandbox_mode() == CODER_SANDBOX_DANGER_FULL_ACCESS:
+        return {"type": "dangerFullAccess"}
+    return {"type": "readOnly", "networkAccess": False}
 
 
 def coder_thread_params(project_root: Path, *, model: str | None = None) -> dict[str, Any]:
@@ -15,7 +50,7 @@ def coder_thread_params(project_root: Path, *, model: str | None = None) -> dict
         "runtimeWorkspaceRoots": [str(project_root)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
-        "sandbox": "read-only",
+        "sandbox": coder_sandbox_mode(),
         "ephemeral": False,
         "experimentalRawEvents": False,
         "persistExtendedHistory": False,
@@ -33,7 +68,7 @@ def coder_turn_params(thread_id: str, text: str, project_root: Path, *, model: s
         "runtimeWorkspaceRoots": [str(project_root)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
-        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+        "sandboxPolicy": coder_turn_sandbox_policy(),
     }
     if model:
         params["model"] = model
@@ -49,9 +84,13 @@ class CoderSession:
     model: str | None = None
     thread_id: str | None = None
     active_turn_id: str | None = None
+    coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
 
     async def start_thread(self) -> str:
-        response = await self.client.thread_start(coder_thread_params(self.project_root, model=self.model))
+        response = await self.client.thread_start(
+            coder_thread_params(self.project_root, model=self.model),
+            timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+        )
         thread = response.get("thread", {})
         thread_id = thread.get("id")
         if not isinstance(thread_id, str):
@@ -68,7 +107,10 @@ class CoderSession:
 
     async def start_turn(self, message: str) -> str:
         thread_id = self.thread_id or await self.start_thread()
-        response = await self.client.turn_start(coder_turn_params(thread_id, message, self.project_root, model=self.model))
+        response = await self.client.turn_start(
+            coder_turn_params(thread_id, message, self.project_root, model=self.model),
+            timeout=self.coder_rpc_timeout_seconds,
+        )
         turn = response.get("turn", {})
         turn_id = turn.get("id")
         if not isinstance(turn_id, str):
@@ -80,8 +122,15 @@ class CoderSession:
     async def steer_or_start(self, message: str) -> str | None:
         if self.thread_id and self.active_turn_id:
             try:
-                await self.client.turn_steer(self.thread_id, self.active_turn_id, message)
+                await self.client.turn_steer(
+                    self.thread_id,
+                    self.active_turn_id,
+                    message,
+                    timeout=self.coder_rpc_timeout_seconds,
+                )
                 return self.active_turn_id
+            except AppServerError:
+                raise
             except Exception:
                 self.active_turn_id = None
                 self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
@@ -92,7 +141,11 @@ class CoderSession:
     async def interrupt(self) -> None:
         if not self.thread_id or not self.active_turn_id:
             return
-        await self.client.turn_interrupt(self.thread_id, self.active_turn_id)
+        await self.client.turn_interrupt(
+            self.thread_id,
+            self.active_turn_id,
+            timeout=self.coder_rpc_timeout_seconds,
+        )
 
     def mark_turn_completed(self, turn_id: str) -> None:
         if self.active_turn_id == turn_id:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
+from typing import Any, Coroutine
 
 import click
 
@@ -31,11 +33,29 @@ def cli(
 ) -> None:
     if ctx.invoked_subcommand is None:
         try:
-            asyncio.run(_run_sentinel(task_path, model, start_over, clean))
+            _run_async_cleanly(_run_sentinel(task_path, model, start_over, clean))
         except TaskSelectionError as exc:
             raise click.ClickException(str(exc)) from exc
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
+
+
+def _run_async_cleanly(coro: Coroutine[Any, Any, Any]) -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(coro)
+    finally:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+        asyncio.set_event_loop(None)
+        loop.close()
+    sys.exit(0)
 
 
 async def _run_sentinel(

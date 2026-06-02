@@ -17,8 +17,9 @@ Sentinel runs two kinds of Codex work:
 - **Coder**: a persistent Codex thread that reads the selected task file, edits
   code, runs commands, and validates the task.
 - **Supervisor**: short-lived stateless Codex turns that review compact state
-  packets and decide whether to continue, approve, deny, steer, restart, pause,
-  or complete.
+  packets. Runtime monitor turns decide whether to continue, approve, deny,
+  steer, restart, or pause; a dedicated completion-review turn accepts or
+  returns final readiness after the coder emits the readiness marker.
 
 The human talks to Sentinel, not directly to the coder. Normal approval prompts
 should not reach the human during a run.
@@ -34,7 +35,7 @@ Sentinel separates those roles:
 - dangerous actions are denied automatically;
 - gray-zone actions are reviewed by a fresh stateless supervisor turn;
 - the coder can be steered or restarted when it drifts;
-- completion is accepted only by the supervisor;
+- completion is accepted only by dedicated completion review;
 - state and decisions are written to `.supervisor/` for inspection.
 
 This is designed for unattended work with controlled risk, not for perfect
@@ -112,7 +113,7 @@ If one of these fails, Sentinel exits before real work starts.
 The coder receives an instruction like:
 
 ```text
-You are the coding agent for this supervised run.
+You are the coding agent for this task.
 
 Read the selected task file first:
 <absolute task path>
@@ -121,11 +122,11 @@ Complete the task autonomously. When a command, file edit, network access,
 MCP/app action, or other operation requires approval, request permission
 through Codex's normal approval flow. Do not ask the human in chat.
 
-The supervisor/controller is the approval authority. It may approve, deny,
-steer, interrupt, or restart you.
+When work is ready, include Summary, Validation, and the exact readiness marker
+on its own line.
 
 Use minimal changes. Prefer project conventions. Validate your work before
-claiming completion.
+declaring readiness.
 ```
 
 The supervisor does not keep a long chat history. Each supervisor decision gets
@@ -142,10 +143,16 @@ a compact packet containing:
 - current git diff summary;
 - generation and restart count.
 
-The supervisor returns strict JSON with one decision:
+The runtime monitor returns strict JSON with one decision:
 
 ```text
-noop | approve | deny | intervene | restart | complete | pause
+noop | approve | deny | intervene | restart | pause
+```
+
+Completion review uses a separate strict schema:
+
+```text
+accept | return | restart
 ```
 
 ## Prompt Configuration
@@ -160,7 +167,8 @@ It contains:
 
 - `coder_initial.template`;
 - `coder_restart.template`;
-- `stateless_supervisor.instructions`;
+- `stateless_supervisor.body_sections`;
+- `stateless_supervisor.sections.*`;
 - `legacy_supervisor.instructions`.
 
 The coder templates support the `{task_path}` placeholder. Sentinel loads this

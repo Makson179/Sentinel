@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import secrets
@@ -16,7 +17,6 @@ from supervisor.ipc import IPCServer
 from supervisor.llm_driver import ClaudeSubscriptionDriver, CodexSubscriptionDriver, LLMDriver, LLMDriverError, OpenRouterDriver, ParseFailure
 from supervisor.policy import AllowRule, PolicyEngine, SessionAllowRules
 from supervisor.process import ManagedProcess, launch_process
-from supervisor.prompts import build_supervisor_prompt
 from supervisor.schemas import (
     DecisionLogEntry,
     DecisionType,
@@ -34,6 +34,14 @@ from supervisor.schemas import (
 )
 from supervisor.state import DECISIONS, PROGRESS, StateStore
 from supervisor.timing import DebouncedTimer, HookBudget, fallback_response
+
+
+WRAPPER_SUPERVISOR_INSTRUCTIONS = [
+    "Return only JSON matching the provided supervisor decision schema.",
+    "Prefer minimum human involvement and robust autonomous supervision.",
+    "For gray-zone permissions, choose allow_once, allow_class, or deny.",
+    "Confirm kill_restart only when deterministic evidence shows the current generation is stuck.",
+]
 
 
 class SupervisorWrapper:
@@ -239,7 +247,12 @@ class SupervisorWrapper:
 
     async def _call_llm(self, event: HookEvent, sequence: int) -> LLMDecision:
         snapshot = self.snapshot()
-        prompt = build_supervisor_prompt(event, snapshot, sequence, self.store.read_text(self.config.plan_file_path, ""))
+        prompt = build_wrapper_supervisor_prompt(
+            event,
+            snapshot,
+            sequence,
+            self.store.read_text(self.config.plan_file_path, ""),
+        )
         try:
             decision = await self.llm_driver.decide(prompt, timeout_seconds=self.config.hook_timeout_seconds * 0.9)
         except ParseFailure:
@@ -417,3 +430,16 @@ class SupervisorWrapper:
             f"Timeout fallbacks: {health.timeout_fallback_count}\n"
             f"Parse failures: {health.parse_failure_count}\n"
         )
+
+
+def build_wrapper_supervisor_prompt(event: HookEvent, snapshot: StateSnapshot, sequence: int, objective: str) -> str:
+    payload = {
+        "objective": objective,
+        "sequence": sequence,
+        "generation": snapshot.health.generation,
+        "event": event.model_dump(mode="json"),
+        "state": snapshot.model_dump(mode="json"),
+        "decision_schema": LLMDecision.model_json_schema(),
+        "instructions": WRAPPER_SUPERVISOR_INSTRUCTIONS,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)

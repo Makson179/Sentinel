@@ -33,7 +33,6 @@ def apply_delta(state: HealthState, delta: HealthDelta) -> HealthState:
     if delta.last_progress_sequence is not None:
         state.last_progress_sequence = max(state.last_progress_sequence, delta.last_progress_sequence)
         state.minutes_without_progress = 0
-        state.interventions = 0
         state.consecutive_failed_tests = 0
         state.repeated_command_count = 0
     if delta.clear_risk_signals:
@@ -59,9 +58,12 @@ def kill_restart_candidate(state: HealthState) -> tuple[bool, str | None]:
         return True, "fifteen minutes without progress"
     if "bypass_after_denial" in state.risk_signals:
         return True, "bypass/rephrase attempt after denial"
+    if "completion_non_convergence" in state.risk_signals:
+        return True, "completion review non-convergence"
+    if "no_marker_idle_loop" in state.risk_signals:
+        return True, "coder repeatedly idled without readiness marker"
     if state.timeout_fallback_count >= 3:
         return True, "repeated timeout fallbacks"
     if state.parse_failure_count >= 3:
         return True, "repeated parse failures"
     return False, None
-

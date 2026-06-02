@@ -26,6 +26,7 @@ HANDOFF = "HANDOFF.md"
 FINAL_REPORT = "FINAL_REPORT.md"
 LOG = "log.jsonl"
 EVENTS = "events.jsonl"
+SUPERVISOR_WAKES = "supervisor_wakes.jsonl"
 AGENT_SETTINGS = "agent-settings.json"
 
 
@@ -146,6 +147,7 @@ class StateStore:
             FINAL_REPORT: "",
             LOG: "",
             EVENTS: "",
+            SUPERVISOR_WAKES: "",
         }
         for name, value in files.items():
             path = self.path(name)
@@ -219,6 +221,7 @@ class StateStore:
             FINAL_REPORT: "",
             LOG: "",
             EVENTS: "",
+            SUPERVISOR_WAKES: "",
         }
         for name, value in files.items():
             path = self.path(name)
@@ -245,6 +248,9 @@ class StateStore:
     def append_raw_log(self, entry: dict[str, Any]) -> None:
         self.append_text_locked(LOG, json.dumps(entry, default=str, sort_keys=True) + "\n")
 
+    def append_supervisor_wake(self, entry: dict[str, Any]) -> None:
+        self.append_text_locked(SUPERVISOR_WAKES, json.dumps(entry, default=str, sort_keys=True) + "\n")
+
     def read_recent_events(self, limit: int = 50) -> list[dict[str, Any]]:
         raw = self.read_text(EVENTS, "")
         lines = [line for line in raw.splitlines() if line.strip()]
@@ -268,11 +274,21 @@ class StateStore:
                 f"- Result: {report.result}",
                 f"- Restarts: {report.restarts}",
                 f"- Interventions: {report.interventions}",
+                f"- Completion review accepted: {str(report.completion_review_accepted).lower()}",
+                f"- Completion returns: {report.completion_returns}",
+                f"- Completion restarts: {report.completion_restarts}",
+                f"- No-marker idle nudges: {report.no_marker_idle_nudges}",
             ]
             if report.files_changed:
                 lines.extend(["", "## Files Changed", *[f"- {path}" for path in report.files_changed]])
             if report.validations:
                 lines.extend(["", "## Validations", *[f"- {item}" for item in report.validations]])
+            if report.behavior_evidence_summary:
+                lines.extend(["", "## Completion Behavior Evidence", *[f"- {item}" for item in report.behavior_evidence_summary]])
+            if report.files_reviewed_summary:
+                lines.extend(["", "## Completion Files Reviewed", *[f"- {item}" for item in report.files_reviewed_summary]])
+            if report.packet_or_access_limitations:
+                lines.extend(["", "## Packet Or Access Limitations", *[f"- {item}" for item in report.packet_or_access_limitations]])
             if report.denied_actions:
                 lines.extend(["", "## Denied Actions", *[f"- {item}" for item in report.denied_actions]])
             if report.remaining_risks:

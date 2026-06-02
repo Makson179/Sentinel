@@ -16,6 +16,10 @@ class AppServerProtocolError(AppServerError):
     pass
 
 
+class AppServerTimeoutError(AppServerError):
+    pass
+
+
 @dataclass(frozen=True)
 class AppServerMessage:
     raw: dict[str, Any]
@@ -49,6 +53,14 @@ class AppServerMessage:
 
 NotificationHandler = Callable[[AppServerMessage], Awaitable[None] | None]
 ServerRequestHandler = Callable[[AppServerMessage], Awaitable[None] | None]
+TransportErrorHandler = Callable[[BaseException], Awaitable[None] | None]
+
+APP_SERVER_STDOUT_LIMIT = 16 * 1024 * 1024
+APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS = 30.0
+APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS = 30.0
+APP_SERVER_RESPOND_TIMEOUT_SECONDS = 15.0
+APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS = 10.0
+APP_SERVER_CODER_RPC_TIMEOUT_SECONDS = 1800.0
 
 
 class AppServerClient:
@@ -59,11 +71,15 @@ class AppServerClient:
         cwd: Path | None = None,
         notification_handler: NotificationHandler | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        transport_error_handler: TransportErrorHandler | None = None,
+        stdout_limit: int = APP_SERVER_STDOUT_LIMIT,
     ):
         self.command = command or ["codex", "app-server", "--listen", "stdio://"]
         self.cwd = cwd
         self.notification_handler = notification_handler
         self.server_request_handler = server_request_handler
+        self.transport_error_handler = transport_error_handler
+        self.stdout_limit = stdout_limit
         self.process: asyncio.subprocess.Process | None = None
         self._next_id = 1
         self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
@@ -71,6 +87,7 @@ class AppServerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._waiters: list[tuple[Callable[[AppServerMessage], bool], asyncio.Future[AppServerMessage]]] = []
         self.incoming: asyncio.Queue[AppServerMessage] = asyncio.Queue()
+        self.reader_error: BaseException | None = None
 
     async def start(self) -> None:
         if self.process is not None:
@@ -81,6 +98,7 @@ class AppServerClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=self.stdout_limit,
         )
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -110,18 +128,25 @@ class AppServerClient:
                     await self.process.wait()
             self.process = None
 
-    async def initialize(self) -> dict[str, Any]:
+    async def initialize(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
         result = await self.request(
             "initialize",
             {
                 "clientInfo": {"name": "sentinel", "title": "Sentinel", "version": "0.1.0"},
                 "capabilities": {"experimentalApi": True, "requestAttestation": False},
             },
+            timeout=timeout,
         )
-        await self.notify("initialized")
+        await self.notify("initialized", timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS)
         return result
 
-    async def request(self, method: str, params: Any = None, *, timeout: float | None = None) -> dict[str, Any]:
+    async def request(
+        self,
+        method: str,
+        params: Any = None,
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         await self._ensure_started()
         request_id = self._next_id
         self._next_id += 1
@@ -130,85 +155,155 @@ class AppServerClient:
             payload["params"] = params
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._send(payload)
         try:
+            await self._send_with_timeout(payload, timeout, stage=f"app-server RPC {method} send")
             return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise AppServerTimeoutError(f"app-server RPC {method} response timed out after {timeout:g}s") from exc
         finally:
             self._pending.pop(request_id, None)
 
-    async def notify(self, method: str, params: Any = None) -> None:
+    async def notify(
+        self,
+        method: str,
+        params: Any = None,
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> None:
         await self._ensure_started()
         payload: dict[str, Any] = {"method": method}
         if params is not None:
             payload["params"] = params
-        await self._send(payload)
+        await self._send_with_timeout(payload, timeout, stage=f"app-server notification {method} send")
 
-    async def respond(self, request_id: int | str, result: Any = None, error: Any = None) -> None:
+    async def respond(
+        self,
+        request_id: int | str,
+        result: Any = None,
+        error: Any = None,
+        *,
+        timeout: float = APP_SERVER_RESPOND_TIMEOUT_SECONDS,
+    ) -> None:
         await self._ensure_started()
         payload: dict[str, Any] = {"id": request_id}
         if error is not None:
             payload["error"] = error
         else:
             payload["result"] = result if result is not None else {}
-        await self._send(payload)
+        await self._send_with_timeout(payload, timeout, stage=f"app-server respond {request_id} send")
 
     async def wait_for_notification(
         self,
         predicate: Callable[[AppServerMessage], bool],
         *,
-        timeout: float | None = None,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
     ) -> AppServerMessage:
         future: asyncio.Future[AppServerMessage] = asyncio.get_running_loop().create_future()
         self._waiters.append((predicate, future))
         try:
             return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise AppServerTimeoutError(f"app-server notification wait timed out after {timeout:g}s") from exc
         finally:
             self._waiters = [(pred, fut) for pred, fut in self._waiters if fut is not future]
 
-    async def config_requirements_read(self) -> dict[str, Any]:
-        return await self.request("configRequirements/read")
+    async def config_requirements_read(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
+        return await self.request("configRequirements/read", timeout=timeout)
 
-    async def account_read(self) -> dict[str, Any]:
-        return await self.request("account/read", {"refreshToken": False})
+    async def account_read(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
+        return await self.request("account/read", {"refreshToken": False}, timeout=timeout)
 
-    async def account_rate_limits_read(self) -> dict[str, Any]:
-        return await self.request("account/rateLimits/read")
+    async def account_rate_limits_read(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
+        return await self.request("account/rateLimits/read", timeout=timeout)
 
-    async def model_list(self) -> dict[str, Any]:
-        return await self.request("model/list", {})
+    async def model_list(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
+        return await self.request("model/list", {}, timeout=timeout)
 
-    async def thread_start(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await self.request("thread/start", params)
+    async def thread_start(
+        self,
+        params: dict[str, Any],
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/start", params, timeout=timeout)
 
-    async def thread_resume(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await self.request("thread/resume", params)
+    async def thread_resume(
+        self,
+        params: dict[str, Any],
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/resume", params, timeout=timeout)
 
-    async def thread_read(self, thread_id: str, *, include_turns: bool = True) -> dict[str, Any]:
-        return await self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns})
+    async def thread_read(
+        self,
+        thread_id: str,
+        *,
+        include_turns: bool = True,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns}, timeout=timeout)
 
-    async def thread_turns_list(self, thread_id: str, *, limit: int = 10, items_view: str = "full") -> dict[str, Any]:
+    async def thread_turns_list(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 10,
+        items_view: str = "full",
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         return await self.request(
             "thread/turns/list",
             {"threadId": thread_id, "limit": limit, "itemsView": items_view},
+            timeout=timeout,
         )
 
-    async def thread_archive(self, thread_id: str) -> dict[str, Any]:
-        return await self.request("thread/archive", {"threadId": thread_id})
+    async def thread_archive(
+        self,
+        thread_id: str,
+        *,
+        timeout: float = APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/archive", {"threadId": thread_id}, timeout=timeout)
 
-    async def thread_unsubscribe(self, thread_id: str) -> dict[str, Any]:
-        return await self.request("thread/unsubscribe", {"threadId": thread_id})
+    async def thread_unsubscribe(
+        self,
+        thread_id: str,
+        *,
+        timeout: float = APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/unsubscribe", {"threadId": thread_id}, timeout=timeout)
 
-    async def turn_start(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await self.request("turn/start", params)
+    async def turn_start(
+        self,
+        params: dict[str, Any],
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("turn/start", params, timeout=timeout)
 
-    async def turn_steer(self, thread_id: str, expected_turn_id: str, text: str) -> dict[str, Any]:
+    async def turn_steer(
+        self,
+        thread_id: str,
+        expected_turn_id: str,
+        text: str,
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         return await self.request(
             "turn/steer",
             {"threadId": thread_id, "expectedTurnId": expected_turn_id, "input": [text_input(text)]},
+            timeout=timeout,
         )
 
-    async def turn_interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
-        return await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+    async def turn_interrupt(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=timeout)
 
     async def _ensure_started(self) -> None:
         if self.process is None:
@@ -223,14 +318,24 @@ class AppServerClient:
         self.process.stdin.write(data)
         await self.process.stdin.drain()
 
+    async def _send_with_timeout(self, payload: dict[str, Any], timeout: float, *, stage: str) -> None:
+        try:
+            await asyncio.wait_for(self._send(payload), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise AppServerTimeoutError(f"{stage} timed out after {timeout:g}s") from exc
+
     async def _read_loop(self) -> None:
         assert self.process is not None
-        if self.process.stdout is None:
-            raise AppServerError("app-server process has no stdout")
+        error: BaseException | None = None
         try:
+            if self.process.stdout is None:
+                raise AppServerError("app-server process has no stdout")
             while True:
                 line = await self.process.stdout.readline()
                 if not line:
+                    error = AppServerError("app-server stream closed")
+                    self.reader_error = error
+                    await self._notify_transport_error(error)
                     break
                 try:
                     raw = json.loads(line.decode("utf-8"))
@@ -240,10 +345,36 @@ class AppServerClient:
                     continue
                 message = AppServerMessage(raw)
                 await self._dispatch(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = self._normalize_reader_error(exc)
+            self.reader_error = error
+            await self._notify_transport_error(error)
         finally:
+            pending_error = error or AppServerError("app-server stream closed")
             for future in list(self._pending.values()):
                 if not future.done():
-                    future.set_exception(AppServerError("app-server stream closed"))
+                    future.set_exception(pending_error)
+
+    def _normalize_reader_error(self, exc: Exception) -> AppServerError:
+        if isinstance(exc, AppServerError):
+            return exc
+        if isinstance(exc, ValueError) and "chunk is longer than limit" in str(exc):
+            return AppServerProtocolError(
+                f"app-server stdout line exceeded stream limit ({self.stdout_limit} bytes): {exc}"
+            )
+        return AppServerError(f"app-server stream reader failed: {exc}")
+
+    async def _notify_transport_error(self, error: BaseException) -> None:
+        if self.transport_error_handler is None:
+            return
+        try:
+            result = self.transport_error_handler(error)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            pass
 
     async def _drain_stderr(self) -> None:
         if self.process is None or self.process.stderr is None:

@@ -20,6 +20,15 @@ def test_health_concurrent_delta_application(store: StateStore) -> None:
     assert health.interventions == 100
 
 
+def test_progress_update_preserves_active_task_intervention_count(store: StateStore) -> None:
+    patch_health(store, HealthDelta(generation=0, interventions=2))
+    patch_health(store, HealthDelta(generation=0, last_progress_sequence=1071))
+
+    health = store.get_health()
+    assert health.last_progress_sequence == 1071
+    assert health.interventions == 2
+
+
 def test_pending_intervention_claim_clear_is_atomic(store: StateStore) -> None:
     store.write_pending(PendingIntervention(generation=0, sequence=10, message="Fix the approach."))
 

@@ -7,7 +7,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from supervisor.schemas import HookEvent, StateSnapshot, SupervisorWakePacket
+from supervisor.schemas import SupervisorWakePacket
 
 
 PROMPTS_ENV_VAR = "SENTINEL_PROMPTS_FILE"
@@ -17,18 +17,6 @@ PROMPTS_RESOURCE = "prompts.toml"
 def clear_prompt_cache() -> None:
     """Compatibility hook; prompts are loaded fresh on every build."""
     return None
-
-
-def build_supervisor_prompt(event: HookEvent, snapshot: StateSnapshot, sequence: int, objective: str) -> str:
-    payload = {
-        "objective": objective,
-        "sequence": sequence,
-        "generation": snapshot.health.generation,
-        "event": event.model_dump(mode="json"),
-        "state": snapshot.model_dump(mode="json"),
-        "instructions": _instructions("legacy_supervisor"),
-    }
-    return json.dumps(payload, indent=2, sort_keys=True)
 
 
 def build_coder_prompt(task_path: Path) -> str:
@@ -42,6 +30,14 @@ def build_restart_prompt(task_path: Path) -> str:
 def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
     payload = packet.model_dump(mode="json")
     section_names = _stateless_supervisor_section_names(packet)
+    payload["prompt_sections"] = section_names
+    payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
+    payload = packet.model_dump(mode="json")
+    section_names = _completion_review_section_names(packet)
     payload["prompt_sections"] = section_names
     payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
     return json.dumps(payload, indent=2, sort_keys=True)
@@ -73,22 +69,12 @@ def _template(name: str) -> str:
     return value
 
 
-def _instructions(name: str) -> list[str]:
-    value = _section(name).get("instructions")
-    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
-        raise RuntimeError(f"prompt section [{name}] must define non-empty string instructions")
-    return list(value)
-
-
 def _stateless_supervisor_section_names(packet: SupervisorWakePacket) -> list[str]:
     root = _section("stateless_supervisor")
-    legacy = root.get("instructions")
-    if isinstance(legacy, list):
-        return ["stateless_supervisor"]
     body_sections = root.get("body_sections")
     if not isinstance(body_sections, list) or not body_sections:
         raise RuntimeError("[stateless_supervisor] must define body_sections")
-    names = [str(name) for name in body_sections]
+    names = _section_name_list(body_sections, key="body_sections")
     if packet.handoff is not None:
         names.append("handoff")
     if packet.approval_context is not None or packet.triggering_server_request_id is not None:
@@ -100,9 +86,24 @@ def _stateless_supervisor_section_names(packet: SupervisorWakePacket) -> list[st
     return names
 
 
+def _completion_review_section_names(packet: SupervisorWakePacket) -> list[str]:
+    root = _section("stateless_supervisor")
+    body_sections = root.get("completion_body_sections")
+    if not isinstance(body_sections, list) or not body_sections:
+        raise RuntimeError("[stateless_supervisor] must define completion_body_sections")
+    return _section_name_list(body_sections, key="completion_body_sections")
+
+
+def _section_name_list(value: list[Any], *, key: str) -> list[str]:
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise RuntimeError(f"[stateless_supervisor] {key} must contain non-empty section names")
+        names.append(item)
+    return names
+
+
 def _stateless_supervisor_section_text(name: str) -> str:
-    if name == "stateless_supervisor":
-        return "\n\n".join(_instructions("stateless_supervisor"))
     root = _section("stateless_supervisor")
     sections = root.get("sections")
     if not isinstance(sections, dict):
