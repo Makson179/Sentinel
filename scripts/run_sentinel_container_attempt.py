@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
+import os
 import re
+import select
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import textwrap
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +28,16 @@ DATASET = "ScaleAI/SWE-bench_Pro"
 CONTAINER_CWD = "/app"
 DEFAULT_DOCKERHUB_USERNAME = "jefzda"
 DEFAULT_PLATFORM = "linux/amd64"
+CODEX_WEB_SEARCH_DISABLED_CONFIG = 'web_search="disabled"'
+DEFAULT_EGRESS_NETWORK = "sentinel-egress"
+DEFAULT_EGRESS_SUBNET = "172.31.250.0/24"
+DEFAULT_EGRESS_GATEWAY = "172.31.250.1"
+DEFAULT_EGRESS_ALLOW_DOMAINS = (
+    "chatgpt.com",
+    ".chatgpt.com",
+    ".openai.com",
+)
+EGRESS_STATE_ROOT = Path("/tmp/sentinel-egress-isolation")
 
 
 @dataclass(frozen=True)
@@ -33,6 +51,27 @@ class RunPaths:
     artifacts: Path
     rollouts: Path
     scoring: Path
+
+
+@dataclass(frozen=True)
+class EgressConfig:
+    network_name: str
+    subnet: str
+    gateway: str
+    proxy_port: int
+    allow_domains: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class EgressRuntime:
+    network_name: str
+    subnet: str
+    gateway: str
+    proxy_port: int
+    proxy_url: str
+    allow_domains: tuple[str, ...]
+    common_iptables_rules: tuple[tuple[str, ...], ...]
+    proxy_iptables_rule: tuple[str, ...]
 
 
 def main() -> int:
@@ -50,15 +89,35 @@ def main() -> int:
         raise SystemExit(f"--task-id {args.task_id!r} does not match instance JSON {task_id!r}")
 
     write_json(paths.private / "instance.json", instance)
-    task_text = decode_problem_statement(str(instance["problem_statement"]))
-    (paths.attempt_input / "TASK.md").write_text(task_text.rstrip() + "\n", encoding="utf-8")
+    task_text = compose_task_text(instance)
+    (paths.attempt_input / "TASK.md").write_text(task_text, encoding="utf-8")
+    if args.agent_mode == "raw-codex":
+        assert args.raw_prompt_file is not None
+        raw_prompt_text = args.raw_prompt_file.expanduser().resolve().read_text(encoding="utf-8")
+        (paths.attempt_input / "RAW_CODEX_PROMPT.md").write_text(
+            compose_raw_codex_prompt(raw_prompt_text),
+            encoding="utf-8",
+        )
     runtime_config = prepare_codex_runtime_config(args.auth_dir.expanduser().resolve(), paths)
 
     base_image = args.base_image or dockerhub_image(instance, args.dockerhub_username)
-    attempt_image = args.attempt_image or f"sentinel-attempt:{safe_tag(task_id)}-{timestamp}"
+    run_token = make_run_token(task_id, paths.root, timestamp)
+    container_name = f"sentinel-attempt-{run_token}"
+    attempt_image = args.attempt_image or f"sentinel-attempt:{safe_tag(task_id)[:72]}-{run_token[-16:]}"
     codex_version = args.codex_version or detect_codex_version()
+    write_json(
+        paths.attempt / "runner-identity.json",
+        {
+            "run_token": run_token,
+            "container_name": container_name,
+            "attempt_image": attempt_image,
+            "agent_mode": args.agent_mode,
+        },
+    )
 
     print(f"results_root={paths.root}")
+    print(f"agent_mode={args.agent_mode}")
+    print(f"container_name={container_name}")
     print(f"base_image={base_image}")
     print(f"attempt_image={attempt_image}")
     print(f"codex_version={codex_version}")
@@ -75,17 +134,32 @@ def main() -> int:
             platform=args.platform,
         )
 
+    egress_config = None
+    if not args.disable_egress_isolation:
+        allow_domains = tuple(args.egress_allow_domain or DEFAULT_EGRESS_ALLOW_DOMAINS)
+        egress_config = EgressConfig(
+            network_name=args.egress_network_name,
+            subnet=args.egress_subnet,
+            gateway=args.egress_gateway,
+            proxy_port=args.egress_proxy_port,
+            allow_domains=allow_domains,
+        )
+
     start_utc = datetime.now(timezone.utc)
-    sentinel_rc = run_attempt_container(
-        image=attempt_image,
-        paths=paths,
-        instance=instance,
-        auth_dir=args.auth_dir.expanduser().resolve(),
-        runtime_config=runtime_config,
-        model=args.model,
-        platform=args.platform,
-        extra_supervisor_args=args.supervisor_args,
-    )
+    with egress_isolation(paths, egress_config, run_token=run_token) as egress:
+        sentinel_rc = run_attempt_container(
+            image=attempt_image,
+            container_name=container_name,
+            paths=paths,
+            instance=instance,
+            auth_dir=args.auth_dir.expanduser().resolve(),
+            runtime_config=runtime_config,
+            model=args.model,
+            platform=args.platform,
+            extra_supervisor_args=args.supervisor_args,
+            egress=egress,
+            agent_mode=args.agent_mode,
+        )
     end_utc = datetime.now(timezone.utc)
 
     summary = collect_rollouts(paths, container_cwd=CONTAINER_CWD, start_utc=start_utc, end_utc=end_utc)
@@ -123,14 +197,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-dir", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
     parser.add_argument("--model", help="Optional model passed to supervisor.")
+    parser.add_argument(
+        "--agent-mode",
+        choices=["supervisor", "raw-codex"],
+        default="supervisor",
+        help="Run either Sentinel supervisor+coder or a single raw Codex coder inside the same harness.",
+    )
+    parser.add_argument(
+        "--raw-prompt-file",
+        type=Path,
+        help="Prompt file used for --agent-mode raw-codex. The canonical TASK.md is still written separately.",
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-score", action="store_true")
+    parser.add_argument(
+        "--disable-egress-isolation",
+        action="store_true",
+        help="Run the attempt container with Docker's default networking and no host egress filter.",
+    )
+    parser.add_argument("--egress-network-name", default=DEFAULT_EGRESS_NETWORK)
+    parser.add_argument("--egress-subnet", default=DEFAULT_EGRESS_SUBNET)
+    parser.add_argument("--egress-gateway", default=DEFAULT_EGRESS_GATEWAY)
+    parser.add_argument("--egress-container-ip", help=argparse.SUPPRESS)
+    parser.add_argument("--egress-proxy-port", type=int, default=0, help="Host proxy port; 0 picks a free port.")
+    parser.add_argument(
+        "--egress-allow-domain",
+        action="append",
+        help="Allowed CONNECT domain for the host egress proxy. Repeat to replace the default allowlist.",
+    )
     parser.add_argument("supervisor_args", nargs=argparse.REMAINDER, help="Extra args after -- are passed to supervisor.")
     args = parser.parse_args()
     if not args.instance_json and not args.task_id:
         parser.error("provide --instance-json or --task-id")
     if args.supervisor_args and args.supervisor_args[0] == "--":
         args.supervisor_args = args.supervisor_args[1:]
+    if args.agent_mode == "raw-codex" and args.raw_prompt_file is None:
+        parser.error("--raw-prompt-file is required with --agent-mode raw-codex")
+    if args.agent_mode == "raw-codex" and args.supervisor_args:
+        parser.error("extra supervisor args are only valid with --agent-mode supervisor")
     return args
 
 
@@ -201,6 +305,10 @@ def prepare_codex_runtime_config(auth_dir: Path, paths: RunPaths) -> Path:
     text = source.read_text(encoding="utf-8")
     if not re.search(r"(?m)^\s*zsh_path\s*=", text):
         text = 'zsh_path = "/usr/bin/zsh"\n' + text
+    if re.search(r"(?m)^\s*web_search\s*=", text):
+        text = re.sub(r"(?m)^\s*web_search\s*=.*$", 'web_search = "disabled"', text, count=1)
+    else:
+        text = 'web_search = "disabled"\n' + text
     runtime_config = paths.private / "codex-container-config.toml"
     runtime_config.write_text(text, encoding="utf-8")
     return runtime_config
@@ -224,17 +332,22 @@ def build_attempt_image(
     dockerfile.write_text(
         textwrap.dedent(
             f"""
+            FROM python:3.11-slim-bullseye AS sentinel-python
             FROM {base_image}
             ARG CODEX_VERSION={codex_version}
             ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+            COPY --from=sentinel-python /usr/local /usr/local
+            COPY --from=sentinel-python /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /usr/lib/x86_64-linux-gnu/
+            COPY --from=sentinel-python /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/
             RUN apt-get update \\
-                && apt-get install -y --no-install-recommends python3.11-venv ca-certificates zsh \\
+                && apt-get install -y --no-install-recommends ca-certificates zsh \\
+                && if ! command -v npm >/dev/null 2>&1; then apt-get install -y --no-install-recommends nodejs npm; fi \\
                 && rm -rf /var/lib/apt/lists/*
             RUN npm install -g @openai/codex@${{CODEX_VERSION}} --no-audit --no-fund
             COPY sentinel-src /opt/sentinel-src
-            RUN python3 -m venv /opt/sentinel-venv \\
-                && /opt/sentinel-venv/bin/python -m pip install --upgrade pip setuptools wheel \\
-                && /opt/sentinel-venv/bin/python -m pip install /opt/sentinel-src
+            RUN /usr/local/bin/python3.11 -m venv /opt/sentinel-venv \\
+                && PIP_INDEX_URL=https://pypi.org/simple PIP_EXTRA_INDEX_URL= /opt/sentinel-venv/bin/python -m pip install --upgrade pip setuptools wheel \\
+                && PIP_INDEX_URL=https://pypi.org/simple PIP_EXTRA_INDEX_URL= /opt/sentinel-venv/bin/python -m pip install /opt/sentinel-src
             ENV SHELL="/usr/bin/zsh"
             ENV PATH="/opt/sentinel-venv/bin:${{PATH}}"
             WORKDIR /app
@@ -285,9 +398,440 @@ def copy_sentinel_source(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, ignore=ignore)
 
 
+class _AllowlistProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        server = self.server
+        assert isinstance(server, _AllowlistProxyServer)
+        self.request.settimeout(10)
+        header = b""
+        while b"\r\n\r\n" not in header and len(header) < 16384:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                break
+            header += chunk
+        first_line = header.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+        parts = first_line.split()
+        if len(parts) < 3 or parts[0].upper() != "CONNECT":
+            server.record("block", first_line or "<empty>", "non-connect")
+            self._send_status(405, "Method Not Allowed")
+            return
+
+        host, sep, port_text = parts[1].rpartition(":")
+        if not sep:
+            server.record("block", parts[1], "missing-port")
+            self._send_status(400, "Bad Request")
+            return
+        try:
+            port = int(port_text)
+        except ValueError:
+            server.record("block", parts[1], "bad-port")
+            self._send_status(400, "Bad Request")
+            return
+
+        target = f"{host}:{port}"
+        if port != 443 or not server.host_allowed(host):
+            server.record("block", target, "not-allowlisted")
+            self._send_status(403, "Forbidden")
+            return
+
+        try:
+            upstream = socket.create_connection((host, port), timeout=15)
+        except OSError as exc:
+            server.record("error", target, f"connect-failed:{exc.__class__.__name__}")
+            self._send_status(502, "Bad Gateway")
+            return
+
+        server.record("allow", target, "allowlisted")
+        try:
+            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            self._tunnel(self.request, upstream)
+        finally:
+            with contextlib.suppress(OSError):
+                upstream.close()
+
+    def _send_status(self, code: int, reason: str) -> None:
+        response = f"HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        with contextlib.suppress(OSError):
+            self.request.sendall(response.encode("ascii"))
+
+    @staticmethod
+    def _tunnel(left: socket.socket, right: socket.socket) -> None:
+        sockets = [left, right]
+        while sockets:
+            readable, _, _ = select.select(sockets, [], [], 120)
+            if not readable:
+                return
+            for source in readable:
+                try:
+                    data = source.recv(65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                target = right if source is left else left
+                try:
+                    target.sendall(data)
+                except OSError:
+                    return
+
+
+class _AllowlistProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int], allow_domains: tuple[str, ...], log_path: Path):
+        super().__init__(server_address, _AllowlistProxyHandler)
+        self.allow_domains = tuple(domain.lower().rstrip(".") for domain in allow_domains)
+        self.log_path = log_path
+        self._log_lock = threading.Lock()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.write_text("", encoding="utf-8")
+
+    def host_allowed(self, host: str) -> bool:
+        normalized = host.lower().rstrip(".")
+        for allowed in self.allow_domains:
+            if allowed.startswith("."):
+                if normalized.endswith(allowed):
+                    return True
+            elif normalized == allowed:
+                return True
+        return False
+
+    def record(self, decision: str, target: str, reason: str) -> None:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "decision": decision,
+            "target": target,
+            "reason": reason,
+        }
+        with self._log_lock:
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+@contextlib.contextmanager
+def egress_isolation(paths: RunPaths, config: EgressConfig | None, *, run_token: str | None = None):
+    if config is None:
+        yield None
+        return
+
+    proxy = _AllowlistProxyServer(("0.0.0.0", config.proxy_port), config.allow_domains, paths.attempt / "egress-proxy.log")
+    proxy_port = int(proxy.server_address[1])
+    thread = threading.Thread(target=proxy.serve_forever, name="sentinel-egress-proxy", daemon=True)
+    thread.start()
+    common_rules = egress_common_iptables_rules(config.subnet, config.gateway)
+    proxy_rule = egress_proxy_iptables_rule(config.subnet, config.gateway, proxy_port)
+    runtime = EgressRuntime(
+        network_name=config.network_name,
+        subnet=config.subnet,
+        gateway=config.gateway,
+        proxy_port=proxy_port,
+        proxy_url=f"http://{config.gateway}:{proxy_port}",
+        allow_domains=config.allow_domains,
+        common_iptables_rules=tuple(tuple(rule) for rule in common_rules),
+        proxy_iptables_rule=tuple(proxy_rule),
+    )
+    holder = run_token or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    shared_state: dict[str, Any] = {}
+    write_json(paths.attempt / "egress-isolation.json", {
+        "holder": holder,
+        "runtime": {
+            "network_name": runtime.network_name,
+            "subnet": runtime.subnet,
+            "gateway": runtime.gateway,
+            "proxy_url": runtime.proxy_url,
+            "allow_domains": list(runtime.allow_domains),
+            "common_iptables_rules": [" ".join(rule) for rule in runtime.common_iptables_rules],
+            "proxy_iptables_rule": " ".join(runtime.proxy_iptables_rule),
+        },
+    })
+    try:
+        shared_state = acquire_egress_shared(config, paths, holder=holder, proxy_port=proxy_port)
+        egress_info_path = paths.attempt / "egress-isolation.json"
+        egress_info = json.loads(egress_info_path.read_text(encoding="utf-8"))
+        egress_info["shared_state"] = shared_state
+        write_json(egress_info_path, egress_info)
+        yield runtime
+    finally:
+        if shared_state:
+            release_egress_shared(config, paths, holder=holder, proxy_port=proxy_port)
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=5)
+
+
+def ensure_docker_network(config: EgressConfig, paths: RunPaths) -> bool:
+    inspect = inspect_docker_network(config.network_name)
+    if inspect.returncode == 0:
+        validate_docker_network(config, inspect.stdout)
+        return False
+
+    cmd = [
+        "docker",
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--subnet",
+        config.subnet,
+        "--gateway",
+        config.gateway,
+        config.network_name,
+    ]
+    log_path = paths.attempt / "egress-docker-network-create.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write("$ " + " ".join(cmd) + "\n")
+        log.flush()
+        created = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+    if created.returncode == 0:
+        return True
+
+    # Another parallel runner may have created the shared network after our
+    # initial inspect. Re-inspect and accept it only if the IPAM config matches.
+    inspect = inspect_docker_network(config.network_name)
+    if inspect.returncode == 0:
+        validate_docker_network(config, inspect.stdout)
+        return False
+    raise SystemExit(
+        f"failed to create docker network {config.network_name!r}; "
+        f"see {log_path}"
+    )
+
+
+def inspect_docker_network(network_name: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", "network", "inspect", network_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def validate_docker_network(config: EgressConfig, inspect_stdout: str) -> None:
+    data = json.loads(inspect_stdout)
+    ipam_configs = ((data[0].get("IPAM") or {}).get("Config") or []) if data else []
+    expected = {"Subnet": config.subnet, "Gateway": config.gateway}
+    if expected not in [{key: item.get(key) for key in expected} for item in ipam_configs]:
+        raise SystemExit(
+            f"docker network {config.network_name!r} exists but does not match "
+            f"subnet={config.subnet} gateway={config.gateway}"
+        )
+
+
+def egress_common_iptables_rules(subnet: str, gateway: str) -> list[list[str]]:
+    return [
+        ["-s", subnet, "-d", gateway, "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+        ["-s", subnet, "-d", gateway, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
+        ["-s", subnet, "-j", "REJECT", "--reject-with", "icmp-port-unreachable"],
+    ]
+
+
+def egress_proxy_iptables_rule(subnet: str, gateway: str, proxy_port: int) -> list[str]:
+    return ["-s", subnet, "-d", gateway, "-p", "tcp", "--dport", str(proxy_port), "-j", "ACCEPT"]
+
+
+def install_iptables_rules(rules: list[list[str]], paths: RunPaths, *, append_log: bool = False) -> None:
+    log_path = paths.attempt / "egress-iptables.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not append_log:
+        log_path.write_text("", encoding="utf-8")
+    # Insert terminal REJECT-style rules first, then allows above them.
+    for rule in reversed(rules):
+        install_iptables_rule(rule, log_path)
+
+
+def install_iptables_rule(rule: list[str], log_path: Path) -> None:
+    with log_path.open("a", encoding="utf-8") as log:
+        check_cmd = ["iptables", "-C", "DOCKER-USER", *rule]
+        log.write("$ " + " ".join(check_cmd) + "\n")
+        log.flush()
+        check = subprocess.run(check_cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+        if check.returncode == 0:
+            log.write("# already present\n")
+            return
+        insert_cmd = ["iptables", "-I", "DOCKER-USER", "1", *rule]
+        log.write("$ " + " ".join(insert_cmd) + "\n")
+        log.flush()
+        subprocess.run(insert_cmd, stdout=log, stderr=subprocess.STDOUT, check=True, text=True)
+
+
+def iptables_rule_present(rule: list[str]) -> bool:
+    return (
+        subprocess.run(
+            ["iptables", "-C", "DOCKER-USER", *rule],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
+def remove_iptables_rules(rules: list[list[str]], paths: RunPaths, *, append_log: bool = False) -> None:
+    log_path = paths.attempt / "egress-iptables-cleanup.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append_log else "w"
+    with log_path.open(mode, encoding="utf-8") as log:
+        for rule in rules:
+            check_cmd = ["iptables", "-C", "DOCKER-USER", *rule]
+            log.write("$ " + " ".join(check_cmd) + "\n")
+            log.flush()
+            check = subprocess.run(check_cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+            if check.returncode != 0:
+                log.write("# absent\n")
+                continue
+            delete_cmd = ["iptables", "-D", "DOCKER-USER", *rule]
+            log.write("$ " + " ".join(delete_cmd) + "\n")
+            log.flush()
+            subprocess.run(delete_cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+
+
+def acquire_egress_shared(config: EgressConfig, paths: RunPaths, *, holder: str, proxy_port: int) -> dict[str, Any]:
+    state_path = egress_state_path(config.network_name)
+    common_rules = egress_common_iptables_rules(config.subnet, config.gateway)
+    proxy_rule = egress_proxy_iptables_rule(config.subnet, config.gateway, proxy_port)
+    with locked_egress_state(config.network_name):
+        network_created = ensure_docker_network(config, paths)
+        state = read_egress_state(state_path)
+        holders = dict(state.get("holders") or {})
+        if holders and not all(iptables_rule_present(rule) for rule in common_rules):
+            holders = {}
+        first_holder = not holders
+        if first_holder:
+            install_iptables_rules(common_rules, paths)
+        else:
+            (paths.attempt / "egress-iptables.log").write_text("", encoding="utf-8")
+        install_iptables_rules([proxy_rule], paths, append_log=True)
+        holders[holder] = {"proxy_port": proxy_port, "results_root": str(paths.root)}
+        write_json(
+            state_path,
+            {
+                "network_name": config.network_name,
+                "subnet": config.subnet,
+                "gateway": config.gateway,
+                "holders": holders,
+            },
+        )
+        return {
+            "state_path": str(state_path),
+            "network_created": network_created,
+            "common_rules_installed": first_holder,
+            "holder_count": len(holders),
+        }
+
+
+def release_egress_shared(config: EgressConfig, paths: RunPaths, *, holder: str, proxy_port: int) -> None:
+    state_path = egress_state_path(config.network_name)
+    common_rules = egress_common_iptables_rules(config.subnet, config.gateway)
+    proxy_rule = egress_proxy_iptables_rule(config.subnet, config.gateway, proxy_port)
+    with locked_egress_state(config.network_name):
+        remove_iptables_rules([proxy_rule], paths)
+        state = read_egress_state(state_path)
+        holders = dict(state.get("holders") or {})
+        holders.pop(holder, None)
+        if holders:
+            write_json(
+                state_path,
+                {
+                    "network_name": config.network_name,
+                    "subnet": config.subnet,
+                    "gateway": config.gateway,
+                    "holders": holders,
+                },
+            )
+            return
+        remove_iptables_rules(common_rules, paths, append_log=True)
+        with contextlib.suppress(FileNotFoundError):
+            state_path.unlink()
+        subprocess.run(["docker", "network", "rm", config.network_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def read_egress_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def egress_state_path(network_name: str) -> Path:
+    return EGRESS_STATE_ROOT / f"{safe_tag(network_name)}.json"
+
+
+@contextlib.contextmanager
+def locked_egress_state(network_name: str):
+    EGRESS_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    lock_path = EGRESS_STATE_ROOT / f"{safe_tag(network_name)}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def git_history_cleanup_script(base_commit: str, *, artifacts_dir: str = "/attempt-out/artifacts") -> str:
+    base = sh_single(base_commit)
+    artifacts = sh_single(artifacts_dir)
+    return textwrap.dedent(
+        f"""
+        mkdir -p {artifacts}
+        {{
+          echo "base_commit={base_commit}"
+          echo "$ git tag -l | xargs -r git tag -d"
+          git tag -l | xargs -r git tag -d
+          echo "$ git for-each-ref --format='%(refname)' refs/remotes | xargs -r -n1 git update-ref -d"
+          git for-each-ref --format='%(refname)' refs/remotes | xargs -r -n1 git update-ref -d
+          echo "$ git remote | while read remote; do git remote remove \"\\$remote\"; done"
+          git remote | while IFS= read -r remote; do git remote remove "$remote" || true; done
+          echo "$ rm -rf .git/refs/remotes"
+          rm -rf .git/refs/remotes
+          current_branch="$(git rev-parse --abbrev-ref HEAD)"
+          if [ "$current_branch" = "HEAD" ]; then
+            echo "$ git checkout -B sentinel-base {base}"
+            git checkout -B sentinel-base {base}
+            current_branch="sentinel-base"
+          fi
+          echo "$ git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \\"$current_branch\\" | xargs -r git branch -D"
+          git for-each-ref --format='%(refname:short)' refs/heads | while IFS= read -r branch; do
+            if [ "$branch" != "$current_branch" ]; then
+              git branch -D "$branch"
+            fi
+          done
+          echo "$ rm -f .git/ORIG_HEAD .git/FETCH_HEAD .git/MERGE_HEAD .git/CHERRY_PICK_HEAD .git/REVERT_HEAD"
+          rm -f .git/ORIG_HEAD .git/FETCH_HEAD .git/MERGE_HEAD .git/CHERRY_PICK_HEAD .git/REVERT_HEAD
+          echo "$ git reflog expire --expire=now --all"
+          git reflog expire --expire=now --all
+          echo "$ git gc --prune=now"
+          git gc --prune=now
+        }} > {artifacts}/git-history-cleanup.log 2>&1
+        {{
+          echo "base_commit={base_commit}"
+          printf "head="
+          git rev-parse HEAD
+          if [ "$(git rev-parse HEAD)" != {base} ]; then
+            echo "ERROR: HEAD moved away from base commit" >&2
+            exit 1
+          fi
+          echo "tags:"
+          git tag -l
+          echo "remote_refs:"
+          git for-each-ref --format='%(refname) %(objectname)' refs/remotes
+          echo "heads:"
+          git for-each-ref --format='%(refname:short) %(objectname)' refs/heads
+          echo "log_all:"
+          git log --all --oneline -20
+        }} > {artifacts}/git-history-cleanup-verify.txt 2>&1
+        """
+    ).strip()
+
+
 def run_attempt_container(
     *,
     image: str,
+    container_name: str,
     paths: RunPaths,
     instance: dict[str, Any],
     auth_dir: Path,
@@ -295,20 +839,25 @@ def run_attempt_container(
     model: str | None,
     platform: str,
     extra_supervisor_args: list[str],
+    egress: EgressRuntime | None,
+    agent_mode: str = "supervisor",
 ) -> int:
     base_commit = str(instance["base_commit"])
+    agent_command = agent_invocation_script(agent_mode=agent_mode, model=model, extra_supervisor_args=extra_supervisor_args)
     command = textwrap.dedent(
         f"""
         set -euo pipefail
         cd /app
         git reset --hard {sh_single(base_commit)}
         git clean -fd
+        {git_history_cleanup_script(base_commit)}
         cp /attempt-input/TASK.md /app/TASK.md
         export SENTINEL_CODER_SANDBOX=danger-full-access
         start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         echo "$start_utc" > /attempt-out/sentinel-start-utc.txt
+        echo {sh_single(agent_mode)} > /attempt-out/agent-mode.txt
         set +e
-        /opt/sentinel-venv/bin/supervisor --task TASK.md --start-over {('--model ' + sh_single(model)) if model else ''} {' '.join(sh_single(arg) for arg in extra_supervisor_args)}
+        {agent_command}
         rc=$?
         set -e
         date -u +%Y-%m-%dT%H:%M:%SZ > /attempt-out/sentinel-end-utc.txt
@@ -317,8 +866,14 @@ def run_attempt_container(
         cp /app/TASK.md /attempt-out/artifacts/TASK.md
         if [ -d /app/.supervisor ]; then cp -a /app/.supervisor /attempt-out/artifacts/.supervisor; fi
         git status --short > /attempt-out/artifacts/final_git_status.txt
-        git diff --binary {sh_single(base_commit)} > /attempt-out/artifacts/agent_diff_vs_base.diff
-        git diff --stat {sh_single(base_commit)} > /attempt-out/artifacts/agent_diff_vs_base.stat || true
+        git add -A -- \\
+          ':(exclude).supervisor' ':(exclude).supervisor/**' \\
+          ':(exclude)TASK.md' \\
+          ':(exclude)pyproject.toml' ':(exclude)setup.cfg' ':(exclude)setup.py' \\
+          ':(exclude)tox.ini' ':(exclude)*.cfg' ':(exclude)*.toml'
+        git diff --cached --binary {sh_single(base_commit)} > /attempt-out/artifacts/agent_diff_vs_base.diff
+        git diff --cached --stat {sh_single(base_commit)} > /attempt-out/artifacts/agent_diff_vs_base.stat || true
+        git reset --quiet
         tar --exclude=.git --exclude=node_modules --exclude=.supervisor -czf /attempt-out/artifacts/final-worktree-no-git-no-node_modules.tar.gz -C /app .
         exit "$rc"
         """
@@ -334,24 +889,74 @@ def run_attempt_container(
         # The attempt container is disposable, and privileged mode keeps those
         # sandboxes usable inside Docker instead of weakening supervisor policy.
         "--privileged",
-        "-v",
-        f"{paths.attempt_input}:/attempt-input:ro",
-        "-v",
-        f"{paths.attempt_output}:/attempt-out",
-        "-v",
-        f"{paths.rollouts / 'codex-home'}:/root/.codex",
-        "-v",
-        f"{auth_dir / 'auth.json'}:/root/.codex/auth.json:ro",
-        "-v",
-        f"{runtime_config}:/root/.codex/config.toml:ro",
-        "--entrypoint",
-        "/bin/bash",
-        image,
-        "-c",
-        command,
+        "--name",
+        container_name,
     ]
+    if egress:
+        cmd.extend(
+            [
+                "--network",
+                egress.network_name,
+                "-e",
+                f"HTTPS_PROXY={egress.proxy_url}",
+                "-e",
+                f"HTTP_PROXY={egress.proxy_url}",
+                "-e",
+                f"https_proxy={egress.proxy_url}",
+                "-e",
+                f"http_proxy={egress.proxy_url}",
+                "-e",
+                "ALL_PROXY=",
+                "-e",
+                "all_proxy=",
+                "-e",
+                "NO_PROXY=localhost,127.0.0.1,::1",
+                "-e",
+                "no_proxy=localhost,127.0.0.1,::1",
+            ]
+        )
+    cmd.extend(
+        [
+            "-v",
+            f"{paths.attempt_input}:/attempt-input:ro",
+            "-v",
+            f"{paths.attempt_output}:/attempt-out",
+            "-v",
+            f"{paths.rollouts / 'codex-home'}:/root/.codex",
+            "-v",
+            f"{auth_dir / 'auth.json'}:/root/.codex/auth.json:ro",
+            "-v",
+            f"{runtime_config}:/root/.codex/config.toml:ro",
+            "--entrypoint",
+            "/bin/bash",
+            image,
+            "-c",
+            command,
+        ]
+    )
     (paths.attempt / "docker-run-command.json").write_text(json.dumps(cmd, indent=2) + "\n", encoding="utf-8")
     return run_streaming(cmd, log_path=log_path)
+
+
+def agent_invocation_script(*, agent_mode: str, model: str | None, extra_supervisor_args: list[str]) -> str:
+    if agent_mode == "supervisor":
+        return (
+            "/opt/sentinel-venv/bin/supervisor --task TASK.md --start-over "
+            f"{('--model ' + sh_single(model)) if model else ''} "
+            f"{' '.join(sh_single(arg) for arg in extra_supervisor_args)}"
+        ).strip()
+    if agent_mode == "raw-codex":
+        model_args = f"--model {sh_single(model)} " if model else ""
+        return (
+            "codex exec --json "
+            "--cd /app "
+            "--dangerously-bypass-approvals-and-sandbox "
+            f"-c {sh_single(CODEX_WEB_SEARCH_DISABLED_CONFIG)} "
+            f"{model_args}"
+            "--output-last-message /attempt-out/raw-codex-final-message.txt "
+            "- < /attempt-input/RAW_CODEX_PROMPT.md"
+        )
+    raise ValueError(f"unknown agent_mode: {agent_mode}")
 
 
 def collect_rollouts(paths: RunPaths, *, container_cwd: str, start_utc: datetime, end_utc: datetime) -> dict[str, Any]:
@@ -488,7 +1093,7 @@ def run_scoring(
     patch_json = paths.scoring / "patches.json"
     harness_output = paths.scoring / "harness-output"
     harness_output.mkdir(parents=True, exist_ok=True)
-    raw_sample.write_text(json.dumps(instance) + "\n", encoding="utf-8")
+    raw_sample.write_text(json.dumps(scoring_sample_for_scorer(instance)) + "\n", encoding="utf-8")
     patch = (paths.artifacts / "agent_diff_vs_base.diff").read_text(encoding="utf-8") if (paths.artifacts / "agent_diff_vs_base.diff").exists() else ""
     patch_json.write_text(
         json.dumps([{"instance_id": instance["instance_id"], "patch": patch, "prefix": "container_attempt"}], indent=2)
@@ -540,8 +1145,9 @@ def summarize_scoring(paths: RunPaths, instance: dict[str, Any]) -> None:
     if output_path.exists():
         output = json.loads(output_path.read_text(encoding="utf-8"))
         passed = {item["name"] for item in output.get("tests", []) if item.get("status") == "PASSED"}
-        fail_to_pass = parse_list_field(instance.get("fail_to_pass", "[]"))
-        pass_to_pass = parse_list_field(instance.get("pass_to_pass", "[]"))
+        scorer_sample = scoring_sample_for_scorer(instance)
+        fail_to_pass = parse_list_field(scorer_sample.get("fail_to_pass", "[]"))
+        pass_to_pass = parse_list_field(scorer_sample.get("pass_to_pass", "[]"))
         summary["fail_to_pass_total"] = len(fail_to_pass)
         summary["fail_to_pass_failed"] = sorted(set(fail_to_pass) - passed)
         summary["pass_to_pass_total"] = len(pass_to_pass)
@@ -562,6 +1168,10 @@ def write_run_report(
 ) -> None:
     scoring_summary_path = paths.scoring / "scoring_summary.json"
     scoring_summary = json.loads(scoring_summary_path.read_text(encoding="utf-8")) if scoring_summary_path.exists() else {}
+    identity_path = paths.attempt / "runner-identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8")) if identity_path.exists() else {}
+    egress_isolation_path = paths.attempt / "egress-isolation.json"
+    egress_enabled = egress_isolation_path.exists()
     report = f"""# Sentinel Container Attempt Report
 
 ## Instance
@@ -572,6 +1182,7 @@ def write_run_report(
 - dockerhub_tag: `{instance.get('dockerhub_tag')}`
 - base_image: `{base_image}`
 - attempt_image: `{attempt_image}`
+- container_name: `{identity.get('container_name')}`
 
 ## Feasibility
 
@@ -580,18 +1191,29 @@ def write_run_report(
 - Codex auth is provided at runtime by a read-only mount from host `~/.codex/auth.json`; config is generated from host `~/.codex/config.toml` with `zsh_path = "/usr/bin/zsh"` for Linux unified exec.
 - Codex rollouts are mounted out through one host-backed `/root/.codex` directory, so `sessions` and `archived_sessions` stay on the same filesystem for Codex archive renames.
 - The attempt container sets `SENTINEL_CODER_SANDBOX=danger-full-access` because Codex's Linux read-only sandbox requires user namespace support that was unavailable in the nested Docker attempt container during feasibility probes.
+- Codex web search is disabled in the generated runtime config and Codex process flags with `{CODEX_WEB_SEARCH_DISABLED_CONFIG}`.
 
 ## Attempt
 
+- Agent mode: `{identity.get('agent_mode')}`
 - Sentinel cwd inside container: `{CONTAINER_CWD}`
 - TASK.md path inside container: `{CONTAINER_CWD}/TASK.md`
 - Coder sandbox inside attempt container: `danger-full-access`
-- Sentinel exit code: `{sentinel_rc}`
+- Agent exit code: `{sentinel_rc}`
 - Live log: `{paths.attempt / 'sentinel-live.log'}`
+- Raw Codex final message: `{paths.attempt_output / 'raw-codex-final-message.txt'}`
 - Agent diff: `{paths.artifacts / 'agent_diff_vs_base.diff'}`
 - Supervisor state: `{paths.artifacts / '.supervisor'}`
 - Test command evidence count: `{test_evidence.get('count')}`
 - Test command evidence file: `{test_evidence.get('path')}`
+
+## Egress Isolation
+
+- Enabled during agent run: `{egress_enabled}`
+- Isolation config: `{egress_isolation_path if egress_enabled else None}`
+- Proxy CONNECT log: `{paths.attempt / 'egress-proxy.log'}`
+- iptables install log: `{paths.attempt / 'egress-iptables.log'}`
+- iptables cleanup log: `{paths.attempt / 'egress-iptables-cleanup.log'}`
 
 ## Rollouts
 
@@ -630,6 +1252,37 @@ def detect_codex_version() -> str:
     return match.group(1) if match else "0.134.0"
 
 
+def compose_task_text(instance: dict[str, Any]) -> str:
+    """Compose the canonical SWE-bench Pro task text shown to the agent."""
+    problem_statement = decode_text_field(instance["problem_statement"])
+    requirements = decode_text_field(instance.get("requirements", ""))
+    interface = decode_text_field(instance.get("interface", ""))
+    return (
+        f"{problem_statement}\n\n"
+        f"Requirements:\n{requirements}\n\n"
+        f"New interfaces introduced:\n{interface}"
+    )
+
+
+def compose_raw_codex_prompt(prompt_text: str) -> str:
+    return (
+        prompt_text.rstrip()
+        + "\n\n"
+        + "# Benchmark task\n\n"
+        + "Read `/app/TASK.md` first. It contains the benchmark problem statement, "
+        + "requirements, and new interfaces. Implement that task in the `/app` "
+        + "repository. Leave the final code changes in the worktree for scoring.\n"
+    )
+
+
+def decode_text_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    return decode_problem_statement(value)
+
+
 def decode_problem_statement(value: str) -> str:
     stripped = value.strip()
     if stripped.startswith('"') and stripped.endswith('"'):
@@ -664,6 +1317,15 @@ def parse_list_field(value: Any) -> list[str]:
     return []
 
 
+def scoring_sample_for_scorer(instance: dict[str, Any]) -> dict[str, Any]:
+    sample = dict(instance)
+    if "fail_to_pass" not in sample and "FAIL_TO_PASS" in sample:
+        sample["fail_to_pass"] = sample["FAIL_TO_PASS"]
+    if "pass_to_pass" not in sample and "PASS_TO_PASS" in sample:
+        sample["pass_to_pass"] = sample["PASS_TO_PASS"]
+    return sample
+
+
 def parse_utc(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -676,6 +1338,14 @@ def parse_utc(value: Any) -> datetime | None:
 def safe_tag(value: str) -> str:
     tag = re.sub(r"[^a-z0-9_.-]+", "-", value.lower()).strip(".-")
     return tag[:96] or "attempt"
+
+
+def make_run_token(task_id: str, results_root: Path, timestamp: str) -> str:
+    root_part = safe_tag(results_root.name)[:32]
+    task_part = safe_tag(task_id)[:48]
+    unique = f"{timestamp}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    token = safe_tag(f"{task_part}-{root_part}-{unique}")
+    return token[:120] or f"run-{uuid.uuid4().hex[:12]}"
 
 
 def sh_single(value: str | None) -> str:

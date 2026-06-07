@@ -79,6 +79,7 @@ class AcceptGateResult:
     failure_type: str | None = None
     check_name: str | None = None
     reason: str | None = None
+    passed_checks: tuple[str, ...] = ()
 
 
 class SentinelController:
@@ -820,6 +821,7 @@ class SentinelController:
             if not gate_result.passed:
                 await self._handle_completion_accept_gate_failure(decision, gate_result)
                 return
+            self._record_accept_gate_success(gate_result)
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
         if decision.progress_update:
@@ -861,6 +863,7 @@ class SentinelController:
         changed_files = packet.changed_files if packet is not None else await self.changed_files()
         validations = packet.validations if packet is not None else list(self.validations)
         code_review_files = _material_code_review_files(changed_files)
+        passed_checks: list[str] = []
 
         if packet is not None:
             if decision.wake_sequence != packet.wake_sequence:
@@ -877,6 +880,7 @@ class SentinelController:
                     check_name="structural_consistency",
                     reason="completion decision generation does not match the reviewed packet",
                 )
+            passed_checks.append("packet_consistency")
 
         structural_issue = _accept_structural_issue(decision, code_changing=bool(code_review_files))
         if structural_issue is not None:
@@ -886,6 +890,7 @@ class SentinelController:
                 check_name="structural_consistency",
                 reason=structural_issue,
             )
+        passed_checks.append("structural_consistency")
 
         file_issue = _accept_file_review_issue(decision, code_review_files)
         if file_issue is not None:
@@ -895,9 +900,10 @@ class SentinelController:
                 check_name="file_review_coverage",
                 reason=file_issue,
             )
+        passed_checks.append("file_review_coverage")
 
         if packet is not None:
-            unassessed_test_risks = _changed_test_contract_shift_risks(packet)
+            unassessed_test_risks = _changed_test_contract_shift_risks(packet, decision)
             if unassessed_test_risks:
                 return AcceptGateResult(
                     passed=False,
@@ -908,6 +914,7 @@ class SentinelController:
                         + ", ".join(unassessed_test_risks[:5])
                     ),
                 )
+            passed_checks.append("changed_test_risks_assessment")
             parallel_state_risks = _unassessed_parallel_persistence_risks(packet, decision)
             if parallel_state_risks:
                 return AcceptGateResult(
@@ -919,6 +926,7 @@ class SentinelController:
                         + ", ".join(parallel_state_risks[:5])
                     ),
                 )
+            passed_checks.append("parallel_persistence_assessment")
 
         latest_change = (
             packet.latest_relevant_change_sequence
@@ -941,6 +949,7 @@ class SentinelController:
                     check_name="behavioral_floor",
                     reason="no fresh passing behavioral validation after the latest relevant source/test change",
                 )
+            passed_checks.append("behavioral_floor")
 
         binding_issue = _accept_evidence_binding_issue(decision, validations, latest_change=latest_change)
         if binding_issue is not None:
@@ -950,8 +959,9 @@ class SentinelController:
                 check_name="evidence_binding",
                 reason=binding_issue,
             )
+        passed_checks.append("evidence_binding")
 
-        return AcceptGateResult(passed=True)
+        return AcceptGateResult(passed=True, passed_checks=tuple(passed_checks))
 
     async def _handle_completion_accept_gate_failure(
         self,
@@ -1026,6 +1036,19 @@ class SentinelController:
                 "failure_type": gate_result.failure_type,
                 "check_name": gate_result.check_name,
                 "reason": gate_result.reason,
+            }
+        )
+
+    def _record_accept_gate_success(self, gate_result: AcceptGateResult) -> None:
+        self._increment_accept_gate_counter("accept_gate_accepts")
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "completion_accept_gate_pass",
+                "checks": [
+                    {"check_name": check_name, "passed": True}
+                    for check_name in gate_result.passed_checks
+                ],
             }
         )
 
@@ -1605,6 +1628,8 @@ def _executed_test_names(command: str, output: str, *, limit: int = 50) -> list[
     names: list[str] = []
     names.extend(_explicit_test_selectors(command, limit=limit))
     names.extend(_test_names_from_output(output, limit=limit))
+    if not names and _is_behavioral_validation_command(command):
+        names.extend(_target_files_or_test_files(command))
     return list(dict.fromkeys(names))[:limit]
 
 
@@ -1645,6 +1670,8 @@ def _test_count_summary(output: str) -> tuple[int | None, int | None]:
             r"\btests?:\s*\d+\s+passed,\s*(\d+)\s+failed\b",
         ),
     )
+    if passed is not None and failed is None:
+        failed = 0
     return passed, failed
 
 
@@ -1898,16 +1925,35 @@ def _accept_evidence_binding_issue(
             validation = by_id.get(evidence.validation_id or "")
             if validation is None:
                 continue
+            if evidence.validation_type != validation.type:
+                continue
             if _validation_is_fresh_pass(validation, latest_change):
                 fresh_pass_found = True
                 break
         if not fresh_pass_found:
             if not linked_evidence_found:
                 return f"behavior '{row.behavior}' is covered but has no evidence linked by validation_id"
+            type_mismatch = _evidence_type_mismatch(row.evidence, by_id)
+            if type_mismatch:
+                return f"behavior '{row.behavior}' evidence type mismatch: {type_mismatch}"
             return (
                 f"behavior '{row.behavior}' is covered but has no linked fresh passing validation "
                 "record in the ledger"
             )
+    return None
+
+
+def _evidence_type_mismatch(evidence_items: list[Any], validations_by_id: dict[str, ValidationRun]) -> str | None:
+    for evidence in evidence_items:
+        if not evidence.validation_id:
+            continue
+        validation = validations_by_id.get(evidence.validation_id)
+        if validation is None or evidence.validation_type == validation.type:
+            continue
+        return (
+            f"{evidence.validation_id} declares {evidence.validation_type} "
+            f"but ledger has {validation.type}"
+        )
     return None
 
 
@@ -1944,7 +1990,7 @@ def _completion_accept_rejection_decision(
     )
 
 
-def _changed_test_contract_shift_risks(packet: SupervisorWakePacket) -> list[str]:
+def _changed_test_contract_shift_risks(packet: SupervisorWakePacket, decision: CompletionReviewDecision) -> list[str]:
     risks: list[str] = []
     for changed in packet.changed_file_diffs:
         if changed.file_kind != "test" or changed.change_kind not in {"modified", "renamed"}:
@@ -1952,10 +1998,21 @@ def _changed_test_contract_shift_risks(packet: SupervisorWakePacket) -> list[str
         removed_lines = _substantive_removed_test_lines(changed.diff)
         if not removed_lines:
             continue
+        if _changed_test_reviewed_with_assessment(decision, changed.path):
+            continue
         risks.append(f"{changed.path} removed/rewrote existing test behavior: {removed_lines[0]}")
         if len(risks) >= 10:
             break
     return risks
+
+
+def _changed_test_reviewed_with_assessment(decision: CompletionReviewDecision, path: str) -> bool:
+    reviewed_by_path = {_normalize_review_path(file.path): file for file in decision.files_reviewed}
+    reviewed = reviewed_by_path.get(_normalize_review_path(path))
+    if reviewed is None or reviewed.kind != "test" or not reviewed.inspected:
+        return False
+    assessment = " ".join(part for part in (reviewed.reason, reviewed.limitation or "") if part).strip()
+    return bool(assessment)
 
 
 def _unassessed_parallel_persistence_risks(

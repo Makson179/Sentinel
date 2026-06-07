@@ -163,6 +163,7 @@ class SentinelConfig(BaseModel):
     model: str | None = None
     max_no_marker_idle_nudges: int = 2
     max_completion_returns_per_generation: int = 2
+    accept_gate_accepts: int = 0
     accept_gate_rejections: int = 0
     accept_gate_reviewer_reruns: int = 0
     accept_gate_coder_returns: int = 0

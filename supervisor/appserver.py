@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from supervisor.codex_cli import CODEX_NO_WEB_SEARCH_CONFIG_FLAGS
+
 
 class AppServerError(RuntimeError):
     pass
@@ -74,7 +76,7 @@ class AppServerClient:
         transport_error_handler: TransportErrorHandler | None = None,
         stdout_limit: int = APP_SERVER_STDOUT_LIMIT,
     ):
-        self.command = command or ["codex", "app-server", "--listen", "stdio://"]
+        self.command = command or ["codex", "app-server", *CODEX_NO_WEB_SEARCH_CONFIG_FLAGS, "--listen", "stdio://"]
         self.cwd = cwd
         self.notification_handler = notification_handler
         self.server_request_handler = server_request_handler

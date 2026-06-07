@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS
+from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS, CODEX_EXEC_NO_WEB_SEARCH_FLAGS
 from supervisor.state import FileLock, LOG, StateStore
 
 MARKER = "supervisor-agent-mvp"
@@ -683,6 +683,7 @@ class CodexAdapter:
             self.codex_executable,
             "exec",
             *CODEX_EXEC_GIT_TRUST_FLAGS,
+            *CODEX_EXEC_NO_WEB_SEARCH_FLAGS,
             "--sandbox",
             "workspace-write",
             prompt,

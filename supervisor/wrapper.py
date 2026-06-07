@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from supervisor.adapters import ClaudeAdapter, CodexAdapter
-from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS
+from supervisor.codex_cli import CODEX_EXEC_GIT_TRUST_FLAGS, CODEX_EXEC_NO_WEB_SEARCH_FLAGS
 from supervisor.health import kill_restart_candidate, patch_health
 from supervisor.ipc import IPCServer
 from supervisor.llm_driver import ClaudeSubscriptionDriver, CodexSubscriptionDriver, LLMDriver, LLMDriverError, OpenRouterDriver, ParseFailure
@@ -375,7 +375,16 @@ class SupervisorWrapper:
                 command.extend(["--settings", str(self.claude_settings_path)])
             return command
         if self.config.platform == "codex":
-            return ["codex", "exec", *CODEX_EXEC_GIT_TRUST_FLAGS, "--json", "--sandbox", "workspace-write", instruction]
+            return [
+                "codex",
+                "exec",
+                *CODEX_EXEC_GIT_TRUST_FLAGS,
+                *CODEX_EXEC_NO_WEB_SEARCH_FLAGS,
+                "--json",
+                "--sandbox",
+                "workspace-write",
+                instruction,
+            ]
         return [os.environ.get("PYTHON", "python3"), "-m", "tests.fake_agent.agent"]
 
     async def timer_tick(self, sequence: int) -> IPCResponse | None:

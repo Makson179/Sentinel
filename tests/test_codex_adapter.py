@@ -247,7 +247,7 @@ async def test_codex_hook_fire_self_test_uses_supported_exec_flags(store: StateS
 
     assert await adapter.hook_fire_self_test(store.workspace / "ipc.sock", "token") is True
     args = captured["args"]
-    assert args[:5] == ("codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write")
+    assert args[:7] == ("codex", "exec", "--skip-git-repo-check", "-c", 'web_search="disabled"', "--sandbox", "workspace-write")
     assert "--ask-for-approval" not in args
     assert captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
     assert captured["kwargs"]["env"]["SUPERVISOR_HOOK_TRACE_PATH"] == str(store.path("codex-hook-trace.log"))

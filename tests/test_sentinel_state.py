@@ -196,6 +196,27 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         sequence=13,
         item={"stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"},
     )
+    broad_pytest = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="ANSIBLE_DEVEL_WARNING=False python -m pytest test/units/cli/test_galaxy.py test/units/galaxy/test_collection_install.py",
+            exit_code=0,
+            status="completed",
+            summary="command completed: pytest broad target exit=0",
+        ),
+        sequence=15,
+        item={"stdout": "============================= 155 passed in 5.45s =============================\n"},
+    )
+    broad_pytest_without_output = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="ANSIBLE_DEVEL_WARNING=False python -m pytest test/units/cli/test_galaxy.py test/units/galaxy/test_collection_install.py",
+            exit_code=0,
+            status="completed",
+            summary="command completed: pytest broad target exit=0",
+        ),
+        sequence=16,
+    )
     direct_script = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -221,7 +242,22 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert filtered.was_filtered is True
     assert "tests/test_user.py::test_sends_email" in filtered.executed_test_names
     assert filtered.passed_count == 1
+    assert filtered.failed_count == 0
     assert filtered.target_files_or_test_files == ["tests/test_user.py"]
+    assert broad_pytest is not None
+    assert broad_pytest.executed_test_names == [
+        "test/units/cli/test_galaxy.py",
+        "test/units/galaxy/test_collection_install.py",
+    ]
+    assert broad_pytest.passed_count == 155
+    assert broad_pytest.failed_count == 0
+    assert broad_pytest_without_output is not None
+    assert broad_pytest_without_output.executed_test_names == [
+        "test/units/cli/test_galaxy.py",
+        "test/units/galaxy/test_collection_install.py",
+    ]
+    assert broad_pytest_without_output.passed_count is None
+    assert broad_pytest_without_output.failed_count is None
     assert direct_script is not None
     assert direct_script.type == "behavioral"
     assert direct_script.validation_id == "validation-14"
@@ -581,7 +617,7 @@ async def test_completion_accept_gate_rejects_empty_behavior_matrix_for_code_cha
     assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
 
 
-async def test_completion_accept_gate_rejects_unassessed_changed_test_contract_shift(tmp_path: Path) -> None:
+async def test_completion_accept_gate_allows_assessed_changed_test_contract_shift(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("User-facing flow depends on helper resend semantics.", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -655,7 +691,134 @@ async def test_completion_accept_gate_rejects_unassessed_changed_test_contract_s
                 "reason": "flow test passed",
                 "files_reviewed": [
                     {"path": "src/helper.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-                    {"path": "tests/test_flow.py", "reason": "changed test", "kind": "test", "inspected": True, "limitation": None},
+                    {
+                        "path": "tests/test_flow.py",
+                        "reason": "inspected removed expiry assertion and found no unresolved changed-test risk",
+                        "kind": "test",
+                        "inspected": True,
+                        "limitation": None,
+                    },
+                ],
+                "behavior_evidence_matrix": [
+                    {
+                        "behavior": "user-facing flow and helper resend semantics",
+                        "task_basis": "TASK.md",
+                        "files_considered": ["src/helper.py", "tests/test_flow.py"],
+                        "evidence": [
+                            {
+                                "validation_id": "validation-5",
+                                "command": "pytest tests/test_flow.py",
+                                "sequence": 5,
+                                "validation_type": "behavioral",
+                                "outcome": "pass",
+                                "freshness": "fresh",
+                                "why_it_covers_behavior": "runs the visible flow",
+                            }
+                        ],
+                        "status": "covered",
+                        "gap": None,
+                    }
+                ],
+                "uncovered_behaviors": [],
+                "validation_gaps": [],
+                "claim_evidence_mismatches": [],
+                "packet_or_access_limitations": [],
+                "changed_test_risks": [],
+                "message_to_coder": None,
+                "persistent_decision": None,
+                "progress_update": "Accepted.",
+                "clear_handoff": False,
+                "display_message": None,
+                "handoff": None,
+                "wake_sequence": 1,
+                "generation": 0,
+            }
+        ),
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert len(controller.completion_returns) == 0
+    assert controller.coder.messages == []
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
+
+
+async def test_completion_accept_gate_rejects_changed_test_contract_shift_without_assessment(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("User-facing flow depends on helper resend semantics.", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        overwrite=True,
+    )
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def steer_or_start(self, message):
+            self.messages.append(message)
+            return "turn"
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.coder = FakeCoder()
+    controller.pending_approvals = {}
+    controller.validations = [
+        ValidationRun(command="pytest tests/test_flow.py", exit_code=0, passed=True, summary="passed", sequence=5)
+    ]
+    controller.prior_interventions = []
+    controller.observed_changed_files = {}
+    controller.use_git_diff = False
+    controller.tui = _FakeTUI()
+    controller.running = True
+    controller.event_queue = asyncio.Queue()
+    controller._sequence = 0
+    controller.completion_returns = []
+    controller.completion_restarts = 0
+    controller.no_marker_idle_nudge_count = 0
+
+    packet = SupervisorWakePacket(
+        wake_sequence=1,
+        latest_event_sequence=1,
+        generation=0,
+        restart_count=0,
+        task_path=str(task),
+        task_contents=task.read_text(encoding="utf-8"),
+        coder_thread_id="thread",
+        changed_files=[
+            ChangedFile(path="src/helper.py", status="M", sequence=2),
+            ChangedFile(path="tests/test_flow.py", status="M", sequence=3),
+        ],
+        changed_file_diffs=[
+            ChangedFileDiff(
+                path="tests/test_flow.py",
+                file_kind="test",
+                change_kind="modified",
+                diff=(
+                    "diff --git a/tests/test_flow.py b/tests/test_flow.py\n"
+                    "@@\n"
+                    "-    await db.expire('confirm:user', 1)\n"
+                    "+    await db.set('helper:last_sent', old_enough)\n"
+                    "     assert ok\n"
+                ),
+            )
+        ],
+        validations=controller.validations,
+        latest_relevant_change_sequence=3,
+    )
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(
+            {
+                "decision": "accept",
+                "reason": "flow test passed",
+                "files_reviewed": [
+                    {"path": "src/helper.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
+                    {"path": "tests/test_flow.py", "reason": "", "kind": "test", "inspected": True, "limitation": None},
                 ],
                 "behavior_evidence_matrix": [
                     {
@@ -926,9 +1089,42 @@ async def test_completion_accept_gate_allows_fresh_covered_code_change(tmp_path:
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_sentinel_config().accept_gate_accepts == 1
+    log_entry = json.loads(store.path(LOG).read_text(encoding="utf-8").splitlines()[-1])
+    assert log_entry["type"] == "completion_accept_gate_pass"
+    assert {"check_name": "evidence_binding", "passed": True} in log_entry["checks"]
+    assert {"check_name": "behavioral_floor", "passed": True} in log_entry["checks"]
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "## Completion Behavior Evidence" in report
     assert "## Completion Files Reviewed" in report
+
+
+async def test_completion_accept_gate_returns_to_coder_when_evidence_type_mismatches_ledger(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="passed",
+            sequence=3,
+            type="behavioral",
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "static"
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert "evidence type mismatch" in coder.messages[0]
+    assert "validation-3 declares static but ledger has behavioral" in coder.messages[0]
 
 
 async def test_completion_accept_gate_returns_to_coder_when_behavior_lacks_ledger_record(tmp_path: Path) -> None:

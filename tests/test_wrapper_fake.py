@@ -57,7 +57,16 @@ def test_codex_exec_command_uses_workspace_sandbox_and_logs(workspace: Path) -> 
 
     command = wrapper.default_supervisee_command()
 
-    assert command[:6] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write"]
+    assert command[:8] == [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "-c",
+        'web_search="disabled"',
+        "--json",
+        "--sandbox",
+        "workspace-write",
+    ]
 
 
 def test_codex_launch_routes_process_output_to_logs(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
