@@ -332,20 +332,36 @@ def build_attempt_image(
     dockerfile.write_text(
         textwrap.dedent(
             f"""
-            FROM python:3.11-slim-bullseye AS sentinel-python
             FROM {base_image}
             ARG CODEX_VERSION={codex_version}
             ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-            COPY --from=sentinel-python /usr/local /usr/local
-            COPY --from=sentinel-python /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /usr/lib/x86_64-linux-gnu/
-            COPY --from=sentinel-python /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/
-            RUN apt-get update \\
-                && apt-get install -y --no-install-recommends ca-certificates zsh \\
-                && if ! command -v npm >/dev/null 2>&1; then apt-get install -y --no-install-recommends nodejs npm; fi \\
-                && rm -rf /var/lib/apt/lists/*
+            RUN if command -v apt-get >/dev/null 2>&1; then \\
+                    apt-get update \\
+                    && apt-get install -y --no-install-recommends ca-certificates zsh bash python3 python3-venv python3-pip \\
+                    && if ! command -v npm >/dev/null 2>&1; then apt-get install -y --no-install-recommends nodejs npm; fi \\
+                    && rm -rf /var/lib/apt/lists/*; \\
+                elif command -v apk >/dev/null 2>&1; then \\
+                    apk add --no-cache ca-certificates zsh bash python3 py3-pip py3-virtualenv nodejs npm; \\
+                else \\
+                    echo "Unsupported base image: no apt-get or apk" >&2; exit 1; \\
+                fi \\
+                && if [ ! -x /usr/bin/zsh ] && command -v zsh >/dev/null 2>&1; then mkdir -p /usr/bin && ln -s "$(command -v zsh)" /usr/bin/zsh; fi
             RUN npm install -g @openai/codex@${{CODEX_VERSION}} --no-audit --no-fund
             COPY sentinel-src /opt/sentinel-src
-            RUN /usr/local/bin/python3.11 -m venv /opt/sentinel-venv \\
+            RUN set -eu; \\
+                sentinel_python=""; \\
+                for py in /usr/bin/python3.12 /usr/bin/python3.11 /usr/bin/python3 python3; do \\
+                    if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then \\
+                        py_path="$py"; \\
+                        if command -v "$py" >/dev/null 2>&1; then py_path="$(command -v "$py")"; fi; \\
+                        if "$py_path" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then \\
+                            sentinel_python="$py_path"; \\
+                            break; \\
+                        fi; \\
+                    fi; \\
+                done; \\
+                if [ -z "$sentinel_python" ]; then echo "Python >=3.11 required for sentinel venv" >&2; exit 1; fi; \\
+                "$sentinel_python" -m venv /opt/sentinel-venv \\
                 && PIP_INDEX_URL=https://pypi.org/simple PIP_EXTRA_INDEX_URL= /opt/sentinel-venv/bin/python -m pip install --upgrade pip setuptools wheel \\
                 && PIP_INDEX_URL=https://pypi.org/simple PIP_EXTRA_INDEX_URL= /opt/sentinel-venv/bin/python -m pip install /opt/sentinel-src
             ENV SHELL="/usr/bin/zsh"

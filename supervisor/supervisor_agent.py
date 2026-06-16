@@ -4,7 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
@@ -62,6 +62,7 @@ class StatelessSupervisorAgent:
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.completion_timeout_seconds = completion_timeout_seconds
+        self.completion_thread_id: str | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
         return await self._decide(
@@ -81,6 +82,7 @@ class StatelessSupervisorAgent:
             model_cls=CompletionReviewDecision,
             use_case="completion_review",
             timeout_seconds=self.completion_timeout_seconds,
+            persistent_completion_thread=True,
         )
 
     async def _decide(
@@ -92,6 +94,7 @@ class StatelessSupervisorAgent:
         model_cls: type[SupervisorDecision] | type[CompletionReviewDecision],
         use_case: str,
         timeout_seconds: float,
+        persistent_completion_thread: bool = False,
     ) -> SupervisorDecision | CompletionReviewDecision:
         thread_id: str | None = None
         turn_id: str | None = None
@@ -99,15 +102,20 @@ class StatelessSupervisorAgent:
         decision: SupervisorDecision | CompletionReviewDecision | None = None
         audit_error: str | None = None
         try:
-            thread_response = await self._await_rpc(
-                "supervisor thread/start response",
-                self.client.thread_start(self._thread_params(), timeout=timeout_seconds),
-                timeout=timeout_seconds,
-            )
-            thread = thread_response.get("thread", {})
-            thread_id = thread.get("id") if isinstance(thread, dict) else None
-            if not isinstance(thread_id, str):
-                raise SupervisorAgentError("supervisor thread/start did not return thread id")
+            if persistent_completion_thread and self.completion_thread_id:
+                thread_id = self.completion_thread_id
+            else:
+                thread_response = await self._await_rpc(
+                    "supervisor thread/start response",
+                    self.client.thread_start(self._thread_params(), timeout=timeout_seconds),
+                    timeout=timeout_seconds,
+                )
+                thread = thread_response.get("thread", {})
+                thread_id = thread.get("id") if isinstance(thread, dict) else None
+                if not isinstance(thread_id, str):
+                    raise SupervisorAgentError("supervisor thread/start did not return thread id")
+                if persistent_completion_thread:
+                    self.completion_thread_id = thread_id
             turn_response = await self._await_rpc(
                 "supervisor turn/start response",
                 self.client.turn_start(
@@ -196,7 +204,20 @@ class StatelessSupervisorAgent:
                 use_case=use_case,
             )
             if thread_id:
-                await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
+                if persistent_completion_thread:
+                    if audit_error is not None:
+                        await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
+                        if self.completion_thread_id == thread_id:
+                            self.completion_thread_id = None
+                else:
+                    await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
+
+    async def close_completion_review(self) -> None:
+        thread_id = self.completion_thread_id
+        if not thread_id:
+            return
+        self.completion_thread_id = None
+        await self._cleanup_thread(thread_id, None, self.completion_timeout_seconds)
 
     async def _await_rpc(
         self,
@@ -325,6 +346,9 @@ class StatelessSupervisorAgent:
         changed_tests_summary: list[ChangedTestsSummary] | None = None,
         validation_outputs: list[ValidationOutput] | None = None,
         diff_packet_limits: DiffPacketLimits | None = None,
+        completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
+        completion_payload_since_sequence: int | None = None,
+        completion_review_thread_id: str | None = None,
     ) -> SupervisorWakePacket:
         cfg = self.store.get_sentinel_config()
         health = self.store.get_health()
@@ -375,6 +399,9 @@ class StatelessSupervisorAgent:
             changed_tests_summary=changed_tests_summary or [],
             validation_outputs=validation_outputs or [],
             diff_packet_limits=diff_packet_limits or DiffPacketLimits(),
+            completion_payload_mode=completion_payload_mode,
+            completion_payload_since_sequence=completion_payload_since_sequence,
+            completion_review_thread_id=completion_review_thread_id,
         )
 
     def _thread_params(self) -> dict[str, Any]:

@@ -7,7 +7,7 @@ There is ONE narrow exception to "do not fix anything": problems in the **execut
 ## The three instances (baked in; expected test counts)
 These exact instance_ids are baked into the launch block. They were chosen for having enough hidden tests that "resolved" is a real signal:
 
-- `instance_element-hq__element-web-4fec436883b601a3cac2d4a58067e597f737b817-vnan` -> expect fail_to_pass 16, pass_to_pass 35
+- `d` -> expect fail_to_pass 16, pass_to_pass 35
 - `instance_qutebrowser__qutebrowser-f631cd4422744160d9dcf7a0455da532ce973315-v35616345bb8052ea303186706cec663146f0f184` -> expect fail_to_pass 32, pass_to_pass 0
 - `instance_navidrome__navidrome-ee21f3957e0de91624427e93c62b8ee390de72e3` -> expect fail_to_pass 15, pass_to_pass 0
 

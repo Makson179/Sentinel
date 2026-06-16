@@ -27,6 +27,8 @@ FINAL_REPORT = "FINAL_REPORT.md"
 LOG = "log.jsonl"
 EVENTS = "events.jsonl"
 SUPERVISOR_WAKES = "supervisor_wakes.jsonl"
+RUNTIME_TRACE = "runtime_trace.jsonl"
+RUNTIME_METRICS = "runtime_metrics.json"
 AGENT_SETTINGS = "agent-settings.json"
 
 
@@ -148,6 +150,8 @@ class StateStore:
             LOG: "",
             EVENTS: "",
             SUPERVISOR_WAKES: "",
+            RUNTIME_TRACE: "",
+            RUNTIME_METRICS: "{}\n",
         }
         for name, value in files.items():
             path = self.path(name)
@@ -222,6 +226,8 @@ class StateStore:
             LOG: "",
             EVENTS: "",
             SUPERVISOR_WAKES: "",
+            RUNTIME_TRACE: "",
+            RUNTIME_METRICS: "{}\n",
         }
         for name, value in files.items():
             path = self.path(name)
@@ -250,6 +256,18 @@ class StateStore:
 
     def append_supervisor_wake(self, entry: dict[str, Any]) -> None:
         self.append_text_locked(SUPERVISOR_WAKES, json.dumps(entry, default=str, sort_keys=True) + "\n")
+
+    def append_runtime_trace(self, entry: dict[str, Any]) -> None:
+        self.append_text_locked(RUNTIME_TRACE, json.dumps(entry, default=str, sort_keys=True) + "\n")
+
+    def update_runtime_metrics(self, patcher: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+        with self.locked(RUNTIME_METRICS):
+            current = self.read_json(RUNTIME_METRICS, {})
+            if not isinstance(current, dict):
+                current = {}
+            updated = patcher(dict(current))
+            self.atomic_write_json(self.path(RUNTIME_METRICS), updated)
+            return updated
 
     def read_recent_events(self, limit: int = 50) -> list[dict[str, Any]]:
         raw = self.read_text(EVENTS, "")

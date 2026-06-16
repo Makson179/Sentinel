@@ -42,7 +42,18 @@ from supervisor.schemas import (
     TriggeringAction,
     ValidationRun,
 )
-from supervisor.state import CONFIG, EVENTS, FINAL_REPORT, HANDOFF, LOG, PROGRESS, SUPERVISOR_WAKES, StateStore
+from supervisor.state import (
+    CONFIG,
+    EVENTS,
+    FINAL_REPORT,
+    HANDOFF,
+    LOG,
+    PROGRESS,
+    RUNTIME_METRICS,
+    RUNTIME_TRACE,
+    SUPERVISOR_WAKES,
+    StateStore,
+)
 from supervisor.supervisor_agent import StatelessSupervisorAgent
 
 
@@ -196,6 +207,17 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         sequence=13,
         item={"stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"},
     )
+    filtered_same_identity = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="pytest tests/test_user.py::test_sends_email -k sends",
+            exit_code=0,
+            status="completed",
+            summary="command completed: pytest tests/test_user.py::test_sends_email -k sends exit=0",
+        ),
+        sequence=99,
+        item={"stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"},
+    )
     broad_pytest = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -238,7 +260,12 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert zero_tests.outcome == "fail"
     assert not zero_tests.passed
     assert filtered is not None
-    assert filtered.validation_id == "validation-13"
+    assert filtered_same_identity is not None
+    assert filtered.validation_id.startswith("validation-")
+    assert filtered.validation_id == filtered_same_identity.validation_id
+    assert filtered.raw_command == "pytest tests/test_user.py::test_sends_email -k sends"
+    assert filtered.normalized_command == "pytest tests/test_user.py::test_sends_email -k sends"
+    assert filtered.trusted_validation_outcome == "passed"
     assert filtered.was_filtered is True
     assert "tests/test_user.py::test_sends_email" in filtered.executed_test_names
     assert filtered.passed_count == 1
@@ -260,7 +287,7 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert broad_pytest_without_output.failed_count is None
     assert direct_script is not None
     assert direct_script.type == "behavioral"
-    assert direct_script.validation_id == "validation-14"
+    assert direct_script.validation_id.startswith("validation-")
     assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script])
 
 
@@ -482,6 +509,298 @@ def test_validation_freshness_summary_marks_stale_behavioral_pass() -> None:
     )
 
     assert "behavioral validation is stale" in summary
+
+
+async def test_runtime_noop_action_skips_supervisor_and_records_trace(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "python3 -c 'print(1)'",
+                        "exitCode": 0,
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+    )
+
+    assert fake.runtime_packets == []
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["skipped_noop"] is True
+    assert trace["should_wake_runtime_supervisor"] is False
+    metrics = json.loads(store.path(RUNTIME_METRICS).read_text(encoding="utf-8"))
+    assert metrics["runtime_skipped_noop_total"] == 1
+
+
+async def test_runtime_nonzero_action_wakes_supervisor(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "python3 -c 'raise SystemExit(1)'",
+                        "exitCode": 1,
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+    )
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 1
+    assert fake.runtime_packets[0].triggering_action.exit_code == 1
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["should_wake_runtime_supervisor"] is True
+    assert "nonzero_exit" in trace["trigger_reasons"]
+
+
+async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 3}))
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "python3 -c 'print(1)'",
+                        "exitCode": 0,
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+    )
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 1
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert "restart_budget" in trace["trigger_reasons"]
+
+
+async def test_masked_validation_wakes_and_is_not_trusted(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "pytest tests/test_app.py | cat",
+                        "exitCode": 0,
+                        "status": "completed",
+                        "stdout": "tests/test_app.py::test_app PASSED\n1 passed in 0.01s\n",
+                    },
+                },
+            }
+        )
+    )
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 1
+    assert controller.validations[0].trusted_validation_outcome == "masked_or_unknown"
+    assert controller.validations[0].masking_reason == "pipeline_without_pipefail"
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert "masked_validation" in trace["trigger_reasons"]
+
+
+async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    item = {
+        "type": "commandExecution",
+        "command": "pytest tests/test_app.py",
+        "exitCode": 1,
+        "status": "completed",
+        "stdout": "tests/test_app.py::test_app FAILED\n1 failed in 0.01s\n",
+    }
+
+    await controller.handle_notification(
+        AppServerMessage({"method": "item/completed", "params": {"threadId": "thread", "itemId": "cmd-1", "item": item}})
+    )
+    await controller._supervisor_task
+    await controller.handle_notification(
+        AppServerMessage({"method": "item/completed", "params": {"threadId": "thread", "itemId": "cmd-2", "item": item}})
+    )
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 2
+    assert controller.validations[0].validation_id == controller.validations[1].validation_id
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert "repeated_same_failing_validation" in trace["trigger_reasons"]
+
+
+async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.last_coder_message = CoderMessage(text="Summary\nSENTINEL_READY_FOR_REVIEW", sequence=3)
+    controller.observed_changed_files = {
+        "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=2)
+    }
+    controller.validations = [
+        ValidationRun(
+            command="node --check src/app.js",
+            exit_code=0,
+            type="static",
+            passed=True,
+            summary="ok",
+            sequence=3,
+        )
+    ]
+
+    await controller._handle_coder_turn_completed(item_id="done-1")
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 1
+    assert fake.completion_packets == []
+    assert store.get_sentinel_config().last_relevant_edit_sequence == 2
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
+
+
+async def test_completion_packet_details_can_send_delta_after_return(tmp_path: Path) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    controller.validations = [
+        ValidationRun(command="pytest old.py", exit_code=0, passed=True, summary="old", sequence=1),
+        ValidationRun(command="pytest new.py", exit_code=0, passed=True, summary="new", sequence=5),
+    ]
+    changed_files = [
+        ChangedFile(path="src/old.py", status="M", sequence=2),
+        ChangedFile(path="src/new.py", status="M", sequence=6),
+    ]
+
+    details = await controller.completion_packet_details(changed_files, since_sequence=3)
+
+    assert [diff.path for diff in details["changed_file_diffs"]] == ["src/new.py"]
+    assert [validation.validation_id for validation in details["validation_outputs"]] == [
+        controller.validations[1].validation_id
+    ]
+
+
+async def test_completion_review_agent_reuses_thread_until_closed(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_starts = 0
+            self.turn_starts = []
+            self.archived = []
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_starts += 1
+            return {"thread": {"id": "completion-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.turn_starts.append(params["threadId"])
+            return {
+                "turn": {
+                    "id": f"turn-{len(self.turn_starts)}",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": json.dumps(
+                                {
+                                    "decision": "return",
+                                    "reason": "needs more validation",
+                                    "files_reviewed": [],
+                                    "behavior_evidence_matrix": [],
+                                    "uncovered_behaviors": ["fallback"],
+                                    "validation_gaps": ["missing fallback test"],
+                                    "claim_evidence_mismatches": [],
+                                    "packet_or_access_limitations": [],
+                                    "changed_test_risks": [],
+                                    "message_to_coder": "validate fallback",
+                                    "persistent_decision": None,
+                                    "progress_update": None,
+                                    "clear_handoff": False,
+                                    "display_message": None,
+                                    "handoff": None,
+                                    "wake_sequence": 7,
+                                    "generation": 0,
+                                }
+                            ),
+                        }
+                    ],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(client, store, task)  # type: ignore[arg-type]
+    packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
+
+    await agent.decide_completion(packet)
+    await agent.decide_completion(packet)
+
+    assert client.thread_starts == 1
+    assert client.turn_starts == ["completion-thread", "completion-thread"]
+    assert client.archived == []
+
+    await agent.close_completion_review()
+
+    assert client.archived == ["completion-thread"]
+
+
+async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = []
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.store = store
+    controller.client = FakeClient()
+    controller.approvals = ApprovalManager(tmp_path)
+    controller.tui = _FakeTUI()
+    controller._terminal_cleanup_started = True
+
+    await controller.handle_server_request(
+        AppServerMessage(
+            {
+                "id": 99,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "echo after terminal", "availableDecisions": ["accept", "decline"]},
+            }
+        )
+    )
+
+    assert controller.client.responses == [(99, {"decision": "decline"})]
 
 
 async def test_completion_return_sends_message_and_continues_same_generation(tmp_path: Path) -> None:
@@ -2127,6 +2446,83 @@ def _completion_gate_controller(
     controller.completion_reviewer_rerun_count = reruns
     controller.no_marker_idle_nudge_count = 0
     return controller, store, task, coder
+
+
+class _RuntimeFakeSupervisor:
+    def __init__(self, store: StateStore, task: Path) -> None:
+        self.agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+        self.runtime_packets = []
+        self.completion_packets = []
+        self.completion_thread_id = None
+
+    def build_packet(self, **kwargs):
+        return self.agent.build_packet(**kwargs)
+
+    async def decide(self, packet):
+        self.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.NOOP,
+            reason="observed",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    async def decide_completion(self, packet):
+        self.completion_packets.append(packet)
+        return CompletionReviewDecision(
+            decision="return",
+            reason="not used",
+            message_to_coder="not used",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    async def close_completion_review(self):
+        return None
+
+
+def _runtime_controller(tmp_path: Path) -> tuple[SentinelController, StateStore, _RuntimeFakeSupervisor]:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        overwrite=True,
+    )
+    fake = _RuntimeFakeSupervisor(store, task)
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.supervisor = fake
+    controller.coder = None
+    controller.pending_approvals = {}
+    controller.last_coder_message = None
+    controller.validations = []
+    controller.prior_interventions = []
+    controller.observed_changed_files = {}
+    controller.use_git_diff = False
+    controller.tui = _FakeTUI()
+    controller.running = True
+    controller.paused = False
+    controller.event_queue = asyncio.Queue()
+    controller._sequence = 0
+    controller._supervisor_task = None
+    controller._supervisor_dirty = False
+    controller._supervisor_next_summary = None
+    controller._supervisor_next_completion_review = False
+    controller._current_turn_action_count = 0
+    controller._last_completion_marker_sequence = None
+    controller.no_marker_idle_nudge_count = 0
+    controller.completion_returns = []
+    controller.completion_attempt_count = 0
+    controller.completion_restarts = 0
+    controller.completion_reviewer_rerun_count = 0
+    controller.validation_runtime_state = {}
+    controller.completion_review_return_sequence = None
+    controller.completion_review_return_validation_sequence = None
+    controller._terminal_cleanup_started = False
+    return controller, store, fake
 
 
 def _covered_accept_decision(*, wake_sequence: int, validation_id: str = "validation-3") -> CompletionReviewDecision:

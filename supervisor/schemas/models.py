@@ -168,6 +168,10 @@ class SentinelConfig(BaseModel):
     accept_gate_reviewer_reruns: int = 0
     accept_gate_coder_returns: int = 0
     accept_gate_audit_failures: int = 0
+    last_relevant_edit_sequence: int | None = None
+    last_validation_sequence: int | None = None
+    last_trusted_behavioral_validation_sequence: int | None = None
+    last_trusted_passing_behavioral_validation_sequence: int | None = None
 
 
 class AppEvent(BaseModel):
@@ -369,6 +373,7 @@ class TriggeringAction(BaseModel):
     item_id: str | None = None
     kind: str
     command: str | None = None
+    cwd: str | None = None
     paths: list[str] = Field(default_factory=list)
     exit_code: int | None = None
     status: str | None = None
@@ -383,10 +388,16 @@ class CoderMessage(BaseModel):
 class ValidationRun(BaseModel):
     validation_id: str
     command: str
+    raw_command: str | None = None
+    normalized_command: str | None = None
+    cwd: str | None = None
     exit_code: int | None = None
+    shell_exit_code: int | None = None
     type: Literal["static", "behavioral"] = "behavioral"
     outcome: Literal["pass", "fail"] = "fail"
     passed: bool
+    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
+    masking_reason: str | None = None
     summary: str
     sequence: int
     was_filtered: bool = False
@@ -413,9 +424,17 @@ class ValidationRun(BaseModel):
             data["passed"] = data.get("outcome") == "pass"
         if "type" not in data:
             data["type"] = "behavioral"
+        command = data.get("command")
+        if "raw_command" not in data and isinstance(command, str):
+            data["raw_command"] = command
+        if "normalized_command" not in data and isinstance(command, str):
+            data["normalized_command"] = " ".join(command.strip().split())
+        if "shell_exit_code" not in data:
+            data["shell_exit_code"] = data.get("exit_code")
+        if "trusted_validation_outcome" not in data:
+            data["trusted_validation_outcome"] = "passed" if data.get("outcome") == "pass" and data.get("passed") else "failed"
         if "validation_id" not in data:
             sequence = data.get("sequence")
-            command = data.get("command")
             if isinstance(sequence, int) and isinstance(command, str):
                 data["validation_id"] = f"validation-{sequence}"
         return data
@@ -477,10 +496,16 @@ class ChangedTestsSummary(BaseModel):
 class ValidationOutput(BaseModel):
     validation_id: str
     command: str
+    raw_command: str | None = None
+    normalized_command: str | None = None
+    cwd: str | None = None
     exit_code: int | None = None
+    shell_exit_code: int | None = None
     type: Literal["static", "behavioral"]
     outcome: Literal["pass", "fail"]
     passed: bool
+    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
+    masking_reason: str | None = None
     sequence: int
     stdout_or_summary: str
     stderr_or_summary: str | None = None
@@ -542,6 +567,9 @@ class SupervisorWakePacket(BaseModel):
     changed_tests_summary: list[ChangedTestsSummary] = Field(default_factory=list)
     validation_outputs: list[ValidationOutput] = Field(default_factory=list)
     diff_packet_limits: DiffPacketLimits = Field(default_factory=DiffPacketLimits)
+    completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
+    completion_payload_since_sequence: int | None = None
+    completion_review_thread_id: str | None = None
 
 
 class FinalReport(BaseModel):

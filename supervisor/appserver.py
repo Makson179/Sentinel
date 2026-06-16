@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +103,7 @@ class AppServerClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=self.stdout_limit,
+            start_new_session=True,
         )
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -122,13 +125,27 @@ class AppServerClient:
             self._stderr_task = None
         if self.process:
             if self.process.returncode is None:
-                self.process.terminate()
+                self._terminate_process_group(signal.SIGTERM)
                 try:
                     await asyncio.wait_for(self.process.wait(), timeout=3)
                 except asyncio.TimeoutError:
-                    self.process.kill()
+                    self._terminate_process_group(signal.SIGKILL)
                     await self.process.wait()
             self.process = None
+
+    def _terminate_process_group(self, sig: int) -> None:
+        process = self.process
+        if process is None or process.returncode is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except ProcessLookupError:
+            return
+        except Exception:
+            if sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
 
     async def initialize(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
         result = await self.request(

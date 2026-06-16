@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
@@ -62,6 +62,8 @@ NO_MARKER_IDLE_NUDGE = (
 ACCEPT_GATE_REVIEWER_INCOMPLETE = "reviewer-incomplete"
 ACCEPT_GATE_CODER_CORRECTABLE = "coder-correctable"
 ACCEPT_GATE_AUDIT_FAILURE = "audit-failure"
+LARGE_DIFF_CHANGED_LINES_THRESHOLD = 500
+LARGE_DIFF_CHANGED_FILES_THRESHOLD = 10
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,12 @@ class AcceptGateResult:
     check_name: str | None = None
     reason: str | None = None
     passed_checks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RuntimeTriggerDecision:
+    should_wake: bool
+    reasons: tuple[str, ...] = ()
 
 
 class SentinelController:
@@ -133,6 +141,10 @@ class SentinelController:
         self.completion_restarts = 0
         self.completion_reviewer_rerun_count = 0
         self.no_marker_idle_nudge_count = 0
+        self.validation_runtime_state: dict[str, dict[str, Any]] = {}
+        self.completion_review_return_sequence: int | None = None
+        self.completion_review_return_validation_sequence: int | None = None
+        self._terminal_cleanup_started = False
 
     async def run(self) -> None:
         self.initialize_state()
@@ -299,6 +311,12 @@ class SentinelController:
 
     async def handle_server_request(self, message: AppServerMessage) -> None:
         context = normalize_approval_request(message)
+        if getattr(self, "_terminal_cleanup_started", False):
+            manager = getattr(self, "approvals", None) or ApprovalManager(self.project_root)
+            resolution = manager._deny(context, "terminal state reached")
+            await self.client.respond(context.server_request_id, manager.response_payload(context, resolution))
+            self.tui.render("DENIED", f"{resolution.decision}: {resolution.reason}")
+            return
         self.pending_approvals[context.server_request_id] = context
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
@@ -361,6 +379,8 @@ class SentinelController:
         if _is_stream_delta_method(method):
             return
         self._append_event(AppEventSource.APP_SERVER, method, thread_id=thread_id, turn_id=turn_id, item_id=item_id)
+        if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
+            return
 
         cfg = self.store.get_sentinel_config()
         if method == "serverRequest/resolved":
@@ -397,16 +417,35 @@ class SentinelController:
                     item=item,
                     changed_paths=list(getattr(self, "observed_changed_files", {}) or {}),
                 )
+                validation_trigger_reasons: tuple[str, ...] = ()
                 if validation is not None:
                     self.validations.append(validation)
                     self.validations = self.validations[-VALIDATION_LEDGER_LIMIT:]
-                self.tui.render("TOOL", summary)
-                self._schedule_supervisor_check(
-                    f"Coder completed action: {summary}",
-                    triggering_item_id=item_id,
-                    triggering_action=triggering_action,
-                    patch_summary=_patch_summary_from_item(item),
+                    self._record_validation_progress(validation)
+                    validation_trigger_reasons = self._record_validation_runtime_state(validation)
+                changed_files = await self.changed_files()
+                self._update_relevant_edit_state(changed_files)
+                runtime_decision = self.should_wake_runtime_supervisor(
+                    action=triggering_action,
+                    validation=validation,
+                    changed_files=changed_files,
+                    validation_trigger_reasons=validation_trigger_reasons,
                 )
+                self.tui.render("TOOL", summary)
+                self._record_runtime_trigger_trace(
+                    event_type=method,
+                    action=triggering_action,
+                    validation=validation,
+                    changed_files=changed_files,
+                    decision=runtime_decision,
+                )
+                if runtime_decision.should_wake:
+                    self._schedule_supervisor_check(
+                        f"Runtime trigger ({', '.join(runtime_decision.reasons)}): {summary}",
+                        triggering_item_id=item_id,
+                        triggering_action=triggering_action,
+                        patch_summary=_patch_summary_from_item(item),
+                    )
             return
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
             if self.coder and isinstance(turn_id, str):
@@ -420,6 +459,28 @@ class SentinelController:
                 self._last_completion_marker_sequence = message.sequence
                 self.no_marker_idle_nudge_count = 0
                 self.completion_reviewer_rerun_count = 0
+                done_gap = await self._done_without_fresh_behavioral_validation()
+                if done_gap is not None:
+                    self._record_runtime_trigger_trace(
+                        event_type="turn/completed",
+                        action=TriggeringAction(
+                            item_id=item_id,
+                            kind="done",
+                            status="completed",
+                            summary=done_gap,
+                        ),
+                        validation=None,
+                        changed_files=await self.changed_files(),
+                        decision=RuntimeTriggerDecision(
+                            should_wake=True,
+                            reasons=("done_without_fresh_validation",),
+                        ),
+                    )
+                    self._schedule_supervisor_check(
+                        f"Runtime trigger (done_without_fresh_validation): {done_gap}",
+                        triggering_item_id=item_id,
+                    )
+                    return
                 self._schedule_supervisor_check(
                     "Coder provided exact readiness marker; running completion_review.",
                     triggering_item_id=item_id,
@@ -445,6 +506,20 @@ class SentinelController:
             await self._handle_no_marker_idle()
             return
         self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
+
+    async def _done_without_fresh_behavioral_validation(self) -> str | None:
+        changed_files = await self.changed_files()
+        self._update_relevant_edit_state(changed_files)
+        cfg = self.store.get_sentinel_config()
+        latest_relevant_edit = cfg.last_relevant_edit_sequence
+        if latest_relevant_edit is None:
+            return None
+        if any(_validation_is_fresh_behavioral_pass(validation, latest_relevant_edit) for validation in self.validations):
+            return None
+        return (
+            "coder marked done without a trusted fresh behavioral validation after "
+            f"relevant edit sequence {latest_relevant_edit}"
+        )
 
     async def _steer_for_marker(
         self,
@@ -518,6 +593,7 @@ class SentinelController:
         if cfg.restart_count >= cfg.max_restarts:
             await self.finalize("restart cap reached", status=SentinelStatus.STUCK)
             return
+        await self._close_completion_review_session()
         self.store.update_sentinel_config(lambda current: current.model_copy(update={"status": SentinelStatus.RESTARTING}))
         if self.coder:
             try:
@@ -536,6 +612,9 @@ class SentinelController:
         self.prior_interventions = []
         self.no_marker_idle_nudge_count = 0
         self._last_completion_marker_sequence = None
+        self.completion_review_return_sequence = None
+        self.completion_review_return_validation_sequence = None
+        self.validation_runtime_state = {}
         patch_health(
             self.store,
             HealthDelta(
@@ -568,6 +647,7 @@ class SentinelController:
         status: SentinelStatus = SentinelStatus.COMPLETE,
         completion_review_accepted: bool = False,
     ) -> None:
+        await self._prepare_terminal_shutdown(result)
         self._reconcile_intervention_accounting()
         diff = await self.diff_summary()
         changed_files = await self.changed_files()
@@ -603,6 +683,63 @@ class SentinelController:
         self.running = False
         self._wake_event_loop_for_shutdown()
 
+    async def _prepare_terminal_shutdown(self, reason: str) -> None:
+        if getattr(self, "_terminal_cleanup_started", False):
+            return
+        self._terminal_cleanup_started = True
+        self.running = False
+        await self._close_completion_review_session()
+        coder = getattr(self, "coder", None)
+        if coder:
+            try:
+                await coder.interrupt()
+            except Exception as exc:
+                self._append_cleanup_error(
+                    cleanup_kind="terminal_coder_interrupt",
+                    thread_id=getattr(coder, "thread_id", None) or "unknown",
+                    turn_id=getattr(coder, "active_turn_id", None),
+                    error=exc,
+                )
+        if getattr(self, "pending_approvals", None) and getattr(self, "client", None) is not None:
+            try:
+                await self._resolve_pending_approvals(f"terminal state reached: {reason}")
+            except Exception as exc:
+                self._append_cleanup_error(
+                    cleanup_kind="terminal_pending_approvals",
+                    thread_id="unknown",
+                    turn_id=None,
+                    error=exc,
+                )
+        task = getattr(self, "_supervisor_task", None)
+        if task is not None and task is not asyncio.current_task():
+            await self._stop_supervisor_task()
+        client = getattr(self, "client", None)
+        if client is not None and hasattr(client, "stop"):
+            try:
+                await client.stop()
+            except Exception as exc:
+                self._append_cleanup_error(
+                    cleanup_kind="terminal_appserver_stop",
+                    thread_id="unknown",
+                    turn_id=None,
+                    error=exc,
+                )
+
+    async def _close_completion_review_session(self) -> None:
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is None or not hasattr(supervisor, "close_completion_review"):
+            return
+        thread_id = getattr(supervisor, "completion_thread_id", None) or "unknown"
+        try:
+            await supervisor.close_completion_review()
+        except Exception as exc:
+            self._append_cleanup_error(
+                cleanup_kind="completion_review_session",
+                thread_id=thread_id,
+                turn_id=None,
+                error=exc,
+            )
+
     def _wake_event_loop_for_shutdown(self) -> None:
         queue = getattr(self, "event_queue", None)
         if queue is None:
@@ -635,7 +772,12 @@ class SentinelController:
         patch_summary: str | None = None,
         completion_review: bool = False,
     ) -> None:
-        if not self.running or getattr(self, "paused", False) or getattr(self, "supervisor", None) is None:
+        if (
+            not self.running
+            or getattr(self, "paused", False)
+            or getattr(self, "_terminal_cleanup_started", False)
+            or getattr(self, "supervisor", None) is None
+        ):
             return
         if self._supervisor_task and not self._supervisor_task.done():
             self._supervisor_dirty = True
@@ -656,6 +798,154 @@ class SentinelController:
                 completion_review,
             )
         )
+
+    def _record_validation_progress(self, validation: ValidationRun) -> None:
+        def patch(current: SentinelConfig) -> SentinelConfig:
+            updates: dict[str, Any] = {"last_validation_sequence": validation.sequence}
+            if validation.type == "behavioral" and validation.trusted_validation_outcome != "masked_or_unknown":
+                updates["last_trusted_behavioral_validation_sequence"] = validation.sequence
+                if validation.trusted_validation_outcome == "passed":
+                    updates["last_trusted_passing_behavioral_validation_sequence"] = validation.sequence
+            return current.model_copy(update=updates)
+
+        self.store.update_sentinel_config(patch)
+
+    def _record_validation_runtime_state(self, validation: ValidationRun) -> tuple[str, ...]:
+        key = validation.validation_id
+        state = getattr(self, "validation_runtime_state", None)
+        if state is None:
+            state = {}
+            self.validation_runtime_state = state
+        previous = state.get(key, {})
+        previous_outcome = previous.get("trusted_validation_outcome")
+        previous_failed_count = int(previous.get("consecutive_failed_count") or 0)
+        current_outcome = validation.trusted_validation_outcome
+        reasons: list[str] = []
+        if current_outcome == "masked_or_unknown":
+            reasons.append("masked_validation")
+        elif current_outcome == "failed":
+            if previous_outcome == "passed":
+                reasons.append("validation_regression")
+            failed_count = previous_failed_count + 1 if previous_outcome == "failed" else 1
+            if failed_count >= 2:
+                reasons.append("repeated_same_failing_validation")
+            previous_failed_count = failed_count
+        else:
+            previous_failed_count = 0
+        state[key] = {
+            "trusted_validation_outcome": current_outcome,
+            "consecutive_failed_count": previous_failed_count,
+            "sequence": validation.sequence,
+            "normalized_command": validation.normalized_command,
+            "type": validation.type,
+        }
+        return tuple(dict.fromkeys(reasons))
+
+    def _update_relevant_edit_state(self, changed_files: list[ChangedFile]) -> None:
+        task_contents = _read_task_text(self.task_path)
+        relevant_sequences = [
+            changed.sequence
+            for changed in changed_files
+            if changed.sequence is not None and _is_relevant_changed_path(changed.path, task_contents=task_contents)
+        ]
+        if not relevant_sequences:
+            return
+        latest = max(relevant_sequences)
+
+        def patch(current: SentinelConfig) -> SentinelConfig:
+            existing = current.last_relevant_edit_sequence
+            if existing is not None and existing >= latest:
+                return current
+            return current.model_copy(update={"last_relevant_edit_sequence": latest})
+
+        self.store.update_sentinel_config(patch)
+
+    def should_wake_runtime_supervisor(
+        self,
+        *,
+        action: TriggeringAction,
+        validation: ValidationRun | None,
+        changed_files: list[ChangedFile],
+        validation_trigger_reasons: tuple[str, ...] = (),
+    ) -> RuntimeTriggerDecision:
+        reasons: list[str] = list(validation_trigger_reasons)
+        if action.exit_code is not None and action.exit_code != 0:
+            reasons.append("nonzero_exit")
+        if _action_timed_out(action):
+            reasons.append("timeout")
+        if validation is not None and validation.trusted_validation_outcome == "masked_or_unknown":
+            reasons.append("masked_validation")
+        if _has_large_diff(changed_files):
+            reasons.append("large_diff")
+        if any(_is_suspicious_changed_path(changed.path) for changed in changed_files):
+            reasons.append("suspicious_file_touched")
+        restart_candidate, restart_reason = kill_restart_candidate(self.store.get_health())
+        if restart_candidate and restart_reason:
+            reasons.append("restart_budget")
+        reasons = list(dict.fromkeys(reasons))
+        return RuntimeTriggerDecision(should_wake=bool(reasons), reasons=tuple(reasons))
+
+    def _record_runtime_trigger_trace(
+        self,
+        *,
+        event_type: str,
+        action: TriggeringAction | None,
+        validation: ValidationRun | None,
+        changed_files: list[ChangedFile],
+        decision: RuntimeTriggerDecision,
+    ) -> None:
+        additions, deletions = _diff_line_counts(changed_files)
+        suspicious_paths = [changed.path for changed in changed_files if _is_suspicious_changed_path(changed.path)]
+        trace = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_sequence": getattr(self, "_sequence", None),
+            "generation": self.store.get_sentinel_config().generation,
+            "event_type": event_type,
+            "action_kind": action.kind if action is not None else None,
+            "tool_name": action.kind if action is not None else None,
+            "command": action.command if action is not None else None,
+            "cwd": action.cwd if action is not None else None,
+            "exit_code": action.exit_code if action is not None else None,
+            "status": action.status if action is not None else None,
+            "changed_files_count": len(changed_files),
+            "changed_files": [changed.path for changed in changed_files[:20]],
+            "changed_lines": additions + deletions,
+            "diff_additions": additions,
+            "diff_deletions": deletions,
+            "suspicious_paths": suspicious_paths[:20],
+            "validation_id": validation.validation_id if validation is not None else None,
+            "validation_type": validation.type if validation is not None else None,
+            "trusted_validation_outcome": validation.trusted_validation_outcome if validation is not None else None,
+            "masking_reason": validation.masking_reason if validation is not None else None,
+            "should_wake_runtime_supervisor": decision.should_wake,
+            "trigger_reasons": list(decision.reasons),
+            "skipped_noop": not decision.should_wake,
+        }
+        self.store.append_runtime_trace(trace)
+        self._update_runtime_metrics(trace)
+
+    def _update_runtime_metrics(self, trace: dict[str, Any]) -> None:
+        reasons = trace.get("trigger_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+
+        def patch(current: dict[str, Any]) -> dict[str, Any]:
+            current["runtime_events_total"] = int(current.get("runtime_events_total") or 0) + 1
+            if trace.get("should_wake_runtime_supervisor"):
+                current["runtime_wakes_total"] = int(current.get("runtime_wakes_total") or 0) + 1
+            if trace.get("skipped_noop"):
+                current["runtime_skipped_noop_total"] = int(current.get("runtime_skipped_noop_total") or 0) + 1
+            counts = current.get("runtime_trigger_reason_counts")
+            if not isinstance(counts, dict):
+                counts = {}
+            for reason in reasons:
+                counts[str(reason)] = int(counts.get(str(reason)) or 0) + 1
+                metric_name = f"runtime_trigger_{reason}_total"
+                current[metric_name] = int(current.get(metric_name) or 0) + 1
+            current["runtime_trigger_reason_counts"] = counts
+            return current
+
+        self.store.update_runtime_metrics(patch)
 
     async def _supervisor_check_loop(
         self,
@@ -707,7 +997,15 @@ class SentinelController:
             validations=list(self.validations),
             changed_files=changed_files,
         )
-        completion_details = await self.completion_packet_details(changed_files) if completion_review else {}
+        completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
+        completion_payload_since_sequence: int | None = None
+        completion_details: dict[str, Any] = {}
+        if completion_review:
+            completion_payload_mode, completion_payload_since_sequence = self._completion_payload_window(changed_files)
+            completion_details = await self.completion_packet_details(
+                changed_files,
+                since_sequence=completion_payload_since_sequence,
+            )
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
             current_summary=summary,
@@ -728,6 +1026,9 @@ class SentinelController:
             no_marker_idle_nudge_count=getattr(self, "no_marker_idle_nudge_count", 0),
             latest_relevant_change_sequence=latest_change_sequence,
             validation_freshness_summary=freshness_summary,
+            completion_payload_mode=completion_payload_mode,
+            completion_payload_since_sequence=completion_payload_since_sequence,
+            completion_review_thread_id=getattr(self.supervisor, "completion_thread_id", None),
             **completion_details,
         )
         try:
@@ -745,6 +1046,22 @@ class SentinelController:
             await self.apply_completion_decision(decision, packet_thread_id=packet.coder_thread_id, packet=packet)
         else:
             await self.apply_supervisor_decision(decision, packet_thread_id=packet.coder_thread_id)
+
+    def _completion_payload_window(
+        self,
+        changed_files: list[ChangedFile],
+    ) -> tuple[Literal["full", "delta", "full_fallback"], int | None]:
+        since_sequence = getattr(self, "completion_review_return_sequence", None)
+        if since_sequence is None:
+            return "full", None
+        task_contents = _read_task_text(self.task_path)
+        has_unknown_relevant_sequence = any(
+            changed.sequence is None and _is_relevant_changed_path(changed.path, task_contents=task_contents)
+            for changed in changed_files
+        )
+        if has_unknown_relevant_sequence:
+            return "full_fallback", None
+        return "delta", since_sequence
 
     async def apply_supervisor_decision(self, decision: SupervisorDecision, *, packet_thread_id: str | None) -> None:
         cfg = self.store.get_sentinel_config()
@@ -816,6 +1133,7 @@ class SentinelController:
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence})
         )
+        self._append_completion_anchor_log(decision, packet=packet)
         if decision.decision == CompletionReviewDecisionKind.ACCEPT:
             gate_result = await self._completion_accept_gate(decision, packet=packet)
             if not gate_result.passed:
@@ -853,6 +1171,27 @@ class SentinelController:
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)
             return
+
+    def _append_completion_anchor_log(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+    ) -> None:
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "completion_review_anchor",
+                "decision": decision.decision.value,
+                "wake_sequence": decision.wake_sequence,
+                "generation": decision.generation,
+                "reason": decision.reason,
+                "packet_mode": packet.completion_payload_mode if packet is not None else None,
+                "packet_since_sequence": packet.completion_payload_since_sequence if packet is not None else None,
+                "validation_ids": [validation.validation_id for validation in (packet.validations if packet else [])],
+                "changed_files": [changed.path for changed in (packet.changed_files if packet else [])],
+            }
+        )
 
     async def _completion_accept_gate(
         self,
@@ -1070,6 +1409,9 @@ class SentinelController:
             generation=decision.generation,
         )
         self.completion_returns = [*getattr(self, "completion_returns", []), record][-50:]
+        self.completion_review_return_sequence = decision.wake_sequence
+        validation_sequences = [validation.sequence for validation in self.validations]
+        self.completion_review_return_validation_sequence = max(validation_sequences) if validation_sequences else None
         if not decision.progress_update:
             details = _completion_return_summary(decision)
             self.store.append_text_locked(PROGRESS, f"- Completion review returned: {details}\n")
@@ -1105,10 +1447,11 @@ class SentinelController:
             await self.coder.steer_or_start(decision.message_to_coder)
 
     async def _resolve_pending_approvals(self, reason: str) -> None:
-        if self.approvals is None:
+        approvals = getattr(self, "approvals", None)
+        if approvals is None:
             manager = ApprovalManager(self.project_root)
         else:
-            manager = self.approvals
+            manager = approvals
         for request_id, context in list(self.pending_approvals.items()):
             resolution = manager._deny(context, reason)
             await self.client.respond(request_id, manager.response_payload(context, resolution))
@@ -1223,7 +1566,12 @@ class SentinelController:
             return None
         return _bounded_text("\n\n".join(parts), limit=limit)
 
-    async def completion_packet_details(self, changed_files: list[ChangedFile]) -> dict[str, Any]:
+    async def completion_packet_details(
+        self,
+        changed_files: list[ChangedFile],
+        *,
+        since_sequence: int | None = None,
+    ) -> dict[str, Any]:
         diff_limit = 12000
         context_limit = 8000
         changed_file_diffs: list[ChangedFileDiff] = []
@@ -1235,8 +1583,16 @@ class SentinelController:
         materially_truncated = False
         truncation_reasons: list[str] = []
         is_git = self.use_git_diff and await self._is_git_work_tree()
+        detail_changed_files = [
+            changed
+            for changed in changed_files
+            if since_sequence is None or changed.sequence is None or changed.sequence > since_sequence
+        ]
+        detail_validations = [
+            validation for validation in self.validations if since_sequence is None or validation.sequence > since_sequence
+        ]
 
-        for changed in changed_files[:200]:
+        for changed in detail_changed_files[:200]:
             file_kind = _file_kind(changed.path)
             change_kind = _change_kind(changed.status)
             diff_text = ""
@@ -1285,13 +1641,13 @@ class SentinelController:
                 )
             )
             if file_kind == "test":
-                changed_tests_summary.append(_changed_tests_summary(changed.path, context.text, list(self.validations)))
+                changed_tests_summary.append(_changed_tests_summary(changed.path, context.text, detail_validations))
 
         return {
             "changed_file_diffs": changed_file_diffs,
             "changed_file_contexts": changed_file_contexts,
             "changed_tests_summary": changed_tests_summary,
-            "validation_outputs": [_validation_output(validation) for validation in self.validations],
+            "validation_outputs": [_validation_output(validation) for validation in detail_validations],
             "diff_packet_limits": DiffPacketLimits(
                 total_diff_chars=total_diff_chars,
                 total_context_chars=total_context_chars,
@@ -1462,6 +1818,7 @@ def _triggering_action_from_item(item: Any, *, item_id: str | None, summary: str
         item_id=item_id,
         kind=kind,
         command=item.get("command") if isinstance(item.get("command"), str) else None,
+        cwd=item.get("cwd") if isinstance(item.get("cwd"), str) else None,
         paths=_paths_from_item(item),
         exit_code=exit_code if isinstance(exit_code, int) else None,
         status=item.get("status") if isinstance(item.get("status"), str) else "completed",
@@ -1482,22 +1839,44 @@ def _validation_from_action(
     if validation_type is None:
         return None
     output = _command_output_from_item(item)
+    normalized_command = _normalize_command(action.command)
+    raw_selector = _raw_validation_selector(action.command)
+    executed_test_names = _executed_test_names(action.command, output)
     outcome = "pass" if action.exit_code == 0 else "fail"
     if validation_type == "behavioral" and outcome == "pass" and not _tests_executed(action.command, output):
         outcome = "fail"
+    masking_reason = _validation_masking_reason(action.command)
+    trusted_outcome = "passed" if outcome == "pass" else "failed"
+    passed = outcome == "pass"
+    if masking_reason is not None:
+        trusted_outcome = "masked_or_unknown"
+        outcome = "fail"
+        passed = False
     passed_count, failed_count = _test_count_summary(output)
     return ValidationRun(
-        validation_id=_validation_id(sequence),
+        validation_id=_stable_validation_id(
+            normalized_command=normalized_command,
+            cwd=action.cwd,
+            validation_type=validation_type,
+            raw_selector=raw_selector,
+            executed_test_names=executed_test_names,
+        ),
         command=action.command,
+        raw_command=action.command,
+        normalized_command=normalized_command,
+        cwd=action.cwd,
         exit_code=action.exit_code,
+        shell_exit_code=action.exit_code,
         type=validation_type,
         outcome=outcome,
-        passed=outcome == "pass",
+        passed=passed,
+        trusted_validation_outcome=trusted_outcome,
+        masking_reason=masking_reason,
         summary=action.summary,
         sequence=sequence,
         was_filtered=_command_was_filtered(action.command),
-        raw_selector=_raw_validation_selector(action.command),
-        executed_test_names=_executed_test_names(action.command, output),
+        raw_selector=raw_selector,
+        executed_test_names=executed_test_names,
         passed_count=passed_count,
         failed_count=failed_count,
         target_files_or_test_files=_target_files_or_test_files(action.command),
@@ -1589,6 +1968,43 @@ def _command_output_from_item(item: Any, *, limit: int = 20000) -> str:
 
 def _validation_id(sequence: int) -> str:
     return f"validation-{sequence}"
+
+
+def _normalize_command(command: str) -> str:
+    return " ".join(command.strip().split())
+
+
+def _stable_validation_id(
+    *,
+    normalized_command: str,
+    cwd: str | None,
+    validation_type: str,
+    raw_selector: str | None,
+    executed_test_names: list[str],
+) -> str:
+    payload = {
+        "normalized_command": normalized_command,
+        "cwd": cwd or "",
+        "validation_type": validation_type,
+        "raw_selector": raw_selector or "",
+        "executed_test_names": sorted(dict.fromkeys(executed_test_names)),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"validation-{digest[:16]}"
+
+
+def _validation_masking_reason(command: str) -> str | None:
+    lowered = command.lower()
+    pipeline_probe = lowered.replace("||", "")
+    if "|" in pipeline_probe and "pipefail" not in lowered:
+        return "pipeline_without_pipefail"
+    if "$(" in command or "`" in command:
+        return "command_substitution_may_mask_failure"
+    if "||" in lowered and not re.search(r"\|\|\s*exit\s+1(\s|$)", lowered):
+        return "logical_or_may_mask_validation_failure"
+    if ";" in lowered:
+        return "command_separator_may_mask_validation_failure"
+    return None
 
 
 def _command_was_filtered(command: str) -> bool:
@@ -1706,7 +2122,10 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
 
 def _has_passing_behavioral_validation(validations: list[ValidationRun]) -> bool:
     return any(
-        validation.type == "behavioral" and validation.outcome == "pass" and validation.passed
+        validation.type == "behavioral"
+        and validation.outcome == "pass"
+        and validation.passed
+        and validation.trusted_validation_outcome == "passed"
         for validation in validations
     )
 
@@ -1757,7 +2176,11 @@ def _completion_returns_this_generation(controller: Any, generation: int) -> int
 
 
 def _latest_relevant_change_sequence(changed_files: list[ChangedFile]) -> int | None:
-    sequences = [file.sequence for file in changed_files if file.sequence is not None]
+    sequences = [
+        file.sequence
+        for file in changed_files
+        if file.sequence is not None and _is_relevant_changed_path(file.path, task_contents="")
+    ]
     return max(sequences) if sequences else None
 
 
@@ -1770,7 +2193,10 @@ def _validation_freshness_summary(
     passing_behavioral = [
         validation.sequence
         for validation in validations
-        if validation.type == "behavioral" and validation.outcome == "pass" and validation.passed
+        if validation.type == "behavioral"
+        and validation.outcome == "pass"
+        and validation.passed
+        and validation.trusted_validation_outcome == "passed"
     ]
     last_behavioral = max(passing_behavioral) if passing_behavioral else None
     if last_behavioral is None:
@@ -1894,12 +2320,13 @@ def _validation_is_fresh_behavioral_pass(validation: ValidationRun, latest_chang
         validation.type == "behavioral"
         and validation.outcome == "pass"
         and validation.passed
+        and validation.trusted_validation_outcome == "passed"
         and validation.sequence > latest_change
     )
 
 
 def _validation_is_fresh_pass(validation: ValidationRun, latest_change: int | None) -> bool:
-    if validation.outcome != "pass" or not validation.passed:
+    if validation.outcome != "pass" or not validation.passed or validation.trusted_validation_outcome != "passed":
         return False
     if latest_change is None:
         return True
@@ -2256,18 +2683,56 @@ def _file_kind(path: str) -> str:
     if (
         lowered.startswith("tests/")
         or lowered.startswith("test/")
+        or lowered.startswith("fixtures/")
+        or lowered.startswith("fixture/")
+        or lowered.startswith("golden/")
+        or lowered.startswith("goldens/")
+        or lowered.startswith("snapshots/")
+        or lowered.startswith("__snapshots__/")
         or "/tests/" in lowered
         or "/test/" in lowered
+        or "/fixtures/" in lowered
+        or "/fixture/" in lowered
+        or "/golden/" in lowered
+        or "/goldens/" in lowered
+        or "/snapshots/" in lowered
+        or "/__snapshots__/" in lowered
         or "/__tests__/" in lowered
         or "/spec/" in lowered
         or ".test." in name
         or ".spec." in name
+        or ".snap." in name
+        or ".snapshot." in name
+        or ".golden." in name
         or name.startswith("test_")
         or name.endswith("_test.py")
         or name.endswith("_spec.rb")
+        or name.endswith((".snap", ".snapshot", ".golden"))
     ):
         return "test"
-    if name in {"package.json", "pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "tsconfig.json"}:
+    if (
+        lowered.startswith(".github/workflows/")
+        or lowered.startswith(".circleci/")
+        or lowered.startswith(".buildkite/")
+        or lowered.startswith("ci/")
+        or lowered.startswith(".gitlab/")
+        or name in {".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml", "jenkinsfile"}
+    ):
+        return "config"
+    if name in {
+        "package.json",
+        "pyproject.toml",
+        "setup.cfg",
+        "tox.ini",
+        "pytest.ini",
+        "tsconfig.json",
+        "vitest.config.js",
+        "vitest.config.ts",
+        "jest.config.js",
+        "jest.config.ts",
+        "playwright.config.js",
+        "playwright.config.ts",
+    }:
         return "config"
     if lowered.endswith((".toml", ".yaml", ".yml", ".json", ".ini", ".cfg")):
         return "config"
@@ -2306,6 +2771,74 @@ def _file_kind(path: str) -> str:
     return "unknown"
 
 
+def _is_relevant_changed_path(path: str, *, task_contents: str) -> bool:
+    kind = _file_kind(path)
+    if kind in {"source", "test", "config"}:
+        return True
+    if _is_suspicious_changed_path(path):
+        return True
+    if kind == "docs":
+        return _task_is_docs_facing(task_contents)
+    return False
+
+
+def _is_suspicious_changed_path(path: str) -> bool:
+    normalized = path.lower().replace("\\", "/").strip("/")
+    name = normalized.rsplit("/", 1)[-1]
+    if _file_kind(path) == "test":
+        return True
+    suspicious_parts = {
+        "fixtures",
+        "fixture",
+        "golden",
+        "goldens",
+        "snapshots",
+        "__snapshots__",
+        "__fixtures__",
+        "ci",
+    }
+    if set(normalized.split("/")) & suspicious_parts:
+        return True
+    if normalized.startswith((".github/workflows/", ".circleci/", ".buildkite/")):
+        return True
+    if name in {".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml", "jenkinsfile"}:
+        return True
+    if any(marker in name for marker in (".snap", ".snapshot", ".golden")):
+        return True
+    return False
+
+
+def _task_is_docs_facing(task_contents: str) -> bool:
+    lowered = task_contents.lower()
+    return any(token in lowered for token in ("documentation", "docs", "readme", ".md", "markdown", "docstring"))
+
+
+def _read_task_text(task_path: Path) -> str:
+    try:
+        return task_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _diff_line_counts(changed_files: list[ChangedFile]) -> tuple[int, int]:
+    additions = sum(changed.additions or 0 for changed in changed_files)
+    deletions = sum(changed.deletions or 0 for changed in changed_files)
+    return additions, deletions
+
+
+def _has_large_diff(changed_files: list[ChangedFile]) -> bool:
+    additions, deletions = _diff_line_counts(changed_files)
+    return (
+        len(changed_files) >= LARGE_DIFF_CHANGED_FILES_THRESHOLD
+        or additions + deletions >= LARGE_DIFF_CHANGED_LINES_THRESHOLD
+    )
+
+
+def _action_timed_out(action: TriggeringAction) -> bool:
+    text = " ".join(part for part in (action.status, action.summary) if part).lower()
+    return "timeout" in text or "timed out" in text
+
+
 def _change_kind(status: str) -> str:
     normalized = status.strip().upper()
     if "D" in normalized:
@@ -2337,10 +2870,16 @@ def _validation_output(validation: ValidationRun) -> ValidationOutput:
     return ValidationOutput(
         validation_id=validation.validation_id,
         command=validation.command,
+        raw_command=validation.raw_command,
+        normalized_command=validation.normalized_command,
+        cwd=validation.cwd,
         exit_code=validation.exit_code,
+        shell_exit_code=validation.shell_exit_code,
         type=validation.type,
         outcome=validation.outcome,
         passed=validation.passed,
+        trusted_validation_outcome=validation.trusted_validation_outcome,
+        masking_reason=validation.masking_reason,
         sequence=validation.sequence,
         stdout_or_summary=validation.summary,
         stderr_or_summary=None,
