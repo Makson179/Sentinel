@@ -117,6 +117,7 @@ class SentinelController:
         self.last_coder_message: CoderMessage | None = None
         self.validations: list[ValidationRun] = []
         self.observed_changed_files: dict[str, ChangedFile] = {}
+        self._command_output_chunks: dict[str, list[str]] = {}
         self.prior_interventions: list[PriorIntervention] = []
         self.running = False
         self.paused = False
@@ -175,7 +176,7 @@ class SentinelController:
         self.tui.status("checking Codex version")
         version = _run_probe(["codex", "--version"])[1]
         self.tui.status("checking Codex app-server schema")
-        schema_hash = await asyncio.to_thread(self._generate_schema_hash)
+        schema_hash = await self._generate_schema_hash_async()
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(update={"codex_version": version, "appserver_schema_hash": schema_hash})
         )
@@ -186,10 +187,18 @@ class SentinelController:
         self.tui.status("checking Codex rate limits")
         try:
             await self.client.account_rate_limits_read()
-        except AppServerError:
-            raise
-        except Exception:
-            pass
+        except Exception as exc:
+            warning = f"Codex rate limit check unavailable; continuing: {exc}"
+            self.tui.render("SYSTEM", warning)
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "preflight_warning",
+                    "check": "codex_rate_limits",
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                }
+            )
         self.tui.status("checking available models")
         models = await self.client.model_list()
         if self.model is None:
@@ -358,6 +367,7 @@ class SentinelController:
         turn_id = _turn_id_from_params(params)
         item_id = _item_id_from_params(params)
         if _is_stream_delta_method(method):
+            self._record_command_output_delta(method, params, item_id=item_id)
             return
         self._append_event(AppEventSource.APP_SERVER, method, thread_id=thread_id, turn_id=turn_id, item_id=item_id)
 
@@ -390,10 +400,11 @@ class SentinelController:
                 self.store.append_recent_action(summary)
                 triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=summary)
                 self._record_changed_files(triggering_action)
+                validation_item = _item_with_recorded_output(item, self._pop_command_output(item_id))
                 validation = _validation_from_action(
                     triggering_action,
                     sequence=self._sequence,
-                    item=item,
+                    item=validation_item,
                     changed_paths=list(getattr(self, "observed_changed_files", {}) or {}),
                 )
                 if validation is not None:
@@ -411,6 +422,28 @@ class SentinelController:
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
             await self._handle_coder_turn_completed(item_id=item_id)
+
+    def _record_command_output_delta(self, method: str, params: dict[str, Any], *, item_id: str | None) -> None:
+        if method not in {"item/commandExecution/outputDelta", "command/exec/outputDelta", "process/outputDelta"}:
+            return
+        if not item_id:
+            return
+        text = _output_delta_text(params)
+        if not text:
+            return
+        chunks = getattr(self, "_command_output_chunks", None)
+        if chunks is None:
+            chunks = {}
+            self._command_output_chunks = chunks
+        chunks.setdefault(item_id, []).append(text)
+
+    def _pop_command_output(self, item_id: str | None) -> str:
+        if not item_id:
+            return ""
+        chunks = getattr(self, "_command_output_chunks", None)
+        if not chunks:
+            return ""
+        return "".join(chunks.pop(item_id, []))
 
     async def _handle_coder_turn_completed(self, *, item_id: str | None) -> None:
         message = self.last_coder_message
@@ -677,6 +710,8 @@ class SentinelController:
             )
             if not self._supervisor_dirty:
                 return
+            if not self.running:
+                return
             summary = self._supervisor_next_summary or "Supervisor check was dirty; reviewing latest state"
             completion_review = getattr(self, "_supervisor_next_completion_review", False)
             self._supervisor_next_summary = None
@@ -738,6 +773,20 @@ class SentinelController:
         except SupervisorAgentError as exc:
             message = f"supervisor check failed: {exc}"
             self.tui.render("SUPERVISOR", message)
+            if not completion_review and getattr(self, "_supervisor_dirty", False):
+                patch_health(
+                    self.store,
+                    HealthDelta(
+                        generation=cfg.generation,
+                        timeout_fallback_count=1,
+                        add_risk_signals=["stale_runtime_supervisor_timeout"],
+                    ),
+                )
+                self.store.append_text_locked(
+                    PROGRESS,
+                    "- Runtime supervisor check timed out after newer coder activity; continuing with the latest queued review.\n",
+                )
+                return
             await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
             return
         if completion_review:
@@ -1369,13 +1418,15 @@ class SentinelController:
                 digest.update(path.read_bytes())
             return digest.hexdigest()
 
+    async def _generate_schema_hash_async(self) -> str:
+        return await asyncio.to_thread(self._generate_schema_hash)
+
     async def _structured_output_self_test(self) -> None:
         agent = StatelessSupervisorAgent(
             self.client,
             self.store,
             self.task_path,
             model=self.model,
-            timeout_seconds=45,
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -1463,6 +1514,7 @@ def _validation_from_action(
     if validation_type == "behavioral" and outcome == "pass" and not _tests_executed(action.command, output):
         outcome = "fail"
     passed_count, failed_count = _test_count_summary(output)
+    summary = _validation_summary(action.summary, output)
     return ValidationRun(
         validation_id=_validation_id(sequence),
         command=action.command,
@@ -1470,7 +1522,7 @@ def _validation_from_action(
         type=validation_type,
         outcome=outcome,
         passed=outcome == "pass",
-        summary=action.summary,
+        summary=summary,
         sequence=sequence,
         was_filtered=_command_was_filtered(action.command),
         raw_selector=_raw_validation_selector(action.command),
@@ -1484,7 +1536,11 @@ def _validation_from_action(
 def _classify_validation_command(command: str, *, changed_paths: list[str]) -> str | None:
     if _is_static_validation_command(command):
         return "static"
-    if _is_behavioral_validation_command(command) or _command_requires_changed_module(command, changed_paths):
+    if (
+        _is_behavioral_validation_command(command)
+        or _is_direct_script_execution_command(command)
+        or _command_requires_changed_module(command, changed_paths)
+    ):
         return "behavioral"
     return None
 
@@ -1512,12 +1568,25 @@ def _is_static_validation_command(command: str) -> bool:
 def _is_behavioral_validation_command(command: str) -> bool:
     lowered = command.lower()
     executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
+    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
     patterns = (
         executable_prefix + r"mocha(\s|$)",
         r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?test(\s|$|:)",
         r"(^|[\s;&|()'\"])(node|nodejs)\s+--test(\s|$)",
+        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
         executable_prefix + r"(jest|ava|tap|vitest|playwright|cypress|pytest|tox|rspec)(\s|$)",
         r"(^|[\s;&|()'\"])(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _is_direct_script_execution_command(command: str) -> bool:
+    lowered = command.lower()
+    boundary = r"(?=$|[\s;&|()'\"])"
+    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    patterns = (
+        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+(?!-)[\w./-]+\.py" + boundary,
+        r"(^|[\s;&|()'\"])(node|nodejs|ruby|bash|sh)\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
 
@@ -1564,6 +1633,52 @@ def _command_output_from_item(item: Any, *, limit: int = 20000) -> str:
     return _bounded_text("\n".join(parts), limit=limit)
 
 
+def _item_with_recorded_output(item: Any, output: str) -> Any:
+    if not output or not isinstance(item, dict):
+        return item
+    existing = _command_output_from_item(item)
+    merged = output if not existing else f"{existing}\n{output}"
+    enriched = dict(item)
+    enriched["output"] = merged
+    return enriched
+
+
+def _output_delta_text(params: dict[str, Any], *, limit: int = 20000) -> str:
+    parts: list[str] = []
+    _collect_output_delta_strings(params, parts, depth=0)
+    return _bounded_text("".join(parts), limit=limit)
+
+
+def _collect_output_delta_strings(value: Any, parts: list[str], *, depth: int) -> None:
+    if depth > 5:
+        return
+    if isinstance(value, str):
+        if value:
+            parts.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_output_delta_strings(item, parts, depth=depth + 1)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, nested in value.items():
+        key_text = str(key).lower()
+        if key_text in {"delta", "output", "stdout", "stderr", "text", "content", "message", "chunk", "data"}:
+            _collect_output_delta_strings(nested, parts, depth=depth + 1)
+        elif key_text in {"outputs", "chunks", "lines", "items"}:
+            _collect_output_delta_strings(nested, parts, depth=depth + 1)
+
+
+def _validation_summary(summary: str, output: str, *, limit: int = 4000) -> str:
+    stripped = output.strip()
+    if not stripped:
+        return summary
+    if stripped in summary:
+        return summary
+    return _bounded_text(f"{summary}\nOutput:\n{stripped}", limit=limit)
+
+
 def _validation_id(sequence: int) -> str:
     return f"validation-{sequence}"
 
@@ -1582,11 +1697,20 @@ def _raw_validation_selector(command: str) -> str | None:
     )
     for pattern in patterns:
         for match in re.finditer(pattern, command):
+            if match.group(1) == "-m" and _is_python_module_flag(command, match.start(1)):
+                continue
             selector = match.group(2).strip("\"'")
             selectors.append(f"{match.group(1)} {selector}")
     for target in _explicit_test_selectors(command):
         selectors.append(target)
     return "; ".join(dict.fromkeys(selectors)) or None
+
+
+def _is_python_module_flag(command: str, start: int) -> bool:
+    prefix = command[:start].rstrip().lower()
+    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    pattern = r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*$"
+    return bool(re.search(pattern, prefix))
 
 
 def _explicit_test_selectors(command: str, *, limit: int = 50) -> list[str]:
@@ -1675,13 +1799,6 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
             _collect_output_strings(nested, parts, depth=depth + 1)
         elif key_text in {"outputs", "chunks", "lines", "items"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
-
-
-def _has_passing_behavioral_validation(validations: list[ValidationRun]) -> bool:
-    return any(
-        validation.type == "behavioral" and validation.outcome == "pass" and validation.passed
-        for validation in validations
-    )
 
 
 def _has_readiness_marker(text: str) -> bool:

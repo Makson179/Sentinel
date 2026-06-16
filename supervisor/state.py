@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterator, TypeVar
 import fcntl
 from pydantic import BaseModel
 
-from supervisor.schemas import AppEvent, DecisionLogEntry, FinalReport, HealthState, PendingIntervention, RunConfig, SentinelConfig
+from supervisor.schemas import AppEvent, FinalReport, HealthState, SentinelConfig
 
 T = TypeVar("T")
 
@@ -20,7 +20,6 @@ PROGRESS = "PROGRESS.md"
 DECISIONS = "DECISIONS.md"
 LAST_ACTION = "LAST_ACTION.md"
 ACTION_HISTORY_LIMIT = 10
-PENDING = "PENDING_INTERVENTION.md"
 HEALTH = "HEALTH.json"
 HANDOFF = "HANDOFF.md"
 FINAL_REPORT = "FINAL_REPORT.md"
@@ -135,39 +134,6 @@ class StateStore:
         with self.locked(name):
             self.atomic_write_json(self.path(name), data)
 
-    def initialize(self, config: RunConfig, overwrite: bool = False) -> None:
-        files = {
-            CONFIG: config,
-            HEALTH: HealthState(generation=config.generation, restart_count=config.restart_count),
-            PROGRESS: "# Progress\n\n- Current step: not started\n- Completed steps: none\n- Known issues: none\n",
-            DECISIONS: "# Decisions\n\n",
-            LAST_ACTION: "",
-            PENDING: "",
-            HANDOFF: "",
-            FINAL_REPORT: "",
-            LOG: "",
-            EVENTS: "",
-            SUPERVISOR_WAKES: "",
-        }
-        for name, value in files.items():
-            path = self.path(name)
-            if path.exists() and not overwrite:
-                continue
-            if isinstance(value, BaseModel):
-                self.atomic_write_json(path, value)
-            else:
-                self.atomic_write_text(path, value)
-
-    def get_config(self) -> RunConfig:
-        return RunConfig.model_validate(self.read_json(CONFIG, {}))
-
-    def update_config(self, patcher: Callable[[RunConfig], RunConfig]) -> RunConfig:
-        with self.locked(CONFIG):
-            config = self.get_config()
-            updated = patcher(config)
-            self.atomic_write_json(self.path(CONFIG), updated)
-            return updated
-
     def get_health(self) -> HealthState:
         return HealthState.model_validate(self.read_json(HEALTH, HealthState().model_dump()))
 
@@ -177,35 +143,6 @@ class StateStore:
             updated = patcher(health)
             self.atomic_write_json(self.path(HEALTH), updated)
             return updated
-
-    def write_pending(self, pending: PendingIntervention) -> None:
-        with self.locked(PENDING):
-            existing = self.read_pending_unlocked()
-            if existing and existing.generation == pending.generation and existing.sequence >= pending.sequence:
-                return
-            self.atomic_write_text(self.path(PENDING), pending.model_dump_json(indent=2) + "\n")
-
-    def read_pending_unlocked(self) -> PendingIntervention | None:
-        raw = self.read_text(PENDING, "").strip()
-        if not raw:
-            return None
-        return PendingIntervention.model_validate_json(raw)
-
-    def read_pending(self) -> PendingIntervention | None:
-        with self.locked(PENDING):
-            return self.read_pending_unlocked()
-
-    def claim_pending(self, generation: int) -> PendingIntervention | None:
-        with self.locked(PENDING):
-            pending = self.read_pending_unlocked()
-            if pending is None or pending.generation != generation:
-                return None
-            self.atomic_write_text(self.path(PENDING), "")
-            return pending
-
-    def append_log(self, entry: DecisionLogEntry) -> None:
-        line = entry.model_dump_json() + "\n"
-        self.append_text_locked(LOG, line)
 
     def write_handoff(self, content: str) -> None:
         self.write_text_locked(HANDOFF, content)

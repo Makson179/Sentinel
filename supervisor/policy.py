@@ -3,11 +3,10 @@ from __future__ import annotations
 import fnmatch
 import os
 import shlex
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from supervisor.schemas import HookEvent, PolicyDecision
+from supervisor.schemas import PolicyDecision
 
 
 SECRET_FILE_GLOBS = {
@@ -298,71 +297,11 @@ def is_recursive_delete_outside(tokens: list[str], workspace: Path) -> bool:
     return False
 
 
-@dataclass(frozen=True)
-class AllowRule:
-    tool: str | None
-    command: tuple[str, ...] | None
-    paths: tuple[str, ...]
-    generation: int
-
-    @classmethod
-    def from_payload(cls, workspace: Path, generation: int, payload: dict[str, Any]) -> "AllowRule":
-        command_value = payload.get("command")
-        command: tuple[str, ...] | None = None
-        if isinstance(command_value, str):
-            tokens, _ = parse_command(command_value)
-            command = tuple(tokens or ())
-        paths, _ = resolve_all_paths(workspace, extract_paths(payload))
-        return cls(
-            tool=payload.get("tool_name") if isinstance(payload.get("tool_name"), str) else None,
-            command=command,
-            paths=tuple(str(path) for path in paths),
-            generation=generation,
-        )
-
-    def matches(self, workspace: Path, generation: int, payload: dict[str, Any]) -> bool:
-        if self.generation != generation:
-            return False
-        tool = payload.get("tool_name")
-        if self.tool is not None and tool != self.tool:
-            return False
-        command_value = payload.get("command")
-        if self.command is not None:
-            if not isinstance(command_value, str):
-                return False
-            tokens, problem = parse_command(command_value)
-            if problem or tuple(tokens or ()) != self.command:
-                return False
-        paths, problem = resolve_all_paths(workspace, extract_paths(payload))
-        if problem:
-            return False
-        return tuple(str(path) for path in paths) == self.paths
-
-
-@dataclass
-class SessionAllowRules:
-    rules: list[AllowRule] = field(default_factory=list)
-
-    def add(self, rule: AllowRule) -> None:
-        self.rules.append(rule)
-
-    def reset_generation(self, generation: int) -> None:
-        self.rules = [rule for rule in self.rules if rule.generation == generation]
-
-    def matches(self, workspace: Path, generation: int, payload: dict[str, Any]) -> bool:
-        return any(rule.matches(workspace, generation, payload) for rule in self.rules)
-
-
 class PolicyEngine:
-    def __init__(self, workspace: Path, allow_rules: SessionAllowRules | None = None):
+    def __init__(self, workspace: Path):
         self.workspace = workspace.resolve()
-        self.allow_rules = allow_rules or SessionAllowRules()
 
-    def evaluate(self, event: HookEvent) -> PolicyDecision:
-        payload = event.payload
-        if self.allow_rules.matches(self.workspace, event.generation, payload):
-            return PolicyDecision.allow("session allow rule matched")
-
+    def evaluate(self, payload: dict[str, Any]) -> PolicyDecision:
         command = payload.get("command")
         tool_name = payload.get("tool_name")
         operation = payload.get("operation")

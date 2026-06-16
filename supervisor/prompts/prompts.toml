@@ -45,14 +45,6 @@ Validation: <commands, tests, reproductions, or flows that passed>
 SENTINEL_READY_FOR_REVIEW
 '''
 
-[legacy_supervisor]
-instructions = [
-  "Return only JSON matching the supervisor decision schema.",
-  "Prefer minimum human involvement and robust autonomous supervision.",
-  "For gray-zone permissions, choose allow_once, allow_class, or deny.",
-  "Confirm kill_restart only when deterministic evidence shows the current generation is stuck.",
-]
-
 [stateless_supervisor]
 body_sections = ["role", "output_contract", "decisions", "inputs", "state_writes", "invariants"]
 completion_body_sections = ["completion_role", "completion_output_contract", "completion_inputs", "completion_state_writes", "completion_review", "completion_invariants"]

@@ -1,6 +1,5 @@
 # Runtime dependencies
 click>=8.1
-httpx>=0.27
 pydantic>=2.0
 
 # Test/development dependencies

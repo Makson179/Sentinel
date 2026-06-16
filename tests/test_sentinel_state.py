@@ -12,7 +12,6 @@ from supervisor.controller import (
     ControllerEvent,
     SentinelController,
     _has_malformed_readiness_marker,
-    _has_passing_behavioral_validation,
     _has_readiness_marker,
     _path_from_git_status_line,
     _file_kind,
@@ -199,13 +198,24 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     direct_script = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="python3 hello.py",
+            command="/bin/bash -lc 'python3 hello.py'",
             exit_code=0,
             status="completed",
-            summary="command completed: python3 hello.py exit=0",
+            summary="command completed: /bin/bash -lc 'python3 hello.py' exit=0",
         ),
         sequence=14,
-        changed_paths=["hello.py"],
+        item={"stdout": "hello world\n", "stderr": ""},
+    )
+    python_unittest = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="/bin/bash -lc 'python3 -B -m unittest -v'",
+            exit_code=0,
+            status="completed",
+            summary="command completed: /bin/bash -lc 'python3 -B -m unittest -v' exit=0",
+        ),
+        sequence=15,
+        item={"stdout": "Ran 1 test in 0.001s\n\nOK\n"},
     )
 
     assert all(run is not None and run.type == "static" and run.outcome == "pass" for run in static_runs)
@@ -225,7 +235,84 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert direct_script is not None
     assert direct_script.type == "behavioral"
     assert direct_script.validation_id == "validation-14"
-    assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script])
+    assert "hello world" in direct_script.summary
+    assert direct_script.target_files_or_test_files == ["hello.py"]
+    assert python_unittest is not None
+    assert python_unittest.type == "behavioral"
+    assert python_unittest.validation_id == "validation-15"
+    assert python_unittest.was_filtered is False
+    validation_runs = [
+        run for run in [*static_runs, behavioral, zero_tests, filtered, direct_script, python_unittest] if run is not None
+    ]
+    assert any(run.type == "behavioral" and run.outcome == "pass" and run.passed for run in validation_runs)
+
+
+async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("Create hello.py\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        overwrite=True,
+    )
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.store = store
+    controller.coder = None
+    controller.tui = _FakeTUI()
+    controller.pending_approvals = {}
+    controller.validations = []
+    controller.observed_changed_files = {}
+    controller._command_output_chunks = {}
+    controller._sequence = 0
+    controller._current_turn_action_count = 0
+    controller.running = False
+    controller.paused = False
+    controller.supervisor = None
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/commandExecution/outputDelta",
+                "params": {"threadId": "thread", "turnId": "turn", "itemId": "cmd-1", "delta": "hello "},
+            }
+        )
+    )
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/commandExecution/outputDelta",
+                "params": {"threadId": "thread", "turnId": "turn", "itemId": "cmd-1", "delta": {"text": "world\n"}},
+            }
+        )
+    )
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "python3 hello.py",
+                        "exitCode": 0,
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+    )
+
+    assert len(controller.validations) == 1
+    validation = controller.validations[0]
+    assert validation.command == "python3 hello.py"
+    assert validation.type == "behavioral"
+    assert validation.passed is True
+    assert "hello world" in validation.summary
+    assert controller._command_output_chunks == {}
 
 
 def test_readiness_marker_detection_requires_own_exact_line() -> None:
@@ -1208,6 +1295,56 @@ async def test_supervisor_turn_start_timeout_writes_provider_failure_final_repor
     assert "supervisor turn/start response timed out after 0.01s" in audit["error"]
 
 
+async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class HangingTurnStartClient:
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "supervisor-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            await asyncio.Event().wait()
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.use_git_diff = False
+    controller.pending_approvals = {}
+    controller.last_coder_message = None
+    controller.validations = []
+    controller.prior_interventions = []
+    controller.observed_changed_files = {}
+    controller.tui = _FakeTUI()
+    controller.running = True
+    controller.supervisor = StatelessSupervisorAgent(
+        HangingTurnStartClient(),
+        store,
+        task,
+        timeout_seconds=0.01,
+    )  # type: ignore[arg-type]
+    controller._supervisor_dirty = True
+    controller._supervisor_next_completion_review = True
+
+    await controller._run_supervisor_check("stale runtime check", None, None, None, None)
+
+    text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    health = store.get_health()
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert text == ""
+    assert controller.running is True
+    assert health.timeout_fallback_count == 1
+    assert "stale_runtime_supervisor_timeout" in health.risk_signals
+    assert "continuing with the latest queued review" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert any("supervisor check failed" in message for _, message in controller.tui.messages)
+
+
 async def test_preflight_appserver_timeout_writes_provider_failure_final_report(tmp_path: Path, monkeypatch) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -1234,7 +1371,7 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
         overwrite_state=True,
         use_git_diff=False,
     )
-    controller._generate_schema_hash = lambda: "schema"
+    controller._generate_schema_hash_async = _async_schema_hash
 
     await controller.run()
 
@@ -1292,7 +1429,7 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
         overwrite_state=True,
         use_git_diff=False,
     )
-    controller._generate_schema_hash = lambda: "schema"
+    controller._generate_schema_hash_async = _async_schema_hash
     controller._structured_output_self_test = _async_noop
     controller.initialize_state()
 
@@ -1306,6 +1443,67 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
     assert entry["type"] == "cleanup_error"
     assert entry["cleanup_kind"] == "preflight_probe_thread"
     assert entry["thread_id"] == "probe-thread"
+    assert entry["error_type"] == "AppServerError"
+
+
+async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: Path, monkeypatch) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    class RateLimitFailureClient:
+        def __init__(self) -> None:
+            self.unsubscribed: list[str] = []
+
+        async def account_read(self):
+            return {"requiresOpenaiAuth": False, "account": {"id": "acct"}}
+
+        async def account_rate_limits_read(self):
+            raise AppServerError(
+                "{'code': -32603, 'message': 'failed to fetch codex rate limits: error sending request'}"
+            )
+
+        async def model_list(self):
+            return {"data": [{"id": "gpt-test"}]}
+
+        async def config_requirements_read(self):
+            return {}
+
+        async def thread_start(self, params):
+            return {
+                "thread": {"id": "probe-thread"},
+                "approvalPolicy": "on-request",
+                "sandbox": {"type": "readOnly", "networkAccess": False},
+            }
+
+        async def thread_unsubscribe(self, thread_id):
+            self.unsubscribed.append(thread_id)
+            return {}
+
+    client = RateLimitFailureClient()
+    tui = _FakeTUI()
+    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        client=client,  # type: ignore[arg-type]
+        tui=tui,
+        overwrite_state=True,
+        use_git_diff=False,
+    )
+    controller._generate_schema_hash_async = _async_schema_hash
+    controller._structured_output_self_test = _async_noop
+    controller.initialize_state()
+
+    await controller.preflight()
+
+    assert controller.store.get_sentinel_config().model == "gpt-test"
+    assert client.unsubscribed == ["probe-thread"]
+    assert any("rate limit check unavailable" in message for _, message in tui.messages)
+    log_lines = controller.store.path(LOG).read_text(encoding="utf-8").splitlines()
+    assert log_lines
+    entry = json.loads(log_lines[-1])
+    assert entry["type"] == "preflight_warning"
+    assert entry["check"] == "codex_rate_limits"
     assert entry["error_type"] == "AppServerError"
 
 
@@ -1353,7 +1551,7 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
         overwrite_state=True,
         use_git_diff=False,
     )
-    controller._generate_schema_hash = lambda: "schema"
+    controller._generate_schema_hash_async = _async_schema_hash
     controller._structured_output_self_test = _async_noop
     controller.initialize_state()
 
@@ -1860,7 +2058,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
         overwrite_state=True,
         use_git_diff=False,
     )
-    controller._generate_schema_hash = lambda: "schema"
+    controller._generate_schema_hash_async = _async_schema_hash
     controller._structured_output_self_test = _async_noop
 
     run_task = asyncio.create_task(controller.run())
@@ -1881,6 +2079,10 @@ def test_run_async_cleanly_exits_zero_after_loop_cleanup() -> None:
 
 async def _async_noop() -> None:
     return None
+
+
+async def _async_schema_hash() -> str:
+    return "schema"
 
 
 class _GateFakeCoder:

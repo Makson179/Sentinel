@@ -4,7 +4,6 @@ from supervisor.prompts.supervisor import (
     build_coder_prompt,
     build_restart_prompt,
     build_stateless_supervisor_prompt,
-    clear_prompt_cache,
 )
 
 __all__ = [
@@ -13,5 +12,4 @@ __all__ = [
     "build_coder_prompt",
     "build_restart_prompt",
     "build_stateless_supervisor_prompt",
-    "clear_prompt_cache",
 ]

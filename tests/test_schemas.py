@@ -13,17 +13,14 @@ from supervisor.prompts import (
     build_coder_prompt,
     build_restart_prompt,
     build_stateless_supervisor_prompt,
-    clear_prompt_cache,
 )
 from supervisor.schemas.models import (
     HumanMessage,
-    LLMDecision,
     CompletionReviewDecision,
     RestartHandoff,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
-    openai_strict_json_schema_for_decision,
     openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
@@ -37,36 +34,6 @@ def _walk_schema(node: Any) -> Iterator[dict[str, Any]]:
     elif isinstance(node, list):
         for item in node:
             yield from _walk_schema(item)
-
-
-def test_openai_strict_decision_schema_marks_all_objects_closed_and_required() -> None:
-    schema = openai_strict_json_schema_for_decision()
-
-    assert schema["type"] == "object"
-    assert schema["additionalProperties"] is False
-    assert set(schema["required"]) == set(schema["properties"])
-    assert schema["properties"]["allow_rule"]["anyOf"][0]["$ref"] == "#/$defs/AllowRulePayload"
-
-    for node in _walk_schema(schema):
-        if node.get("type") == "object" or "properties" in node:
-            assert node["additionalProperties"] is False
-            assert set(node["required"]) == set(node["properties"])
-        assert node.get("additionalProperties") is not True
-        assert "default" not in node
-
-
-def test_llm_decision_allow_rule_accepts_structured_payload() -> None:
-    decision = LLMDecision.model_validate(
-        {
-            "decision_type": "allow",
-            "permission_kind": "allow_class",
-            "reason": "safe repeated command",
-            "allow_rule": {"tool_name": "Bash", "command": "pwd"},
-        }
-    )
-
-    assert decision.allow_rule is not None
-    assert decision.allow_rule.model_dump(exclude_none=True) == {"tool_name": "Bash", "command": "pwd"}
 
 
 def test_supervisor_decision_schema_is_strict() -> None:
@@ -320,7 +287,6 @@ text = '''completion instruction'''
     task.write_text("# Task\n", encoding="utf-8")
 
     monkeypatch.setenv(PROMPTS_ENV_VAR, str(prompt_file))
-    clear_prompt_cache()
     try:
         assert build_coder_prompt(task) == f"initial {task.resolve()}"
         assert build_restart_prompt(task) == f"restart {task.resolve()}"
@@ -341,7 +307,7 @@ text = '''completion instruction'''
         completion_payload = json.loads(build_completion_review_prompt(packet))
         assert completion_payload["instructions"] == ["completion instruction"]
     finally:
-        clear_prompt_cache()
+        monkeypatch.delenv(PROMPTS_ENV_VAR, raising=False)
 
 
 def test_missing_stateless_prompt_block_fails_fast(monkeypatch, tmp_path: Path) -> None:
