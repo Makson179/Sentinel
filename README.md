@@ -169,7 +169,6 @@ It contains:
 - `coder_restart.template`;
 - `stateless_supervisor.body_sections`;
 - `stateless_supervisor.sections.*`;
-- `legacy_supervisor.instructions`.
 
 The coder templates support the `{task_path}` placeholder. Sentinel loads this
 file at runtime before building coder and supervisor turns.
@@ -325,12 +324,9 @@ echo '# Other task' > NOTES.md
 
 ## Current Status
 
-This is an app-server MVP. It has the core Sentinel architecture, but the Codex
+This is an app-server runtime. It has the core Sentinel architecture, but the Codex
 app-server protocol is experimental and can change between Codex releases.
 Sentinel therefore performs schema/version preflight checks before running.
-
-Legacy hook/IPC modules still exist in the repository for now, but they are not
-the primary Sentinel runtime.
 
 Do not run first tests in an important repository. Start with a throwaway git
 repo and inspect `.supervisor/` after the run.

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from supervisor.schemas import RunConfig
+from supervisor.schemas import SentinelConfig
 from supervisor.state import StateStore
 
 
@@ -16,8 +16,7 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def store(workspace: Path) -> StateStore:
-    config = RunConfig(platform="fake", plan_file_path=str(workspace / "TASK.md"))
+    config = SentinelConfig(project_root=str(workspace), task_path=str(workspace / "TASK.md"))
     state = StateStore(workspace)
-    state.initialize(config, overwrite=True)
+    state.initialize_sentinel(config, overwrite=True)
     return state
-

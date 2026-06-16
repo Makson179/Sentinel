@@ -14,11 +14,6 @@ PROMPTS_ENV_VAR = "SENTINEL_PROMPTS_FILE"
 PROMPTS_RESOURCE = "prompts.toml"
 
 
-def clear_prompt_cache() -> None:
-    """Compatibility hook; prompts are loaded fresh on every build."""
-    return None
-
-
 def build_coder_prompt(task_path: Path) -> str:
     return _template("coder_initial").replace("{task_path}", str(task_path.resolve()))
 

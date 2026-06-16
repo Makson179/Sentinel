@@ -490,7 +490,3 @@ def _read_handoff(store: StateStore) -> RestartHandoff | None:
         return RestartHandoff.model_validate_json(raw)
     except Exception:
         return None
-
-
-def fallback_supervisor_decision(reason: str, *, decision: SupervisorDecisionKind = SupervisorDecisionKind.NOOP) -> SupervisorDecision:
-    return SupervisorDecision(decision=decision, reason=reason, display_message=reason)

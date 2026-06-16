@@ -1,6 +1,0 @@
-from __future__ import annotations
-
-CODEX_EXEC_GIT_TRUST_FLAGS = ["--skip-git-repo-check"]
-CODEX_NO_WEB_SEARCH_CONFIG = 'web_search="disabled"'
-CODEX_NO_WEB_SEARCH_CONFIG_FLAGS = ["-c", CODEX_NO_WEB_SEARCH_CONFIG]
-CODEX_EXEC_NO_WEB_SEARCH_FLAGS = CODEX_NO_WEB_SEARCH_CONFIG_FLAGS

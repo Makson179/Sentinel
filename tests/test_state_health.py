@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 from supervisor.health import patch_health
-from supervisor.schemas import HealthDelta, PendingIntervention
+from supervisor.schemas import HealthDelta
 from supervisor.state import HEALTH, StateStore
 
 
@@ -27,27 +27,6 @@ def test_progress_update_preserves_active_task_intervention_count(store: StateSt
     health = store.get_health()
     assert health.last_progress_sequence == 1071
     assert health.interventions == 2
-
-
-def test_pending_intervention_claim_clear_is_atomic(store: StateStore) -> None:
-    store.write_pending(PendingIntervention(generation=0, sequence=10, message="Fix the approach."))
-
-    def claim() -> str | None:
-        pending = store.claim_pending(0)
-        return pending.message if pending else None
-
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        results = list(pool.map(lambda _: claim(), range(20)))
-
-    assert results.count("Fix the approach.") == 1
-    assert store.read_pending() is None
-
-
-def test_pending_replacement_requires_higher_sequence(store: StateStore) -> None:
-    store.write_pending(PendingIntervention(generation=0, sequence=10, message="old"))
-    store.write_pending(PendingIntervention(generation=0, sequence=9, message="stale"))
-    store.write_pending(PendingIntervention(generation=0, sequence=11, message="new"))
-    assert store.read_pending().message == "new"
 
 
 def test_atomic_write_behavior(store: StateStore) -> None:

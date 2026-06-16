@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import shlex
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -11,8 +10,6 @@ from supervisor.schemas import (
     ApprovalContext,
     ApprovalRequestType,
     ApprovalResolution,
-    HookEvent,
-    EventType,
     NetworkApprovalContext,
     PolicyDecision,
     PolicyDecisionKind,
@@ -27,8 +24,6 @@ PERMISSIONS_APPROVAL_METHOD = "item/permissions/requestApproval"
 TOOL_USER_INPUT_METHOD = "item/tool/requestUserInput"
 DYNAMIC_TOOL_CALL_METHOD = "item/tool/call"
 MCP_ELICITATION_METHOD = "mcpServer/elicitation/request"
-LEGACY_EXEC_COMMAND_METHOD = "execCommandApproval"
-LEGACY_APPLY_PATCH_METHOD = "applyPatchApproval"
 
 
 class SupervisorApprovalReviewer(Protocol):
@@ -50,13 +45,7 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
 
     if request_type == ApprovalRequestType.COMMAND:
         command = _string(params.get("command"))
-    elif request_type == ApprovalRequestType.LEGACY_EXEC_COMMAND:
-        raw_command = params.get("command")
-        if isinstance(raw_command, list):
-            command = " ".join(shlex.quote(str(part)) for part in raw_command)
-        else:
-            command = _string(raw_command)
-    elif request_type in {ApprovalRequestType.FILE_CHANGE, ApprovalRequestType.LEGACY_APPLY_PATCH}:
+    elif request_type == ApprovalRequestType.FILE_CHANGE:
         if grant_root:
             paths.append(grant_root)
         raw_file_changes = params.get("fileChanges")
@@ -129,7 +118,7 @@ class ApprovalManager:
         if context.network_approval_context is not None:
             return await self._route_supervisor_or_deny(context, "network approval requires supervisor judgment")
 
-        if context.request_type in {ApprovalRequestType.FILE_CHANGE, ApprovalRequestType.LEGACY_APPLY_PATCH}:
+        if context.request_type == ApprovalRequestType.FILE_CHANGE:
             file_decision = self._evaluate_file_change(context)
             if file_decision.kind == PolicyDecisionKind.ALLOW:
                 return self._allow(context, file_decision.reason)
@@ -142,7 +131,7 @@ class ApprovalManager:
             payload["command"] = context.command
         if context.cwd:
             payload["cwd"] = context.cwd
-        policy_decision = self.policy.evaluate(HookEvent(event_type=EventType.PERMISSION_REQUEST, payload=payload))
+        policy_decision = self.policy.evaluate(payload)
         if policy_decision.kind == PolicyDecisionKind.ALLOW:
             return self._allow(context, policy_decision.reason)
         if policy_decision.kind == PolicyDecisionKind.DENY:
@@ -153,8 +142,6 @@ class ApprovalManager:
         method = context.server_request_method
         if method in {COMMAND_APPROVAL_METHOD, FILE_CHANGE_APPROVAL_METHOD}:
             return {"decision": resolution.decision}
-        if method == LEGACY_EXEC_COMMAND_METHOD or method == LEGACY_APPLY_PATCH_METHOD:
-            return {"decision": _to_legacy_decision(resolution.decision)}
         if method == TOOL_USER_INPUT_METHOD:
             return {"answers": {}}
         if method == DYNAMIC_TOOL_CALL_METHOD:
@@ -227,12 +214,10 @@ class ApprovalManager:
 
     def _allow(self, context: ApprovalContext, reason: str) -> ApprovalResolution:
         decision = "accept"
-        if context.request_type in {ApprovalRequestType.LEGACY_EXEC_COMMAND, ApprovalRequestType.LEGACY_APPLY_PATCH}:
-            decision = "approved"
         if not self._is_allowed(context, decision):
-            choices = ["accept", "approved"]
+            choices = ["accept"]
             if not _accept_for_session_forbidden(context, self.workspace):
-                choices.extend(["acceptForSession", "approved_for_session"])
+                choices.append("acceptForSession")
             decision = self._first_allowed(context, choices) or self._deny_decision(context)
         return ApprovalResolution(decision=decision, reason=reason)
 
@@ -240,8 +225,6 @@ class ApprovalManager:
         return ApprovalResolution(decision=self._deny_decision(context), reason=reason)
 
     def _deny_decision(self, context: ApprovalContext) -> str:
-        if context.request_type in {ApprovalRequestType.LEGACY_EXEC_COMMAND, ApprovalRequestType.LEGACY_APPLY_PATCH}:
-            return "denied"
         return self._first_allowed(context, ["decline", "cancel"]) or "decline"
 
     def _first_allowed(self, context: ApprovalContext, choices: list[str]) -> str | None:
@@ -285,8 +268,6 @@ def _request_type(method: str) -> ApprovalRequestType:
         TOOL_USER_INPUT_METHOD: ApprovalRequestType.TOOL_USER_INPUT,
         DYNAMIC_TOOL_CALL_METHOD: ApprovalRequestType.DYNAMIC_TOOL_CALL,
         MCP_ELICITATION_METHOD: ApprovalRequestType.MCP_ELICITATION,
-        LEGACY_EXEC_COMMAND_METHOD: ApprovalRequestType.LEGACY_EXEC_COMMAND,
-        LEGACY_APPLY_PATCH_METHOD: ApprovalRequestType.LEGACY_APPLY_PATCH,
     }.get(method, ApprovalRequestType.UNKNOWN)
 
 
@@ -316,26 +297,10 @@ def _paths_from_changes(changes: list[Any]) -> list[str]:
     return paths
 
 
-def _to_legacy_decision(decision: str | dict[str, Any]) -> str | dict[str, Any]:
-    if isinstance(decision, dict):
-        if "acceptWithExecpolicyAmendment" in decision:
-            amendment = decision["acceptWithExecpolicyAmendment"].get("execpolicy_amendment", [])
-            return {"approved_execpolicy_amendment": {"proposed_execpolicy_amendment": amendment}}
-        return "denied"
-    return {
-        "accept": "approved",
-        "acceptForSession": "approved_for_session",
-        "decline": "denied",
-        "cancel": "abort",
-        "approved": "approved",
-        "denied": "denied",
-    }.get(decision, decision)
-
-
 def _accept_for_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
     if context.network_approval_context is not None:
         return True
-    if context.request_type in {ApprovalRequestType.FILE_CHANGE, ApprovalRequestType.LEGACY_APPLY_PATCH}:
+    if context.request_type == ApprovalRequestType.FILE_CHANGE:
         return _file_change_session_forbidden(context, workspace)
     if context.command:
         return _command_session_forbidden(context.command)

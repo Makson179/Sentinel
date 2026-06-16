@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from supervisor.codex_cli import CODEX_NO_WEB_SEARCH_CONFIG_FLAGS
+CODEX_NO_WEB_SEARCH_CONFIG_FLAGS = ["-c", 'web_search="disabled"']
 
 
 class AppServerError(RuntimeError):
