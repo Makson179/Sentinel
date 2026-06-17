@@ -59,5 +59,9 @@ class TerminalTUI:
     def _on_stdin_ready(self) -> None:
         line = sys.stdin.readline()
         if line == "":
+            if self._reader_registered and self._loop is not None:
+                with contextlib.suppress(Exception):
+                    self._loop.remove_reader(sys.stdin.fileno())
+                self._reader_registered = False
             return
         self.input_queue.put_nowait(UserCommand(text=line.rstrip("\n")))

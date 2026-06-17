@@ -254,6 +254,7 @@ class SentinelController:
     async def handle_controller_event(self, event: ControllerEvent) -> None:
         try:
             if event.kind == "shutdown":
+                self.running = False
                 return
             if event.kind == "transport_error":
                 await self.handle_transport_error(event)
@@ -1986,9 +1987,12 @@ def _is_direct_script_execution_command(command: str) -> bool:
     lowered = command.lower()
     boundary = r"(?=$|[\s;&|()'\"])"
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
     patterns = (
         r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+(?!-)[\w./-]+\.py" + boundary,
         r"(^|[\s;&|()'\"])(node|nodejs|ruby|bash|sh)\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
+        r"(^|[\s;&|()'\"])(?:\.{1,2}/|/)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
+        shell_prefix + r"\s+-[a-z]*c\s+['\"]?(?!-)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
 

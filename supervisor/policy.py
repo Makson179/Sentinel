@@ -297,6 +297,10 @@ def is_recursive_delete_outside(tokens: list[str], workspace: Path) -> bool:
     return False
 
 
+def command_mentions_supervisor(command: str) -> bool:
+    return "supervisor" in command.lower()
+
+
 class PolicyEngine:
     def __init__(self, workspace: Path):
         self.workspace = workspace.resolve()
@@ -343,6 +347,8 @@ class PolicyEngine:
         return PolicyDecision.route_llm("unclassified event requires LLM judgment")
 
     def _evaluate_command(self, command: str, paths: list[Path]) -> PolicyDecision:
+        if command_mentions_supervisor(command):
+            return PolicyDecision.deny("commands containing supervisor are denied")
         patch_paths = extract_apply_patch_paths(command)
         if patch_paths is not None:
             return self._evaluate_patch_paths(patch_paths)
