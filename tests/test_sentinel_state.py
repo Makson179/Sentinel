@@ -279,6 +279,7 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert filtered.trusted_validation_outcome == "passed"
     assert filtered.was_filtered is True
     assert "tests/test_user.py::test_sends_email" in filtered.executed_test_names
+    assert filtered.executed_test_files == ["tests/test_user.py"]
     assert filtered.passed_count == 1
     assert filtered.failed_count == 0
     assert filtered.target_files_or_test_files == ["tests/test_user.py"]
@@ -287,6 +288,7 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         "test/units/cli/test_galaxy.py",
         "test/units/galaxy/test_collection_install.py",
     ]
+    assert broad_pytest.executed_test_files == []
     assert broad_pytest.passed_count == 155
     assert broad_pytest.failed_count == 0
     assert broad_pytest_without_output is not None
@@ -294,10 +296,12 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         "test/units/cli/test_galaxy.py",
         "test/units/galaxy/test_collection_install.py",
     ]
+    assert broad_pytest_without_output.executed_test_files == []
     assert broad_pytest_without_output.passed_count is None
     assert broad_pytest_without_output.failed_count is None
     assert direct_script is not None
-    assert direct_script.type == "behavioral"
+    assert direct_script.type == "behavior_demo"
+    assert direct_script.captured_output == "hello world\n"
     assert direct_script.validation_id.startswith("validation-")
     assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script])
 
@@ -345,9 +349,10 @@ async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: P
     assert len(controller.validations) == 1
     validation = controller.validations[0]
     assert validation.command == "python3 hello.py"
-    assert validation.type == "behavioral"
+    assert validation.type == "behavior_demo"
     assert validation.passed is True
     assert "hello world" in validation.summary
+    assert validation.captured_output == "hello world\n"
     assert controller._command_output_chunks == {}
 
 
@@ -1476,6 +1481,249 @@ async def test_completion_accept_gate_allows_fresh_covered_code_change(tmp_path:
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "## Completion Behavior Evidence" in report
     assert "## Completion Files Reviewed" in report
+
+
+async def test_completion_accept_gate_returns_for_self_confirming_added_test_and_snapshot(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="npm test -- DeviceDetailHeading",
+            exit_code=0,
+            passed=True,
+            summary="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed",
+            captured_output="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed\n",
+            executed_test_files=["src/components/DeviceDetailHeading-test.tsx"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    packet = SupervisorWakePacket(
+        wake_sequence=1,
+        latest_event_sequence=1,
+        generation=0,
+        restart_count=0,
+        task_path=str(task),
+        task_contents="Render device detail heading from selected element data.",
+        coder_thread_id="thread",
+        changed_files=[
+            ChangedFile(path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2),
+            ChangedFile(path="src/components/DeviceDetailHeading-test.tsx", status="A", sequence=2),
+            ChangedFile(path="src/components/__snapshots__/DeviceDetailHeading-test.tsx.snap", status="A", sequence=2),
+        ],
+        changed_file_diffs=[
+            ChangedFileDiff(
+                path="src/components/DeviceDetailHeading-test.tsx",
+                file_kind="test",
+                change_kind="added",
+                diff="+test('renders heading', () => expect(screen.getByText('Device')).toBeVisible())",
+            ),
+            ChangedFileDiff(
+                path="src/components/__snapshots__/DeviceDetailHeading-test.tsx.snap",
+                file_kind="test",
+                change_kind="added",
+                diff="+<h1>Device</h1>",
+            ),
+        ],
+        validations=validations,
+        latest_relevant_change_sequence=2,
+    )
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["files_reviewed"] = [
+        {"path": "src/components/DeviceDetailHeading.tsx", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
+        {"path": "src/components/DeviceDetailHeading-test.tsx", "reason": "assessed added test", "kind": "test", "inspected": True, "limitation": None},
+        {
+            "path": "src/components/__snapshots__/DeviceDetailHeading-test.tsx.snap",
+            "reason": "assessed added snapshot",
+            "kind": "test",
+            "inspected": True,
+            "limitation": None,
+        },
+    ]
+    payload["behavior_evidence_matrix"] = [
+        {
+            "behavior": "device detail heading renders selected element data",
+            "task_basis": "TASK.md",
+            "files_considered": [
+                "src/components/DeviceDetailHeading.tsx",
+                "src/components/DeviceDetailHeading-test.tsx",
+            ],
+            "evidence": [
+                {
+                    "validation_id": "validation-3",
+                    "command": "npm test -- DeviceDetailHeading",
+                    "sequence": 3,
+                    "validation_type": "behavioral",
+                    "outcome": "pass",
+                    "freshness": "fresh",
+                    "why_it_covers_behavior": "runs the new heading test",
+                }
+            ],
+            "status": "covered",
+            "gap": None,
+        }
+    ]
+    decision = CompletionReviewDecision.model_validate(payload)
+
+    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
+    assert "self_confirming_test_evidence" in coder.messages[0]
+    assert "device detail heading renders selected element data" in coder.messages[0]
+    assert "validation-3" in coder.messages[0]
+    assert "DeviceDetailHeading-test.tsx" in coder.messages[0]
+    assert "behavior_demo" in coder.messages[0]
+    pending = controller._pending_completion_gate_rejection
+    assert pending is not None
+    assert pending["check_name"] == "self_confirming_test_evidence"
+    assert pending["details"]["behaviors"][0]["behavior"] == "device detail heading renders selected element data"
+    log_entry = json.loads(store.path(LOG).read_text(encoding="utf-8").splitlines()[-1])
+    assert log_entry["check_name"] == "self_confirming_test_evidence"
+    assert log_entry["details"]["requirement"] == "independent_evidence_binding"
+
+
+async def test_completion_accept_gate_allows_untouched_output_identified_test_with_added_test(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app_existing.py tests/test_app_new.py",
+            exit_code=0,
+            passed=True,
+            summary="tests/test_app_existing.py::test_requested_behavior PASSED\ntests/test_app_new.py::test_requested_behavior PASSED\n2 passed",
+            captured_output=(
+                "tests/test_app_existing.py::test_requested_behavior PASSED\n"
+                "tests/test_app_new.py::test_requested_behavior PASSED\n2 passed\n"
+            ),
+            executed_test_files=["tests/test_app_existing.py", "tests/test_app_new.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, _coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["files_reviewed"].append(
+        {"path": "tests/test_app_new.py", "reason": "added test", "kind": "test", "inspected": True, "limitation": None}
+    )
+    packet = _gate_packet(task, validations=validations)
+    packet.changed_file_diffs = [
+        ChangedFileDiff(
+            path="tests/test_app_new.py",
+            file_kind="test",
+            change_kind="added",
+            diff="+def test_requested_behavior():\n+    assert app() == 'ok'",
+        )
+    ]
+    packet.validations = validations
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_sentinel_config().accept_gate_accepts == 1
+
+
+async def test_completion_accept_gate_allows_behavior_demo_independent_evidence(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="npm test -- DeviceDetailHeading",
+            exit_code=0,
+            passed=True,
+            summary="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed",
+            captured_output="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed\n",
+            executed_test_files=["src/components/DeviceDetailHeading-test.tsx"],
+            sequence=3,
+        ),
+        ValidationRun(
+            command="node -e \"console.log(renderHeading({name:'Device 42'}))\"",
+            exit_code=0,
+            passed=True,
+            type="behavior_demo",
+            summary="<h1>Device 42</h1>",
+            captured_output="<h1>Device 42</h1>\n",
+            sequence=4,
+        ),
+    ]
+    controller, store, task, _coder = _completion_gate_controller(tmp_path, validations=validations)
+    packet = SupervisorWakePacket(
+        wake_sequence=1,
+        latest_event_sequence=1,
+        generation=0,
+        restart_count=0,
+        task_path=str(task),
+        task_contents="Render device detail heading from selected element data.",
+        coder_thread_id="thread",
+        changed_files=[
+            ChangedFile(path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2),
+            ChangedFile(path="src/components/DeviceDetailHeading-test.tsx", status="A", sequence=2),
+        ],
+        changed_file_diffs=[
+            ChangedFileDiff(
+                path="src/components/DeviceDetailHeading-test.tsx",
+                file_kind="test",
+                change_kind="added",
+                diff="+test('renders heading', () => expect(screen.getByText('Device 42')).toBeVisible())",
+            )
+        ],
+        validations=validations,
+        latest_relevant_change_sequence=2,
+    )
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["files_reviewed"] = [
+        {"path": "src/components/DeviceDetailHeading.tsx", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
+        {"path": "src/components/DeviceDetailHeading-test.tsx", "reason": "added test", "kind": "test", "inspected": True, "limitation": None},
+    ]
+    payload["behavior_evidence_matrix"][0]["behavior"] = "device detail heading renders selected element data"
+    payload["behavior_evidence_matrix"][0]["files_considered"] = ["src/components/DeviceDetailHeading.tsx"]
+    payload["behavior_evidence_matrix"][0]["evidence"] = [
+        {
+            "validation_id": "validation-4",
+            "command": "node -e \"console.log(renderHeading({name:'Device 42'}))\"",
+            "sequence": 4,
+            "validation_type": "behavior_demo",
+            "outcome": "pass",
+            "freshness": "fresh",
+            "why_it_covers_behavior": "captured rendered DOM output <h1>Device 42</h1> for the task scenario",
+        }
+    ]
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_sentinel_config().accept_gate_accepts == 1
+
+
+async def test_completion_accept_gate_rejects_empty_behavior_demo_output(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="node -e \"demo()\"",
+            exit_code=0,
+            passed=True,
+            type="behavior_demo",
+            summary="command completed",
+            captured_output="",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "node -e \"demo()\""
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert "behavior_demo evidence validation-3 has no captured output" in coder.messages[0]
 
 
 async def test_completion_accept_gate_returns_to_coder_when_evidence_type_mismatches_ledger(tmp_path: Path) -> None:

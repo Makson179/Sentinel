@@ -349,6 +349,7 @@ class StatelessSupervisorAgent:
         completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
         completion_payload_since_sequence: int | None = None,
         completion_review_thread_id: str | None = None,
+        pending_accept_gate_rejection: dict[str, Any] | None = None,
     ) -> SupervisorWakePacket:
         cfg = self.store.get_sentinel_config()
         health = self.store.get_health()
@@ -402,6 +403,7 @@ class StatelessSupervisorAgent:
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=completion_review_thread_id,
+            pending_accept_gate_rejection=pending_accept_gate_rejection,
         )
 
     def _thread_params(self) -> dict[str, Any]:

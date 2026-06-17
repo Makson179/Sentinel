@@ -221,7 +221,7 @@ class EvidenceItem(BaseModel):
     validation_id: str | None = None
     command: str
     sequence: int | None = None
-    validation_type: Literal["static", "behavioral", "unknown"]
+    validation_type: Literal["static", "behavioral", "behavior_demo", "unknown"]
     outcome: Literal["pass", "fail", "unknown"]
     freshness: Literal["fresh", "stale", "unknown"]
     why_it_covers_behavior: str
@@ -335,16 +335,19 @@ class ValidationRun(BaseModel):
     cwd: str | None = None
     exit_code: int | None = None
     shell_exit_code: int | None = None
-    type: Literal["static", "behavioral"] = "behavioral"
+    type: Literal["static", "behavioral", "behavior_demo"] = "behavioral"
     outcome: Literal["pass", "fail"] = "fail"
     passed: bool
     trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
     masking_reason: str | None = None
     summary: str
+    captured_output: str = ""
+    captured_output_truncated: bool = False
     sequence: int
     was_filtered: bool = False
     raw_selector: str | None = None
     executed_test_names: list[str] = Field(default_factory=list)
+    executed_test_files: list[str] = Field(default_factory=list)
     passed_count: int | None = None
     failed_count: int | None = None
     target_files_or_test_files: list[str] = Field(default_factory=list)
@@ -400,6 +403,8 @@ class CompletionReturnRecord(BaseModel):
     claim_evidence_mismatches: list[str] = Field(default_factory=list)
     packet_or_access_limitations: list[str] = Field(default_factory=list)
     message_to_coder: str | None = None
+    accept_gate_check_name: str | None = None
+    accept_gate_details: dict[str, Any] = Field(default_factory=dict)
     sequence: int
     generation: int
 
@@ -443,7 +448,7 @@ class ValidationOutput(BaseModel):
     cwd: str | None = None
     exit_code: int | None = None
     shell_exit_code: int | None = None
-    type: Literal["static", "behavioral"]
+    type: Literal["static", "behavioral", "behavior_demo"]
     outcome: Literal["pass", "fail"]
     passed: bool
     trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
@@ -451,12 +456,14 @@ class ValidationOutput(BaseModel):
     sequence: int
     stdout_or_summary: str
     stderr_or_summary: str | None = None
+    captured_output: str = ""
     output_truncated: bool = False
     detected_test_names: list[str] = Field(default_factory=list)
     target_files_or_test_files: list[str] = Field(default_factory=list)
     was_filtered: bool = False
     raw_selector: str | None = None
     executed_test_names: list[str] = Field(default_factory=list)
+    executed_test_files: list[str] = Field(default_factory=list)
     passed_count: int | None = None
     failed_count: int | None = None
 
@@ -512,6 +519,7 @@ class SupervisorWakePacket(BaseModel):
     completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
     completion_payload_since_sequence: int | None = None
     completion_review_thread_id: str | None = None
+    pending_accept_gate_rejection: dict[str, Any] | None = None
 
 
 class FinalReport(BaseModel):

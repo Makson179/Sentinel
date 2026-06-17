@@ -81,6 +81,7 @@ class AcceptGateResult:
     failure_type: str | None = None
     check_name: str | None = None
     reason: str | None = None
+    details: dict[str, Any] | None = None
     passed_checks: tuple[str, ...] = ()
 
 
@@ -145,6 +146,8 @@ class SentinelController:
         self.validation_runtime_state: dict[str, dict[str, Any]] = {}
         self.completion_review_return_sequence: int | None = None
         self.completion_review_return_validation_sequence: int | None = None
+        self._pending_completion_gate_rejection: dict[str, Any] | None = None
+        self._current_accept_gate_rejection: dict[str, Any] | None = None
         self._terminal_cleanup_started = False
 
     async def run(self) -> None:
@@ -514,8 +517,12 @@ class SentinelController:
                         triggering_item_id=item_id,
                     )
                     return
+                summary = "Coder provided exact readiness marker; running completion_review."
+                pending_gate = getattr(self, "_pending_completion_gate_rejection", None)
+                if pending_gate:
+                    summary = _completion_gate_followup_summary(pending_gate)
                 self._schedule_supervisor_check(
-                    "Coder provided exact readiness marker; running completion_review.",
+                    summary,
                     triggering_item_id=item_id,
                     completion_review=True,
                 )
@@ -835,7 +842,7 @@ class SentinelController:
     def _record_validation_progress(self, validation: ValidationRun) -> None:
         def patch(current: SentinelConfig) -> SentinelConfig:
             updates: dict[str, Any] = {"last_validation_sequence": validation.sequence}
-            if validation.type == "behavioral" and validation.trusted_validation_outcome != "masked_or_unknown":
+            if _is_behavior_proving_validation(validation) and validation.trusted_validation_outcome != "masked_or_unknown":
                 updates["last_trusted_behavioral_validation_sequence"] = validation.sequence
                 if validation.trusted_validation_outcome == "passed":
                     updates["last_trusted_passing_behavioral_validation_sequence"] = validation.sequence
@@ -1064,6 +1071,9 @@ class SentinelController:
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=getattr(self.supervisor, "completion_thread_id", None),
+            pending_accept_gate_rejection=(
+                getattr(self, "_pending_completion_gate_rejection", None) if completion_review else None
+            ),
             **completion_details,
         )
         try:
@@ -1206,6 +1216,7 @@ class SentinelController:
         )
         if decision.decision == CompletionReviewDecisionKind.ACCEPT:
             self.completion_reviewer_rerun_count = 0
+            self._pending_completion_gate_rejection = None
             self._accepted_completion_decision = decision
             await self.finalize(
                 f"accepted by completion_review: {decision.reason or 'task complete'}",
@@ -1214,9 +1225,11 @@ class SentinelController:
             )
             return
         if decision.decision == CompletionReviewDecisionKind.RETURN:
+            self._pending_completion_gate_rejection = None
             await self._return_completion_to_coder(decision)
             return
         if decision.decision == CompletionReviewDecisionKind.RESTART:
+            self._pending_completion_gate_rejection = None
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)
             return
@@ -1349,6 +1362,22 @@ class SentinelController:
             )
         passed_checks.append("evidence_binding")
 
+        self_confirming_issue = _self_confirming_test_evidence_issue(
+            decision,
+            validations,
+            packet=packet,
+            latest_change=latest_change,
+        )
+        if self_confirming_issue is not None:
+            return AcceptGateResult(
+                passed=False,
+                failure_type=ACCEPT_GATE_CODER_CORRECTABLE,
+                check_name="self_confirming_test_evidence",
+                reason=self_confirming_issue["reason"],
+                details=self_confirming_issue,
+            )
+        passed_checks.append("independent_evidence_binding")
+
         return AcceptGateResult(passed=True, passed_checks=tuple(passed_checks))
 
     async def _handle_completion_accept_gate_failure(
@@ -1401,7 +1430,15 @@ class SentinelController:
             )
             return
 
-        converted = _completion_accept_rejection_decision(decision, reason, check_name=check_name)
+        gate_context = _accept_gate_rejection_context(gate_result)
+        self._pending_completion_gate_rejection = gate_context
+        self._current_accept_gate_rejection = gate_context
+        converted = _completion_accept_rejection_decision(
+            decision,
+            reason,
+            check_name=check_name,
+            details=gate_result.details,
+        )
         self.store.append_text_locked(
             PROGRESS,
             f"- Controller rejected completion accept: {check_name} failed ({reason})\n",
@@ -1413,7 +1450,10 @@ class SentinelController:
             reason=f"{check_name}: {reason}",
         )
         self._increment_accept_gate_counter("accept_gate_coder_returns")
-        await self._return_completion_to_coder(converted)
+        try:
+            await self._return_completion_to_coder(converted)
+        finally:
+            self._current_accept_gate_rejection = None
 
     def _record_accept_gate_failure(self, gate_result: AcceptGateResult) -> None:
         self._increment_accept_gate_counter("accept_gate_rejections")
@@ -1424,6 +1464,7 @@ class SentinelController:
                 "failure_type": gate_result.failure_type,
                 "check_name": gate_result.check_name,
                 "reason": gate_result.reason,
+                "details": gate_result.details,
             }
         )
 
@@ -1454,6 +1495,10 @@ class SentinelController:
             claim_evidence_mismatches=decision.claim_evidence_mismatches,
             packet_or_access_limitations=decision.packet_or_access_limitations,
             message_to_coder=decision.message_to_coder,
+            accept_gate_check_name=(
+                getattr(self, "_current_accept_gate_rejection", None) or {}
+            ).get("check_name"),
+            accept_gate_details=getattr(self, "_current_accept_gate_rejection", None) or {},
             sequence=decision.wake_sequence,
             generation=decision.generation,
         )
@@ -1893,6 +1938,7 @@ def _validation_from_action(
     normalized_command = _normalize_command(action.command)
     raw_selector = _raw_validation_selector(action.command)
     executed_test_names = _executed_test_names(action.command, output)
+    executed_test_files = _test_files_from_output(output)
     outcome = "pass" if action.exit_code == 0 else "fail"
     if validation_type == "behavioral" and outcome == "pass" and not _tests_executed(action.command, output):
         outcome = "fail"
@@ -1925,10 +1971,13 @@ def _validation_from_action(
         trusted_validation_outcome=trusted_outcome,
         masking_reason=masking_reason,
         summary=summary,
+        captured_output=output,
+        captured_output_truncated=output.endswith("...<truncated>"),
         sequence=sequence,
         was_filtered=_command_was_filtered(action.command),
         raw_selector=raw_selector,
         executed_test_names=executed_test_names,
+        executed_test_files=executed_test_files,
         passed_count=passed_count,
         failed_count=failed_count,
         target_files_or_test_files=_target_files_or_test_files(action.command),
@@ -1938,12 +1987,10 @@ def _validation_from_action(
 def _classify_validation_command(command: str, *, changed_paths: list[str]) -> str | None:
     if _is_static_validation_command(command):
         return "static"
-    if (
-        _is_behavioral_validation_command(command)
-        or _is_direct_script_execution_command(command)
-        or _command_requires_changed_module(command, changed_paths)
-    ):
+    if _is_behavioral_validation_command(command):
         return "behavioral"
+    if _is_behavior_demo_command(command, changed_paths=changed_paths):
+        return "behavior_demo"
     return None
 
 
@@ -1991,6 +2038,26 @@ def _is_direct_script_execution_command(command: str) -> bool:
         r"(^|[\s;&|()'\"])(node|nodejs|ruby|bash|sh)\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool:
+    lowered = command.lower()
+    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    inline_patterns = (
+        r"(^|[\s;&|()'\"])(node|nodejs)\s+-e(\s|$)",
+        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-c(\s|$)",
+        r"(^|[\s;&|()'\"])(ruby)\s+-e(\s|$)",
+    )
+    http_patterns = (
+        r"(^|[\s;&|()'\"])(curl|wget|http|https)\s+",
+        r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?)",
+    )
+    return (
+        _is_direct_script_execution_command(command)
+        or _command_requires_changed_module(command, changed_paths)
+        or any(re.search(pattern, lowered) for pattern in inline_patterns)
+        or any(re.search(pattern, lowered) for pattern in http_patterns)
+    )
 
 
 def _command_requires_changed_module(command: str, changed_paths: list[str]) -> bool:
@@ -2190,6 +2257,30 @@ def _test_names_from_output(output: str, *, limit: int = 50) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _test_files_from_output(output: str, *, limit: int = 100) -> list[str]:
+    files: list[str] = []
+    path_pattern = re.compile(
+        r"(?<![\w./-])((?:\.{0,2}/)?[\w@+./-]*(?:test|spec|tests|__tests__|snapshots|__snapshots__|golden|goldens)"
+        r"[\w@+./-]*\.(?:py|js|jsx|ts|tsx|mjs|cjs|rb|go|rs|java|cs|php|snap|snapshot|golden))"
+        r"(?:::[\w.*\[\]-]+)?",
+        re.IGNORECASE,
+    )
+    for match in path_pattern.finditer(output):
+        path = _normalize_output_test_path(match.group(1))
+        if path and _file_kind(path) == "test":
+            files.append(path)
+        if len(files) >= limit:
+            break
+    return list(dict.fromkeys(files))[:limit]
+
+
+def _normalize_output_test_path(path: str) -> str:
+    normalized = path.strip().strip("'\"`.,;:()[]{}<>")
+    if "::" in normalized:
+        normalized = normalized.split("::", 1)[0]
+    return normalized.replace("\\", "/").lstrip("./")
+
+
 def _test_count_summary(output: str) -> tuple[int | None, int | None]:
     lowered = output.lower()
     passed = _first_int_match(
@@ -2246,12 +2337,16 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
 
 def _has_passing_behavioral_validation(validations: list[ValidationRun]) -> bool:
     return any(
-        validation.type == "behavioral"
+        _is_behavior_proving_validation(validation)
         and validation.outcome == "pass"
         and validation.passed
         and validation.trusted_validation_outcome == "passed"
         for validation in validations
     )
+
+
+def _is_behavior_proving_validation(validation: ValidationRun) -> bool:
+    return validation.type in {"behavioral", "behavior_demo"}
 
 
 def _has_readiness_marker(text: str) -> bool:
@@ -2317,7 +2412,7 @@ def _validation_freshness_summary(
     passing_behavioral = [
         validation.sequence
         for validation in validations
-        if validation.type == "behavioral"
+        if validation.type in {"behavioral", "behavior_demo"}
         and validation.outcome == "pass"
         and validation.passed
         and validation.trusted_validation_outcome == "passed"
@@ -2441,7 +2536,7 @@ def _review_marks_non_material(file: Any) -> bool:
 
 def _validation_is_fresh_behavioral_pass(validation: ValidationRun, latest_change: int) -> bool:
     return (
-        validation.type == "behavioral"
+        validation.type in {"behavioral", "behavior_demo"}
         and validation.outcome == "pass"
         and validation.passed
         and validation.trusted_validation_outcome == "passed"
@@ -2478,6 +2573,8 @@ def _accept_evidence_binding_issue(
                 continue
             if evidence.validation_type != validation.type:
                 continue
+            if validation.type == "behavior_demo" and not _validation_has_captured_output(validation):
+                continue
             if _validation_is_fresh_pass(validation, latest_change):
                 fresh_pass_found = True
                 break
@@ -2487,10 +2584,36 @@ def _accept_evidence_binding_issue(
             type_mismatch = _evidence_type_mismatch(row.evidence, by_id)
             if type_mismatch:
                 return f"behavior '{row.behavior}' evidence type mismatch: {type_mismatch}"
+            demo_output_issue = _behavior_demo_output_issue(row.evidence, by_id, latest_change=latest_change)
+            if demo_output_issue:
+                return f"behavior '{row.behavior}' {demo_output_issue}"
             return (
                 f"behavior '{row.behavior}' is covered but has no linked fresh passing validation "
                 "record in the ledger"
             )
+    return None
+
+
+def _validation_has_captured_output(validation: ValidationRun) -> bool:
+    return bool((validation.captured_output or "").strip())
+
+
+def _behavior_demo_output_issue(
+    evidence_items: list[Any],
+    validations_by_id: dict[str, ValidationRun],
+    *,
+    latest_change: int | None,
+) -> str | None:
+    for evidence in evidence_items:
+        if not evidence.validation_id:
+            continue
+        validation = validations_by_id.get(evidence.validation_id)
+        if validation is None or evidence.validation_type != "behavior_demo" or validation.type != "behavior_demo":
+            continue
+        if not _validation_is_fresh_pass(validation, latest_change):
+            continue
+        if not _validation_has_captured_output(validation):
+            return f"behavior_demo evidence {evidence.validation_id} has no captured output"
     return None
 
 
@@ -2508,14 +2631,361 @@ def _evidence_type_mismatch(evidence_items: list[Any], validations_by_id: dict[s
     return None
 
 
+def _self_confirming_test_evidence_issue(
+    decision: CompletionReviewDecision,
+    validations: list[ValidationRun],
+    *,
+    packet: SupervisorWakePacket | None,
+    latest_change: int | None,
+) -> dict[str, Any] | None:
+    if packet is None:
+        return None
+    surfaces = _coder_authored_test_surfaces(packet)
+    if not surfaces:
+        return None
+    validations_by_id = {validation.validation_id: validation for validation in validations}
+    behavior_issues: list[dict[str, Any]] = []
+    for row in decision.behavior_evidence_matrix:
+        if row.status != "covered":
+            continue
+        relevant_surfaces = _relevant_coder_authored_test_surfaces(row, surfaces, packet.changed_files)
+        if not relevant_surfaces:
+            continue
+        independent_found = False
+        self_confirming_validations: list[dict[str, Any]] = []
+        for evidence in row.evidence:
+            validation = validations_by_id.get(evidence.validation_id or "")
+            if validation is None or evidence.validation_type != validation.type:
+                continue
+            if not _validation_is_fresh_pass(validation, latest_change):
+                continue
+            if validation.type == "behavior_demo":
+                if _validation_has_captured_output(validation):
+                    independent_found = True
+                    break
+                self_confirming_validations.append(
+                    _self_confirming_validation_detail(
+                        validation,
+                        reason="behavior_demo_missing_captured_output",
+                        test_files=[],
+                        coder_authored_test_files=[],
+                    )
+                )
+                continue
+            if validation.type != "behavioral":
+                continue
+            executed_files = [_normalize_review_path(path) for path in validation.executed_test_files]
+            if not executed_files:
+                self_confirming_validations.append(
+                    _self_confirming_validation_detail(
+                        validation,
+                        reason="unknown_test_file_provenance",
+                        test_files=[],
+                        coder_authored_test_files=[],
+                    )
+                )
+                continue
+            coder_authored_files = [
+                path
+                for path in executed_files
+                if _test_file_is_coder_authored_for_behavior(path, relevant_surfaces)
+            ]
+            if len(coder_authored_files) < len(executed_files):
+                independent_found = True
+                break
+            self_confirming_validations.append(
+                _self_confirming_validation_detail(
+                    validation,
+                    reason="only_coder_authored_tests",
+                    test_files=executed_files,
+                    coder_authored_test_files=coder_authored_files,
+                )
+            )
+        if independent_found or not self_confirming_validations:
+            continue
+        behavior_issues.append(
+            {
+                "behavior": row.behavior,
+                "requirement": "independent_evidence_binding",
+                "coder_authored_test_surfaces": relevant_surfaces,
+                "self_confirming_validations": self_confirming_validations,
+            }
+        )
+    if not behavior_issues:
+        return None
+    behaviors = ", ".join(issue["behavior"] for issue in behavior_issues[:5])
+    return {
+        "check_name": "self_confirming_test_evidence",
+        "requirement": "independent_evidence_binding",
+        "reason": (
+            "covered behaviors have no linked fresh passing validation independent of coder-authored tests: "
+            f"{behaviors}"
+        ),
+        "behaviors": behavior_issues,
+        "required_evidence": (
+            "Provide a linked fresh passing validation_id for an untouched pre-existing test whose output explicitly "
+            "names the test file and exercises this behavior, or a behavior_demo validation with captured factual "
+            "observed output/state for the task scenario."
+        ),
+    }
+
+
+def _self_confirming_validation_detail(
+    validation: ValidationRun,
+    *,
+    reason: str,
+    test_files: list[str],
+    coder_authored_test_files: list[str],
+) -> dict[str, Any]:
+    return {
+        "validation_id": validation.validation_id,
+        "command": validation.command,
+        "sequence": validation.sequence,
+        "reason": reason,
+        "test_files": list(dict.fromkeys(test_files)),
+        "coder_authored_test_files": list(dict.fromkeys(coder_authored_test_files)),
+    }
+
+
+def _coder_authored_test_surfaces(packet: SupervisorWakePacket) -> list[dict[str, Any]]:
+    surfaces: dict[str, dict[str, Any]] = {}
+
+    def add(path: str, reason: str) -> None:
+        normalized = _normalize_review_path(path)
+        if not normalized or _file_kind(normalized) != "test":
+            return
+        current = surfaces.setdefault(normalized, {"path": normalized, "reasons": []})
+        if reason not in current["reasons"]:
+            current["reasons"].append(reason)
+
+    for changed in packet.changed_file_diffs:
+        if changed.file_kind != "test":
+            continue
+        if changed.change_kind == "added":
+            add(changed.path, "added test file or snapshot")
+            continue
+        if _is_snapshot_path(changed.path) and changed.change_kind in {"modified", "renamed"}:
+            add(changed.path, "modified snapshot/golden")
+            continue
+        if changed.change_kind in {"modified", "renamed"}:
+            added_assertions = _substantive_added_test_assertion_lines(changed.diff)
+            if added_assertions:
+                add(changed.path, f"added substantive test assertion: {added_assertions[0]}")
+
+    diff_paths = {_normalize_review_path(changed.path) for changed in packet.changed_file_diffs}
+    for changed in packet.changed_files:
+        path = _normalize_review_path(changed.path)
+        if path in diff_paths or _file_kind(path) != "test":
+            continue
+        change_kind = _change_kind(changed.status)
+        if change_kind == "added":
+            add(path, "added test file or snapshot")
+        elif _is_snapshot_path(path) and change_kind in {"modified", "renamed"}:
+            add(path, "modified snapshot/golden")
+
+    return list(surfaces.values())
+
+
+def _relevant_coder_authored_test_surfaces(
+    row: Any,
+    surfaces: list[dict[str, Any]],
+    changed_files: list[ChangedFile],
+) -> list[dict[str, Any]]:
+    source_paths = _source_paths_for_behavior(row, changed_files)
+    relevant: list[dict[str, Any]] = []
+    for surface in surfaces:
+        path = surface.get("path")
+        if isinstance(path, str) and _test_surface_matches_source_paths(path, source_paths):
+            relevant.append(surface)
+    return relevant
+
+
+def _source_paths_for_behavior(row: Any, changed_files: list[ChangedFile]) -> list[str]:
+    source_paths = [
+        _normalize_review_path(path)
+        for path in getattr(row, "files_considered", []) or []
+        if _file_kind(path) == "source"
+    ]
+    if not source_paths:
+        source_paths = [
+            _normalize_review_path(changed.path)
+            for changed in changed_files
+            if _file_kind(changed.path) == "source"
+        ]
+    return list(dict.fromkeys(source_paths))
+
+
+def _test_surface_matches_source_paths(test_path: str, source_paths: list[str]) -> bool:
+    if not source_paths:
+        return False
+    test_tokens = _path_match_tokens(test_path, include_parent_for_generic=True)
+    for source_path in source_paths:
+        source_tokens = _path_match_tokens(source_path, include_parent_for_generic=True)
+        if _token_sets_match(test_tokens, source_tokens):
+            return True
+    return False
+
+
+def _test_file_is_coder_authored_for_behavior(test_file: str, relevant_surfaces: list[dict[str, Any]]) -> bool:
+    normalized = _normalize_review_path(test_file)
+    test_tokens = _path_match_tokens(normalized, include_parent_for_generic=True)
+    for surface in relevant_surfaces:
+        surface_path = surface.get("path")
+        if not isinstance(surface_path, str):
+            continue
+        if normalized == _normalize_review_path(surface_path):
+            return True
+        if _is_snapshot_path(surface_path) and _token_sets_match(
+            test_tokens,
+            _path_match_tokens(surface_path, include_parent_for_generic=True),
+        ):
+            return True
+    return False
+
+
+def _token_sets_match(left: set[str], right: set[str]) -> bool:
+    if left & right:
+        return True
+    for left_token in left:
+        for right_token in right:
+            if len(left_token) >= 5 and len(right_token) >= 5 and (
+                left_token in right_token or right_token in left_token
+            ):
+                return True
+    return False
+
+
+def _path_match_tokens(path: str, *, include_parent_for_generic: bool) -> set[str]:
+    normalized = _normalize_review_path(path).lower()
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return set()
+    name = parts[-1]
+    stem = _strip_test_path_extensions(name)
+    raw_parts = [part for part in re.split(r"[^a-z0-9]+", stem) if part]
+    generic = {"test", "tests", "spec", "specs", "case", "cases", "snapshot", "snap", "golden", "goldens"}
+    semantic_parts = [part for part in raw_parts if part not in generic]
+    tokens = {_compact_identifier("".join(semantic_parts))} if semantic_parts else set()
+    tokens.update(_compact_identifier(part) for part in semantic_parts if len(part) >= 2)
+    if include_parent_for_generic and (not semantic_parts or semantic_parts in (["index"], ["main"])):
+        for parent in reversed(parts[:-1]):
+            parent_token = _compact_identifier(parent)
+            if parent_token and parent_token not in generic:
+                tokens.add(parent_token)
+                break
+    return {token for token in tokens if token}
+
+
+def _strip_test_path_extensions(name: str) -> str:
+    stem = name
+    suffixes = (
+        ".snapshot",
+        ".golden",
+        ".snap",
+        ".tsx",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".js",
+        ".py",
+        ".rb",
+        ".go",
+        ".rs",
+        ".java",
+        ".cs",
+        ".php",
+        ".vue",
+        ".svelte",
+        ".html",
+        ".css",
+        ".scss",
+    )
+    changed = True
+    while changed:
+        changed = False
+        lowered = stem.lower()
+        for suffix in suffixes:
+            if lowered.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+                break
+    return re.sub(r"(?i)(?:^|[._-])(test|tests|spec|specs|case|cases|snapshot|snap|golden|goldens)$", "", stem)
+
+
+def _compact_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _is_snapshot_path(path: str) -> bool:
+    normalized = _normalize_review_path(path).lower()
+    name = normalized.rsplit("/", 1)[-1]
+    return (
+        "/snapshots/" in normalized
+        or "/__snapshots__/" in normalized
+        or "/goldens/" in normalized
+        or name.endswith((".snap", ".snapshot", ".golden"))
+        or ".snap." in name
+        or ".snapshot." in name
+        or ".golden." in name
+    )
+
+
+def _substantive_added_test_assertion_lines(diff: str, *, limit: int = 5) -> list[str]:
+    lines: list[str] = []
+    for raw in diff.splitlines():
+        if not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        line = raw[1:].strip()
+        if not _is_added_test_assertion_line(line):
+            continue
+        lines.append(_bounded_text(line, limit=180))
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _is_added_test_assertion_line(line: str) -> bool:
+    if not line or line.startswith(("//", "/*", "*", "import ")):
+        return False
+    lowered = line.lower()
+    tokens = (
+        "assert",
+        "expect(",
+        ".tobe",
+        ".toequal",
+        ".tocontain",
+        ".tomatch",
+        "tomatchsnapshot",
+        "it(",
+        "it.each",
+        "test(",
+        "test.each",
+        "case(",
+        "cases",
+        "parametrize",
+    )
+    return any(token in lowered for token in tokens)
+
+
 def _completion_accept_rejection_decision(
     decision: CompletionReviewDecision,
     reason: str,
     *,
     check_name: str = "accept_gate",
+    details: dict[str, Any] | None = None,
 ) -> CompletionReviewDecision:
     validation_gaps = list(decision.validation_gaps)
-    validation_gaps.append(f"Controller accept-gate rejection ({check_name}): {reason}")
+    if check_name == "self_confirming_test_evidence" and details:
+        validation_gaps.extend(_self_confirming_validation_gaps(details, fallback_reason=reason))
+        message_to_coder = _self_confirming_message_to_coder(details, fallback_reason=reason)
+    else:
+        validation_gaps.append(f"Controller accept-gate rejection ({check_name}): {reason}")
+        message_to_coder = (
+            "Continue working. Completion accept was rejected by the deterministic accept gate because "
+            f"{reason}. Provide the missing fresh validation evidence, then use the exact readiness marker "
+            "on its own line."
+        )
     return CompletionReviewDecision(
         decision=CompletionReviewDecisionKind.RETURN,
         reason=f"controller accept-gate rejection ({check_name}): {reason}",
@@ -2526,11 +2996,7 @@ def _completion_accept_rejection_decision(
         claim_evidence_mismatches=decision.claim_evidence_mismatches,
         packet_or_access_limitations=decision.packet_or_access_limitations,
         changed_test_risks=decision.changed_test_risks,
-        message_to_coder=(
-            "Continue working. Completion accept was rejected by the deterministic accept gate because "
-            f"{reason}. Provide the missing fresh validation evidence, then use the exact readiness marker "
-            "on its own line."
-        ),
+        message_to_coder=message_to_coder,
         persistent_decision=decision.persistent_decision,
         progress_update=None,
         clear_handoff=decision.clear_handoff,
@@ -2539,6 +3005,128 @@ def _completion_accept_rejection_decision(
         wake_sequence=decision.wake_sequence,
         generation=decision.generation,
     )
+
+
+def _accept_gate_rejection_context(gate_result: AcceptGateResult) -> dict[str, Any]:
+    return {
+        "check_name": gate_result.check_name,
+        "failure_type": gate_result.failure_type,
+        "reason": gate_result.reason,
+        "details": gate_result.details or {},
+    }
+
+
+def _completion_gate_followup_summary(context: dict[str, Any]) -> str:
+    check_name = str(context.get("check_name") or "accept_gate")
+    reason = str(context.get("reason") or "completion accept was rejected by deterministic accept gate")
+    if check_name == "self_confirming_test_evidence":
+        details = context.get("details") if isinstance(context.get("details"), dict) else {}
+        behaviors = [
+            str(item.get("behavior"))
+            for item in details.get("behaviors", [])
+            if isinstance(item, dict) and item.get("behavior")
+        ]
+        behavior_text = "; ".join(behaviors[:5]) or "covered behavior"
+        return (
+            "Coder provided exact readiness marker after deterministic accept-gate return. "
+            f"Previous gate rejection: self_confirming_test_evidence failed for {behavior_text}. "
+            "Find an independent validation in the ledger: an untouched test explicitly named in output, "
+            "or a behavior_demo with factual captured output/state; compare that output to task_contents "
+            "and bind accepted behavior_evidence_matrix rows to its validation_id before accepting."
+        )
+    return (
+        "Coder provided exact readiness marker after deterministic accept-gate return. "
+        f"Previous gate rejection: {check_name} failed: {reason}."
+    )
+
+
+def _self_confirming_validation_gaps(details: dict[str, Any], *, fallback_reason: str) -> list[str]:
+    behaviors = details.get("behaviors")
+    if not isinstance(behaviors, list) or not behaviors:
+        return [f"Controller accept-gate rejection (self_confirming_test_evidence): {fallback_reason}"]
+    gaps: list[str] = []
+    for behavior in behaviors:
+        if not isinstance(behavior, dict):
+            continue
+        name = str(behavior.get("behavior") or "<unnamed behavior>")
+        validation_ids = _validation_ids_from_self_confirming_behavior(behavior)
+        files = _test_files_from_self_confirming_behavior(behavior)
+        detail = f"behavior '{name}' lacks independent_evidence_binding"
+        if validation_ids:
+            detail += f"; self-confirming validation_ids: {', '.join(validation_ids[:8])}"
+        if files:
+            detail += f"; coder-authored/unknown-provenance test files: {', '.join(files[:8])}"
+        gaps.append(detail)
+    return gaps or [f"Controller accept-gate rejection (self_confirming_test_evidence): {fallback_reason}"]
+
+
+def _self_confirming_message_to_coder(details: dict[str, Any], *, fallback_reason: str) -> str:
+    lines = [
+        "Continue working. Completion accept was rejected by the deterministic accept gate "
+        "self_confirming_test_evidence.",
+    ]
+    behaviors = details.get("behaviors")
+    if isinstance(behaviors, list) and behaviors:
+        lines.append("Behaviors without independent evidence:")
+        for behavior in behaviors[:8]:
+            if not isinstance(behavior, dict):
+                continue
+            name = str(behavior.get("behavior") or "<unnamed behavior>")
+            validation_ids = _validation_ids_from_self_confirming_behavior(behavior)
+            commands = _commands_from_self_confirming_behavior(behavior)
+            files = _test_files_from_self_confirming_behavior(behavior)
+            parts = [name]
+            if validation_ids:
+                parts.append(f"validation_ids={', '.join(validation_ids[:5])}")
+            if files:
+                parts.append(f"test_files={', '.join(files[:5])}")
+            if commands:
+                parts.append(f"commands={'; '.join(commands[:3])}")
+            lines.append("- " + " | ".join(parts))
+    else:
+        lines.append(f"Reason: {fallback_reason}")
+    lines.append(
+        "Provide independent confirmation for each behavior: either an untouched pre-existing test whose output "
+        "explicitly names the test file and exercises this code, or a behavior_demo command that prints factual "
+        "observed output/state for the task scenario. Do not use a bare PASS/OK/self-verdict or a wrapper around "
+        "your changed tests as the demo. Then use the exact readiness marker on its own line."
+    )
+    return _bounded_text("\n".join(lines), limit=3000)
+
+
+def _validation_ids_from_self_confirming_behavior(behavior: dict[str, Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(item.get("validation_id"))
+            for item in behavior.get("self_confirming_validations", [])
+            if isinstance(item, dict) and item.get("validation_id")
+        )
+    )
+
+
+def _commands_from_self_confirming_behavior(behavior: dict[str, Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(item.get("command"))
+            for item in behavior.get("self_confirming_validations", [])
+            if isinstance(item, dict) and item.get("command")
+        )
+    )
+
+
+def _test_files_from_self_confirming_behavior(behavior: dict[str, Any]) -> list[str]:
+    files: list[str] = []
+    for item in behavior.get("self_confirming_validations", []):
+        if not isinstance(item, dict):
+            continue
+        for key in ("coder_authored_test_files", "test_files"):
+            value = item.get(key)
+            if isinstance(value, list):
+                files.extend(str(path) for path in value if path)
+    for surface in behavior.get("coder_authored_test_surfaces", []):
+        if isinstance(surface, dict) and surface.get("path"):
+            files.append(str(surface["path"]))
+    return list(dict.fromkeys(files))
 
 
 def _changed_test_contract_shift_risks(packet: SupervisorWakePacket, decision: CompletionReviewDecision) -> list[str]:
@@ -3007,13 +3595,15 @@ def _validation_output(validation: ValidationRun) -> ValidationOutput:
         sequence=validation.sequence,
         stdout_or_summary=validation.summary,
         stderr_or_summary=None,
-        output_truncated=validation.summary.endswith("...<truncated>"),
+        captured_output=validation.captured_output,
+        output_truncated=validation.summary.endswith("...<truncated>") or validation.captured_output_truncated,
         detected_test_names=_detect_test_names(validation.summary),
         target_files_or_test_files=validation.target_files_or_test_files
         or _target_files_or_test_files(validation.command),
         was_filtered=validation.was_filtered,
         raw_selector=validation.raw_selector,
         executed_test_names=validation.executed_test_names,
+        executed_test_files=validation.executed_test_files,
         passed_count=validation.passed_count,
         failed_count=validation.failed_count,
     )
