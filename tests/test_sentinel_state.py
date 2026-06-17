@@ -261,6 +261,28 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         sequence=15,
         item={"stdout": "Ran 1 test in 0.001s\n\nOK\n"},
     )
+    shell_visible_script = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="/bin/bash -lc ./run_visible_tests.sh",
+            exit_code=0,
+            status="completed",
+            summary="command completed: /bin/bash -lc ./run_visible_tests.sh exit=0",
+        ),
+        sequence=16,
+        item={"stdout": "============================= 45 passed in 0.06s =============================\n"},
+    )
+    direct_visible_script = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="./run_visible_tests.sh",
+            exit_code=0,
+            status="completed",
+            summary="command completed: ./run_visible_tests.sh exit=0",
+        ),
+        sequence=17,
+        item={"stdout": "============================= 45 passed in 0.06s =============================\n"},
+    )
 
     assert all(run is not None and run.type == "static" and run.outcome == "pass" for run in static_runs)
     assert behavioral is not None
@@ -303,7 +325,16 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert direct_script.type == "behavior_demo"
     assert direct_script.captured_output == "hello world\n"
     assert direct_script.validation_id.startswith("validation-")
-    assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script])
+    assert shell_visible_script is not None
+    assert shell_visible_script.type == "behavioral"
+    assert shell_visible_script.trusted_validation_outcome == "passed"
+    assert shell_visible_script.passed_count == 45
+    assert shell_visible_script.failed_count == 0
+    assert direct_visible_script is not None
+    assert direct_visible_script.type == "behavioral"
+    assert direct_visible_script.passed_count == 45
+    assert direct_visible_script.failed_count == 0
+    assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script, shell_visible_script, direct_visible_script])
 
 
 async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
