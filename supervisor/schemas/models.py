@@ -69,6 +69,27 @@ class ApprovalDecisionKind(str, Enum):
     CANCEL = "cancel"
 
 
+class CheapApprovalDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approve_low_impact", "escalate"]
+    reason_code: Literal[
+        "bounded_read_only",
+        "needs_task_judgment",
+        "possible_side_effect",
+        "sensitive_or_ambiguous",
+        "unsupported_request",
+    ]
+
+    @model_validator(mode="after")
+    def validate_reason_code(self) -> "CheapApprovalDecision":
+        if self.decision == "approve_low_impact" and self.reason_code != "bounded_read_only":
+            raise ValueError("approve_low_impact requires bounded_read_only reason_code")
+        if self.decision == "escalate" and self.reason_code == "bounded_read_only":
+            raise ValueError("escalate requires an escalation reason_code")
+        return self
+
+
 class PolicyDecision(BaseModel):
     kind: PolicyDecisionKind
     reason: str
@@ -632,6 +653,14 @@ def json_schema_for_completion_review_decision() -> dict[str, Any]:
 
 def openai_strict_json_schema_for_completion_review_decision() -> dict[str, Any]:
     return openai_strict_json_schema(json_schema_for_completion_review_decision())
+
+
+def json_schema_for_cheap_approval_decision() -> dict[str, Any]:
+    return CheapApprovalDecision.model_json_schema()
+
+
+def openai_strict_json_schema_for_cheap_approval_decision() -> dict[str, Any]:
+    return openai_strict_json_schema(json_schema_for_cheap_approval_decision())
 
 
 def openai_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:

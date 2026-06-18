@@ -103,6 +103,9 @@ Before starting the real coder, Sentinel checks:
 - available models;
 - account rate limits when available;
 - structured JSON output for the supervisor;
+- optional cheap approval triage structured output when
+  `SENTINEL_APPROVAL_TRIAGE_ENABLED=true` and
+  `SENTINEL_APPROVAL_TRIAGE_MODEL` is configured;
 - app-server config requirements;
 - requested coder sandbox and approval settings.
 
@@ -194,6 +197,43 @@ Deterministic policy handles obvious cases first:
 
 Gray-zone approvals are sent to the stateless supervisor. If the supervisor
 times out or returns invalid output, Sentinel fails closed with decline/cancel.
+
+When enabled, command approvals in a narrow gray zone can take a cheaper
+mechanical review path before the full supervisor:
+
+```text
+deterministic policy
+  -> allow or deny
+  -> eligible composed read-only command
+      -> cheap mechanical review
+          -> approve_low_impact: plain accept
+          -> escalate/failure/uncertainty: full supervisor
+  -> all other gray-zone requests: full supervisor
+  -> full-supervisor failure: decline/cancel
+```
+
+The cheap reviewer only classifies whether a command is bounded,
+operationally read-only, workspace-local, and safe without task context. It
+cannot deny, grant `acceptForSession`, amend policy, persist decisions, steer
+the coder, or resolve file-change, network, permissions, tool, MCP, or unknown
+request types. Its output is not included in the full-supervisor packet; on
+uncertainty or failure the full supervisor sees the same approval context and
+deterministic routing reason it would have seen without cheap review.
+
+Configure it independently from the full supervisor:
+
+- `SENTINEL_APPROVAL_TRIAGE_ENABLED=true` enables the optional fast path.
+- `SENTINEL_APPROVAL_TRIAGE_MODEL=<model>` selects the cheap reviewer model.
+  Sentinel does not silently reuse the full supervisor model when this is
+  missing.
+- `SENTINEL_APPROVAL_TRIAGE_TIMEOUT=<seconds>` sets the cheap-review timeout.
+
+Representative candidates include `git status --short && git diff --stat`,
+`git diff --name-only | head -n 20`, `find src -maxdepth 2 -type f | sort`,
+and `cat pyproject.toml | head -n 80`. Noncandidates include redirects,
+command or process substitution, network commands, interpreters such as
+`python -c`, dependency installation, git mutation, permission changes,
+destructive commands, secret paths, workspace escapes, and unknown executables.
 
 Unsupported app-server surfaces are fail-closed in the MVP:
 
