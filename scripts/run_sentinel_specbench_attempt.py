@@ -902,16 +902,24 @@ def collect_rollouts(paths: RunPaths, *, workspace_cwd: str, start_utc: datetime
             if ts and (ts < start_utc.replace(tzinfo=timezone.utc) or ts > end_utc.replace(tzinfo=timezone.utc)):
                 continue
             rollout_id = meta.get("id")
-            if rollout_id and rollout_id == coder_thread_id:
-                bucket = "coder"
-            elif rollout_id in supervisor_thread_ids:
-                bucket = "supervisor"
-            else:
-                bucket = "other"
+            bucket = rollout_bucket(
+                rollout_id=rollout_id,
+                role_hint=meta.get("role_hint"),
+                coder_thread_id=coder_thread_id,
+                supervisor_thread_ids=supervisor_thread_ids,
+            )
             dest = paths.rollouts / bucket / path.name
             if path.resolve() != dest.resolve():
                 shutil.copy2(path, dest)
-            matched.append({"id": rollout_id, "cwd": meta.get("cwd"), "source": str(path), "bucket": bucket})
+            matched.append(
+                {
+                    "id": rollout_id,
+                    "cwd": meta.get("cwd"),
+                    "source": str(path),
+                    "bucket": bucket,
+                    "role_hint": meta.get("role_hint"),
+                }
+            )
 
     return {
         "workspace_cwd": workspace_cwd,
@@ -931,21 +939,102 @@ def collect_rollouts(paths: RunPaths, *, workspace_cwd: str, start_utc: datetime
 def read_rollout_meta(path: Path) -> dict[str, Any] | None:
     try:
         with path.open(encoding="utf-8") as handle:
-            for line in handle:
+            meta: dict[str, Any] | None = None
+            role_hint: str | None = None
+            for index, line in enumerate(handle):
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if item.get("type") == "session_meta":
                     payload = item.get("payload") or {}
-                    return {
+                    meta = {
                         "id": payload.get("id"),
                         "cwd": payload.get("cwd"),
                         "timestamp": payload.get("timestamp") or item.get("timestamp"),
                     }
+                if role_hint is None:
+                    role_hint = rollout_role_hint_from_item(item)
+                if meta is not None and role_hint is not None:
+                    break
+                if index >= 120 and meta is not None:
+                    break
     except OSError:
         return None
+    if meta is None:
+        return None
+    if role_hint is not None:
+        meta["role_hint"] = role_hint
+    return meta
+
+
+def rollout_bucket(
+    *,
+    rollout_id: Any,
+    role_hint: Any,
+    coder_thread_id: str | None,
+    supervisor_thread_ids: set[str],
+) -> str:
+    if isinstance(rollout_id, str) and rollout_id in supervisor_thread_ids:
+        return "supervisor"
+    if isinstance(rollout_id, str) and coder_thread_id and rollout_id == coder_thread_id:
+        return "coder"
+    if role_hint == "supervisor":
+        return "supervisor"
+    if role_hint == "coder":
+        return "coder"
+    return "other"
+
+
+def rollout_role_hint_from_item(item: dict[str, Any]) -> str | None:
+    text = rollout_prompt_text(item)
+    if not text:
+        return None
+    lowered = text.lower()
+    if (
+        "you are the coding agent for this task" in lowered
+        or "an automated supervisor observes your work" in lowered
+        or "read the task file first:" in lowered
+        or ("# benchmark task" in lowered and "/app/task.md" in lowered)
+    ):
+        return "coder"
+    if (
+        "runtime oversight controller" in lowered
+        or "structured output self-test" in lowered
+        or ("current_summary" in lowered and "wake_sequence" in lowered)
+    ):
+        return "supervisor"
     return None
+
+
+def rollout_prompt_text(item: dict[str, Any]) -> str:
+    payload = item.get("payload")
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        if payload.get("type") == "user_message":
+            candidates.append(payload.get("message"))
+        if payload.get("type") == "message":
+            candidates.append(payload.get("content"))
+    if item.get("type") == "response_item" and isinstance(payload, dict):
+        candidates.append(payload.get("content"))
+    parts: list[str] = []
+    for candidate in candidates:
+        collect_rollout_text(candidate, parts)
+    return "\n".join(parts)
+
+
+def collect_rollout_text(value: Any, parts: list[str]) -> None:
+    if isinstance(value, str):
+        if value:
+            parts.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            collect_rollout_text(item, parts)
+        return
+    if isinstance(value, dict):
+        for key in ("text", "content", "message"):
+            collect_rollout_text(value.get(key), parts)
 
 
 def write_run_report(

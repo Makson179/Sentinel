@@ -20,6 +20,7 @@ from supervisor.schemas import (
     CoderMessage,
     CompletionReviewDecision,
     DiffPacketLimits,
+    EvidenceProvenanceSummary,
     HumanMessage,
     PriorIntervention,
     RestartHandoff,
@@ -162,7 +163,7 @@ class StatelessSupervisorAgent:
                     "supervisor thread/turns/list response",
                     self.client.thread_turns_list(
                         thread_id,
-                        limit=1,
+                        limit=5,
                         items_view="full",
                         timeout=timeout_seconds,
                     ),
@@ -171,15 +172,14 @@ class StatelessSupervisorAgent:
                     timeout=timeout_seconds,
                 )
                 data = turns.get("data", [])
-                if data and isinstance(data[0], dict):
-                    text = last_agent_message_text(data[0])
+                text = _agent_message_text_from_turns(data, turn_id=turn_id)
             if text is None:
                 raise SupervisorAgentError("supervisor did not produce an agent message")
             raw_text = text
             decision = model_cls.model_validate(_parse_json_object(text))
-            if isinstance(decision, SupervisorDecision):
-                decision.wake_sequence = decision.wake_sequence or packet.wake_sequence
-                decision.generation = decision.generation if decision.generation is not None else packet.generation
+            if isinstance(decision, (SupervisorDecision, CompletionReviewDecision)):
+                decision.wake_sequence = packet.wake_sequence
+                decision.generation = packet.generation
             return decision
         except (ValidationError, json.JSONDecodeError) as exc:
             audit_error = f"invalid supervisor decision: {exc}"
@@ -345,6 +345,7 @@ class StatelessSupervisorAgent:
         changed_file_contexts: list[ChangedFileContext] | None = None,
         changed_tests_summary: list[ChangedTestsSummary] | None = None,
         validation_outputs: list[ValidationOutput] | None = None,
+        evidence_provenance_summary: EvidenceProvenanceSummary | None = None,
         diff_packet_limits: DiffPacketLimits | None = None,
         completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
         completion_payload_since_sequence: int | None = None,
@@ -399,6 +400,7 @@ class StatelessSupervisorAgent:
             changed_file_contexts=changed_file_contexts or [],
             changed_tests_summary=changed_tests_summary or [],
             validation_outputs=validation_outputs or [],
+            evidence_provenance_summary=evidence_provenance_summary,
             diff_packet_limits=diff_packet_limits or DiffPacketLimits(),
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
@@ -464,6 +466,23 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
     return json.loads(stripped)
+
+
+def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | None:
+    if not isinstance(data, list):
+        return None
+    turns = [item for item in data if isinstance(item, dict)]
+    if turn_id:
+        for turn in turns:
+            if turn.get("id") == turn_id:
+                text = last_agent_message_text(turn)
+                if text is not None:
+                    return text
+    for turn in turns:
+        text = last_agent_message_text(turn)
+        if text is not None:
+            return text
+    return None
 
 
 def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:

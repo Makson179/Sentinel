@@ -468,6 +468,48 @@ class ValidationOutput(BaseModel):
     failed_count: int | None = None
 
 
+class ValidationProvenance(BaseModel):
+    validation_id: str
+    command: str
+    type: Literal["static", "behavioral", "behavior_demo"]
+    passed: bool
+    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
+    sequence: int
+    fresh_after_latest_relevant_change: bool | None = None
+    captured_output_present: bool = False
+    output_identifies_test_files: bool = False
+    executed_test_files: list[str] = Field(default_factory=list)
+    coder_authored_test_files: list[str] = Field(default_factory=list)
+    untouched_executed_test_files: list[str] = Field(default_factory=list)
+    target_files_or_test_files: list[str] = Field(default_factory=list)
+    output_kind: Literal[
+        "not_applicable",
+        "missing",
+        "factual_observation_candidate",
+        "self_verdict_only",
+        "test_runner_output",
+        "unknown",
+    ] = "unknown"
+    independence_class: Literal[
+        "independent",
+        "independent_candidate",
+        "self_confirming",
+        "not_independent",
+        "stale",
+        "failed",
+        "masked_or_unknown",
+        "unknown",
+    ] = "unknown"
+    risk_reasons: list[str] = Field(default_factory=list)
+
+
+class EvidenceProvenanceSummary(BaseModel):
+    latest_relevant_change_sequence: int | None = None
+    changed_test_files: list[str] = Field(default_factory=list)
+    validations: list[ValidationProvenance] = Field(default_factory=list)
+    capture_inconsistencies: list[str] = Field(default_factory=list)
+
+
 class DiffPacketLimits(BaseModel):
     total_diff_chars: int = 0
     total_context_chars: int = 0
@@ -515,6 +557,7 @@ class SupervisorWakePacket(BaseModel):
     changed_file_contexts: list[ChangedFileContext] = Field(default_factory=list)
     changed_tests_summary: list[ChangedTestsSummary] = Field(default_factory=list)
     validation_outputs: list[ValidationOutput] = Field(default_factory=list)
+    evidence_provenance_summary: EvidenceProvenanceSummary | None = None
     diff_packet_limits: DiffPacketLimits = Field(default_factory=DiffPacketLimits)
     completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
     completion_payload_since_sequence: int | None = None

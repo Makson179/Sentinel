@@ -332,6 +332,7 @@ def build_attempt_image(
     dockerfile.write_text(
         textwrap.dedent(
             f"""
+            FROM python:3.11-slim-bullseye AS sentinel-python
             FROM {base_image}
             ARG CODEX_VERSION={codex_version}
             ENV PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -347,10 +348,11 @@ def build_attempt_image(
                 fi \\
                 && if [ ! -x /usr/bin/zsh ] && command -v zsh >/dev/null 2>&1; then mkdir -p /usr/bin && ln -s "$(command -v zsh)" /usr/bin/zsh; fi
             RUN npm install -g @openai/codex@${{CODEX_VERSION}} --no-audit --no-fund
+            COPY --from=sentinel-python /usr/local /opt/sentinel-python
             COPY sentinel-src /opt/sentinel-src
             RUN set -eu; \\
                 sentinel_python=""; \\
-                for py in /usr/bin/python3.12 /usr/bin/python3.11 /usr/bin/python3 python3; do \\
+                for py in /usr/bin/python3.12 /usr/bin/python3.11 /usr/bin/python3 python3 /opt/sentinel-python/bin/python3.11; do \\
                     if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then \\
                         py_path="$py"; \\
                         if command -v "$py" >/dev/null 2>&1; then py_path="$(command -v "$py")"; fi; \\
@@ -796,41 +798,47 @@ def git_history_cleanup_script(base_commit: str, *, artifacts_dir: str = "/attem
         mkdir -p {artifacts}
         {{
           echo "base_commit={base_commit}"
-          echo "$ git tag -l | xargs -r git tag -d"
-          git tag -l | xargs -r git tag -d
-          echo "$ git for-each-ref --format='%(refname)' refs/remotes | xargs -r -n1 git update-ref -d"
-          git for-each-ref --format='%(refname)' refs/remotes | xargs -r -n1 git update-ref -d
-          echo "$ git remote | while read remote; do git remote remove \"\\$remote\"; done"
-          git remote | while IFS= read -r remote; do git remote remove "$remote" || true; done
-          echo "$ rm -rf .git/refs/remotes"
-          rm -rf .git/refs/remotes
-          current_branch="$(git rev-parse --abbrev-ref HEAD)"
-          if [ "$current_branch" = "HEAD" ]; then
-            echo "$ git checkout -B sentinel-base {base}"
-            git checkout -B sentinel-base {base}
-            current_branch="sentinel-base"
-          fi
-          echo "$ git for-each-ref --format='%(refname:short)' refs/heads | grep -vx \\"$current_branch\\" | xargs -r git branch -D"
-          git for-each-ref --format='%(refname:short)' refs/heads | while IFS= read -r branch; do
-            if [ "$branch" != "$current_branch" ]; then
-              git branch -D "$branch"
-            fi
-          done
-          echo "$ rm -f .git/ORIG_HEAD .git/FETCH_HEAD .git/MERGE_HEAD .git/CHERRY_PICK_HEAD .git/REVERT_HEAD"
-          rm -f .git/ORIG_HEAD .git/FETCH_HEAD .git/MERGE_HEAD .git/CHERRY_PICK_HEAD .git/REVERT_HEAD
+          echo "$ test HEAD == base"
+          test "$(git rev-parse HEAD)" = {base}
+          tracked_files="$(mktemp /tmp/sentinel-base-tracked.XXXXXX)"
+          echo "$ git ls-files -z > $tracked_files"
+          git ls-files -z > "$tracked_files"
+          echo "$ snapshot old git config"
+          old_user_email="$(git config --get user.email || true)"
+          old_user_name="$(git config --get user.name || true)"
+          echo "$ rm -rf .git"
+          rm -rf .git
+          echo "$ git init -q"
+          git init -q
+          if [ -n "$old_user_email" ]; then git config user.email "$old_user_email"; else git config user.email "sentinel@example.invalid"; fi
+          if [ -n "$old_user_name" ]; then git config user.name "$old_user_name"; else git config user.name "Sentinel Base Snapshot"; fi
+          echo "$ GIT_LITERAL_PATHSPECS=1 git add -f --pathspec-from-file=$tracked_files --pathspec-file-nul"
+          GIT_LITERAL_PATHSPECS=1 git add -f --pathspec-from-file="$tracked_files" --pathspec-file-nul
+          rm -f "$tracked_files"
+          echo "$ git commit -qm 'sentinel base snapshot'"
+          GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" git commit -qm "sentinel base snapshot"
+          echo "$ git branch -M sentinel-base"
+          git branch -M sentinel-base
           echo "$ git reflog expire --expire=now --all"
           git reflog expire --expire=now --all
           echo "$ git gc --prune=now"
           git gc --prune=now
         }} > {artifacts}/git-history-cleanup.log 2>&1
         {{
-          echo "base_commit={base_commit}"
+          echo "original_base_commit={base_commit}"
           printf "head="
           git rev-parse HEAD
-          if [ "$(git rev-parse HEAD)" != {base} ]; then
-            echo "ERROR: HEAD moved away from base commit" >&2
+          printf "reachable_commit_count="
+          git rev-list --all --count
+          if [ "$(git rev-list --all --count)" != "1" ]; then
+            echo "ERROR: expected exactly one reachable snapshot commit" >&2
             exit 1
           fi
+          if git cat-file -e {base}^{{commit}} 2>/dev/null; then
+            echo "ERROR: original base commit is still reachable in rewritten repository" >&2
+            exit 1
+          fi
+          echo "original_base_commit_unreachable=yes"
           echo "tags:"
           git tag -l
           echo "remote_refs:"
@@ -839,6 +847,8 @@ def git_history_cleanup_script(base_commit: str, *, artifacts_dir: str = "/attem
           git for-each-ref --format='%(refname:short) %(objectname)' refs/heads
           echo "log_all:"
           git log --all --oneline -20
+          echo "status:"
+          git status --short
         }} > {artifacts}/git-history-cleanup-verify.txt 2>&1
         """
     ).strip()
@@ -867,6 +877,8 @@ def run_attempt_container(
         git reset --hard {sh_single(base_commit)}
         git clean -fd
         {git_history_cleanup_script(base_commit)}
+        sentinel_diff_base_ref="$(git rev-parse HEAD)"
+        echo "$sentinel_diff_base_ref" > /attempt-out/artifacts/sentinel-diff-base-ref.txt
         cp /attempt-input/TASK.md /app/TASK.md
         export SENTINEL_CODER_SANDBOX=danger-full-access
         start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -887,8 +899,8 @@ def run_attempt_container(
           ':(exclude)TASK.md' \\
           ':(exclude)pyproject.toml' ':(exclude)setup.cfg' ':(exclude)setup.py' \\
           ':(exclude)tox.ini' ':(exclude)*.cfg' ':(exclude)*.toml'
-        git diff --cached --binary {sh_single(base_commit)} > /attempt-out/artifacts/agent_diff_vs_base.diff
-        git diff --cached --stat {sh_single(base_commit)} > /attempt-out/artifacts/agent_diff_vs_base.stat || true
+        git diff --cached --binary "$sentinel_diff_base_ref" > /attempt-out/artifacts/agent_diff_vs_base.diff
+        git diff --cached --stat "$sentinel_diff_base_ref" > /attempt-out/artifacts/agent_diff_vs_base.stat || true
         git reset --quiet
         tar --exclude=.git --exclude=node_modules --exclude=.supervisor -czf /attempt-out/artifacts/final-worktree-no-git-no-node_modules.tar.gz -C /app .
         exit "$rc"
@@ -1020,16 +1032,24 @@ def collect_rollouts(paths: RunPaths, *, container_cwd: str, start_utc: datetime
             if ts and (ts < start_utc.replace(tzinfo=timezone.utc) or ts > end_utc.replace(tzinfo=timezone.utc)):
                 continue
             rollout_id = meta.get("id")
-            if rollout_id and rollout_id == coder_thread_id:
-                bucket = "coder"
-            elif rollout_id in supervisor_thread_ids:
-                bucket = "supervisor"
-            else:
-                bucket = "other"
+            bucket = rollout_bucket(
+                rollout_id=rollout_id,
+                role_hint=meta.get("role_hint"),
+                coder_thread_id=coder_thread_id,
+                supervisor_thread_ids=supervisor_thread_ids,
+            )
             dest = paths.rollouts / bucket / path.name
             if path.resolve() != dest.resolve():
                 shutil.copy2(path, dest)
-            matched.append({"id": rollout_id, "cwd": meta.get("cwd"), "source": str(path), "bucket": bucket})
+            matched.append(
+                {
+                    "id": rollout_id,
+                    "cwd": meta.get("cwd"),
+                    "source": str(path),
+                    "bucket": bucket,
+                    "role_hint": meta.get("role_hint"),
+                }
+            )
 
     return {
         "container_cwd": container_cwd,
@@ -1048,21 +1068,102 @@ def collect_rollouts(paths: RunPaths, *, container_cwd: str, start_utc: datetime
 def read_rollout_meta(path: Path) -> dict[str, Any] | None:
     try:
         with path.open(encoding="utf-8") as handle:
-            for line in handle:
+            meta: dict[str, Any] | None = None
+            role_hint: str | None = None
+            for index, line in enumerate(handle):
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if item.get("type") == "session_meta":
                     payload = item.get("payload") or {}
-                    return {
+                    meta = {
                         "id": payload.get("id"),
                         "cwd": payload.get("cwd"),
                         "timestamp": payload.get("timestamp") or item.get("timestamp"),
                     }
+                if role_hint is None:
+                    role_hint = rollout_role_hint_from_item(item)
+                if meta is not None and role_hint is not None:
+                    break
+                if index >= 120 and meta is not None:
+                    break
     except OSError:
         return None
+    if meta is None:
+        return None
+    if role_hint is not None:
+        meta["role_hint"] = role_hint
+    return meta
+
+
+def rollout_bucket(
+    *,
+    rollout_id: Any,
+    role_hint: Any,
+    coder_thread_id: str | None,
+    supervisor_thread_ids: set[str],
+) -> str:
+    if isinstance(rollout_id, str) and rollout_id in supervisor_thread_ids:
+        return "supervisor"
+    if isinstance(rollout_id, str) and coder_thread_id and rollout_id == coder_thread_id:
+        return "coder"
+    if role_hint == "supervisor":
+        return "supervisor"
+    if role_hint == "coder":
+        return "coder"
+    return "other"
+
+
+def rollout_role_hint_from_item(item: dict[str, Any]) -> str | None:
+    text = rollout_prompt_text(item)
+    if not text:
+        return None
+    lowered = text.lower()
+    if (
+        "you are the coding agent for this task" in lowered
+        or "an automated supervisor observes your work" in lowered
+        or "read the task file first:" in lowered
+        or ("# benchmark task" in lowered and "/app/task.md" in lowered)
+    ):
+        return "coder"
+    if (
+        "runtime oversight controller" in lowered
+        or "structured output self-test" in lowered
+        or ("current_summary" in lowered and "wake_sequence" in lowered)
+    ):
+        return "supervisor"
     return None
+
+
+def rollout_prompt_text(item: dict[str, Any]) -> str:
+    payload = item.get("payload")
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        if payload.get("type") == "user_message":
+            candidates.append(payload.get("message"))
+        if payload.get("type") == "message":
+            candidates.append(payload.get("content"))
+    if item.get("type") == "response_item" and isinstance(payload, dict):
+        candidates.append(payload.get("content"))
+    parts: list[str] = []
+    for candidate in candidates:
+        collect_rollout_text(candidate, parts)
+    return "\n".join(parts)
+
+
+def collect_rollout_text(value: Any, parts: list[str]) -> None:
+    if isinstance(value, str):
+        if value:
+            parts.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            collect_rollout_text(item, parts)
+        return
+    if isinstance(value, dict):
+        for key in ("text", "content", "message"):
+            collect_rollout_text(value.get(key), parts)
 
 
 def scan_test_evidence(paths: RunPaths) -> dict[str, Any]:

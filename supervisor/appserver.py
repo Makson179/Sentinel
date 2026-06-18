@@ -437,6 +437,42 @@ def last_agent_message_text(turn: dict[str, Any]) -> str | None:
     if not isinstance(items, list):
         return None
     for item in reversed(items):
-        if isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
-            return item["text"]
+        text = _agent_message_text_from_item(item)
+        if text is not None:
+            return text
     return None
+
+
+def _agent_message_text_from_item(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    if item_type == "agentMessage" and isinstance(item.get("text"), str):
+        return item["text"]
+    if item_type in {"message", "assistantMessage"} or item.get("role") in {"assistant", "agent"}:
+        text = _message_content_text(item.get("content"))
+        if text is not None:
+            return text
+        if isinstance(item.get("text"), str):
+            return item["text"]
+        if isinstance(item.get("message"), str):
+            return item["message"]
+    payload = item.get("payload")
+    if isinstance(payload, dict):
+        return _agent_message_text_from_item(payload)
+    return None
+
+
+def _message_content_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    text = "".join(parts).strip()
+    return text or None

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -15,6 +19,7 @@ from supervisor.controller import (
     _has_passing_behavioral_validation,
     _has_readiness_marker,
     _path_from_git_status_line,
+    _evidence_provenance_summary,
     _file_kind,
     _validation_from_action,
     _validation_freshness_summary,
@@ -30,6 +35,7 @@ from supervisor.schemas import (
     ChangedFile,
     ChangedFileDiff,
     CoderMessage,
+    CompletionReturnRecord,
     CompletionReviewDecision,
     FinalReport,
     PriorIntervention,
@@ -82,6 +88,49 @@ def test_git_status_path_parser_handles_missing_second_status_column() -> None:
     assert _path_from_git_status_line(" M public/src/admin/manage/users.js") == "public/src/admin/manage/users.js"
     assert _path_from_git_status_line("M  public/language/en-GB/admin/manage/users.json") == "public/language/en-GB/admin/manage/users.json"
     assert _path_from_git_status_line("M public/language/en-GB/admin/manage/users.json") == "public/language/en-GB/admin/manage/users.json"
+
+
+async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.use_git_diff = True
+    controller.observed_changed_files = {
+        ".supervisor/CONFIG.json": ChangedFile(path=".supervisor/CONFIG.json", status="modified", sequence=1),
+        "TASK.md": ChangedFile(path="TASK.md", status="modified", sequence=2),
+        "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=3),
+    }
+
+    async def is_git_work_tree() -> bool:
+        return True
+
+    async def git_output(command):
+        if command == ["git", "status", "--short"]:
+            return " M .supervisor/CONFIG.json\n M TASK.md\n M src/app.py"
+        if command == ["git", "diff", "--numstat", "HEAD", "--"]:
+            return "1\t1\t.supervisor/CONFIG.json\n1\t0\tTASK.md\n2\t3\tsrc/app.py"
+        if command == ["git", "diff", "--stat"]:
+            return " .supervisor/CONFIG.json | 2 +-\n TASK.md | 1 +\n src/app.py | 5 ++---\n 3 files changed"
+        if command == ["git", "diff", "--name-only"]:
+            return ".supervisor/CONFIG.json\nTASK.md\nsrc/app.py"
+        return None
+
+    controller._is_git_work_tree = is_git_work_tree
+    controller._git_output = git_output
+
+    changed = await controller.changed_files()
+    diff = await controller.diff_summary()
+
+    assert [file.path for file in changed] == ["src/app.py"]
+    assert ".supervisor" not in diff
+    assert "TASK.md" not in diff
+    assert "src/app.py" in diff
 
 
 def test_file_kind_classifies_common_test_roots_before_source_extensions() -> None:
@@ -283,6 +332,17 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         sequence=17,
         item={"stdout": "============================= 45 passed in 0.06s =============================\n"},
     )
+    absolute_go_test = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="/usr/local/go/bin/go test -count=1 ./...",
+            exit_code=0,
+            status="completed",
+            summary="command completed: /usr/local/go/bin/go test -count=1 ./... exit=0",
+        ),
+        sequence=18,
+        item={"result": {"stdout": "ok github.com/example/project/core 0.02s\n"}},
+    )
 
     assert all(run is not None and run.type == "static" and run.outcome == "pass" for run in static_runs)
     assert behavioral is not None
@@ -334,7 +394,11 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert direct_visible_script.type == "behavioral"
     assert direct_visible_script.passed_count == 45
     assert direct_visible_script.failed_count == 0
-    assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script, shell_visible_script, direct_visible_script])
+    assert absolute_go_test is not None
+    assert absolute_go_test.type == "behavioral"
+    assert absolute_go_test.passed is True
+    assert "github.com/example/project/core" in absolute_go_test.captured_output
+    assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script, shell_visible_script, direct_visible_script, absolute_go_test])
 
 
 async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
@@ -387,12 +451,52 @@ async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: P
     assert controller._command_output_chunks == {}
 
 
+async def test_camelcase_stdout_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/commandExecution/stdoutDelta",
+                "params": {"threadId": "thread", "turnId": "turn", "itemId": "cmd-1", "stdout": "ok pkg/a 0.01s\n"},
+            }
+        )
+    )
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "/usr/local/go/bin/go test -count=1 ./...",
+                        "exitCode": 0,
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+    )
+
+    assert len(controller.validations) == 1
+    validation = controller.validations[0]
+    assert validation.command == "/usr/local/go/bin/go test -count=1 ./..."
+    assert validation.type == "behavioral"
+    assert validation.passed is True
+    assert validation.captured_output == "ok pkg/a 0.01s\n"
+    assert "ok pkg/a" in validation.summary
+
+
 def test_readiness_marker_detection_requires_own_exact_line() -> None:
     assert _has_readiness_marker("Summary\n  SENTINEL_READY_FOR_REVIEW  \n")
     assert not _has_readiness_marker("Summary SENTINEL_READY_FOR_REVIEW")
     assert not _has_readiness_marker("sentinel_ready_for_review")
     assert _has_malformed_readiness_marker("sentinel_ready_for_review")
     assert _has_malformed_readiness_marker("SENTINEL READY FOR REVIEW")
+    assert not _has_malformed_readiness_marker("I am not emitting `SENTINEL_READY_FOR_REVIEW`.")
 
 
 async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) -> None:
@@ -542,53 +646,85 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
 
 
-async def test_no_marker_idle_nudge_then_escalates_at_cap(tmp_path: Path) -> None:
+async def test_material_limitation_without_marker_escalates_instead_of_marker_nudge(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(
-            project_root=str(tmp_path),
-            task_path=str(task),
-            coder_thread_id="thread",
-            max_no_marker_idle_nudges=1,
-            max_restarts=0,
-        ),
-        overwrite=True,
-    )
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
 
     class FakeCoder:
         def __init__(self) -> None:
             self.messages = []
+            self.interrupted = False
 
         async def steer_or_start(self, message):
             self.messages.append(message)
             return "turn"
 
+        async def interrupt(self):
+            self.interrupted = True
+
     controller = SentinelController.__new__(SentinelController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
+    controller.supervisor = None
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
-    controller.last_coder_message = None
-    controller.prior_interventions = []
+    controller.last_coder_message = CoderMessage(
+        text=(
+            "I do not believe the task is ready.\n\n"
+            "Validation: changed focused Jest coverage passed earlier.\n\n"
+            "Material limitation: Independent behavioral evidence is still missing. "
+            "Current instructions prohibit adding a temporary behavior test, so there is "
+            "no compliant next validation step. Therefore I am not emitting "
+            "`SENTINEL_READY_FOR_REVIEW`."
+        ),
+        sequence=7,
+    )
     controller.validations = []
+    controller.prior_interventions = []
     controller.observed_changed_files = {}
     controller.use_git_diff = False
     controller.tui = _FakeTUI()
     controller.running = True
+    controller.client = None
     controller.event_queue = asyncio.Queue()
-    controller._current_turn_action_count = 0
+    controller._sequence = 0
+    controller._supervisor_dirty = False
+    controller._supervisor_next_summary = None
+    controller._supervisor_next_completion_review = False
+    controller._supervisor_task = None
+    controller.paused = False
     controller.no_marker_idle_nudge_count = 0
     controller.completion_returns = []
     controller.completion_restarts = 0
 
-    await controller._handle_no_marker_idle()
-    assert controller.coder.messages == [NO_MARKER_IDLE_NUDGE]
+    await controller._handle_coder_turn_completed(item_id="message-item")
+
+    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    assert controller.coder.messages == []
+    assert controller.coder.interrupted is True
+    assert "Coder reported material limitation" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "material validation limitation" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+
+
+async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
+    )
 
     await controller._handle_no_marker_idle()
-    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    await controller._supervisor_task
+
+    assert len(fake.completion_packets) == 1
+    assert controller.completion_returns[0].reason == "not used"
+    assert "Controller forcing completion_review" in store.path(PROGRESS).read_text(encoding="utf-8")
+
+    await controller._handle_no_marker_idle()
+
+    assert len(fake.completion_packets) == 1
 
 
 def test_runtime_supervisor_schema_rejects_complete() -> None:
@@ -794,6 +930,240 @@ async def test_completion_packet_details_can_send_delta_after_return(tmp_path: P
     ]
 
 
+def test_evidence_provenance_marks_changed_test_as_self_confirming() -> None:
+    summary = _evidence_provenance_summary(
+        validations=[
+            ValidationRun(
+                command="pytest tests/test_app_new.py",
+                exit_code=0,
+                passed=True,
+                summary="tests/test_app_new.py::test_requested_behavior PASSED\n1 passed",
+                captured_output="tests/test_app_new.py::test_requested_behavior PASSED\n1 passed\n",
+                executed_test_files=["tests/test_app_new.py"],
+                sequence=3,
+            )
+        ],
+        changed_files=[
+            ChangedFile(path="src/app.py", status="M", sequence=2),
+            ChangedFile(path="tests/test_app_new.py", status="A", sequence=2),
+        ],
+        latest_change_sequence=2,
+    )
+
+    provenance = summary.validations[0]
+    assert provenance.independence_class == "self_confirming"
+    assert provenance.output_identifies_test_files is True
+    assert provenance.coder_authored_test_files == ["tests/test_app_new.py"]
+    assert provenance.untouched_executed_test_files == []
+    assert provenance.risk_reasons == ["all_output_identified_tests_were_coder_authored"]
+
+
+def test_evidence_provenance_canonicalizes_changed_tsx_test_reported_as_ts() -> None:
+    summary = _evidence_provenance_summary(
+        validations=[
+            ValidationRun(
+                command="npm test -- DeviceDetailHeading",
+                exit_code=0,
+                passed=True,
+                summary="PASS src/components/DeviceDetailHeading-test.ts\n1 passed",
+                captured_output="PASS src/components/DeviceDetailHeading-test.ts\n1 passed\n",
+                executed_test_files=["src/components/DeviceDetailHeading-test.ts"],
+                sequence=3,
+            )
+        ],
+        changed_files=[
+            ChangedFile(path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2),
+            ChangedFile(path="src/components/DeviceDetailHeading-test.tsx", status="A", sequence=2),
+        ],
+        latest_change_sequence=2,
+    )
+
+    provenance = summary.validations[0]
+    assert provenance.independence_class == "self_confirming"
+    assert provenance.executed_test_files == ["src/components/DeviceDetailHeading-test.ts"]
+    assert provenance.coder_authored_test_files == ["src/components/DeviceDetailHeading-test.tsx"]
+    assert provenance.untouched_executed_test_files == []
+
+
+def test_evidence_provenance_marks_untouched_output_identified_test_as_independent() -> None:
+    summary = _evidence_provenance_summary(
+        validations=[
+            ValidationRun(
+                command="pytest tests/test_app_existing.py tests/test_app_new.py",
+                exit_code=0,
+                passed=True,
+                summary=(
+                    "tests/test_app_existing.py::test_requested_behavior PASSED\n"
+                    "tests/test_app_new.py::test_requested_behavior PASSED\n2 passed"
+                ),
+                captured_output=(
+                    "tests/test_app_existing.py::test_requested_behavior PASSED\n"
+                    "tests/test_app_new.py::test_requested_behavior PASSED\n2 passed\n"
+                ),
+                executed_test_files=["tests/test_app_existing.py", "tests/test_app_new.py"],
+                sequence=4,
+            )
+        ],
+        changed_files=[
+            ChangedFile(path="src/app.py", status="M", sequence=2),
+            ChangedFile(path="tests/test_app_new.py", status="A", sequence=2),
+        ],
+        latest_change_sequence=2,
+    )
+
+    provenance = summary.validations[0]
+    assert provenance.independence_class == "independent"
+    assert provenance.coder_authored_test_files == ["tests/test_app_new.py"]
+    assert provenance.untouched_executed_test_files == ["tests/test_app_existing.py"]
+    assert provenance.risk_reasons == []
+
+
+def test_evidence_provenance_classifies_behavior_demo_output() -> None:
+    summary = _evidence_provenance_summary(
+        validations=[
+            ValidationRun(
+                command="node -e \"console.log(render())\"",
+                exit_code=0,
+                type="behavior_demo",
+                passed=True,
+                summary="<button>Save</button>",
+                captured_output="<button>Save</button>\n",
+                sequence=3,
+            ),
+            ValidationRun(
+                command="node -e \"console.log('PASS')\"",
+                exit_code=0,
+                type="behavior_demo",
+                passed=True,
+                summary="PASS",
+                captured_output="PASS\n",
+                sequence=4,
+            ),
+            ValidationRun(
+                command="node -e \"runJest()\"",
+                exit_code=0,
+                type="behavior_demo",
+                passed=True,
+                summary="PASS src/App.test.tsx\n1 passed",
+                captured_output="PASS src/App.test.tsx\n1 passed\n",
+                sequence=5,
+            ),
+        ],
+        changed_files=[ChangedFile(path="src/App.tsx", status="M", sequence=2)],
+        latest_change_sequence=2,
+    )
+
+    factual, verdict, wrapped_test = summary.validations
+    assert factual.independence_class == "independent_candidate"
+    assert factual.output_kind == "factual_observation_candidate"
+    assert verdict.independence_class == "not_independent"
+    assert verdict.output_kind == "self_verdict_only"
+    assert verdict.risk_reasons == ["behavior_demo_self_verdict_only"]
+    assert wrapped_test.independence_class == "not_independent"
+    assert wrapped_test.output_kind == "test_runner_output"
+    assert wrapped_test.risk_reasons == ["behavior_demo_looks_like_test_runner_output"]
+
+
+def test_heredoc_script_command_is_behavior_demo_validation() -> None:
+    command = "python - <<'PY'\nfrom app import render\nprint(render())\nPY"
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command=command,
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=7,
+        item={"type": "commandExecution", "stdout": "<button>Save</button>\n"},
+        changed_paths=["src/app.py"],
+    )
+
+    assert validation is not None
+    assert validation.type == "behavior_demo"
+    assert validation.trusted_validation_outcome == "passed"
+    assert validation.captured_output == "<button>Save</button>\n"
+
+
+def test_validation_output_prefers_test_runner_suite_files_over_stack_trace_paths() -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="npm test -- DeviceDetailHeading",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=8,
+        item={
+            "type": "commandExecution",
+            "stdout": (
+                "PASS src/components/DeviceDetailHeading-test.ts\n"
+                "  at renderWithProviders (test/test-utils/utilities.ts:42:10)\n"
+                "1 passed\n"
+            ),
+        },
+        changed_paths=["src/components/DeviceDetailHeading.tsx"],
+    )
+
+    assert validation is not None
+    assert validation.executed_test_files == ["src/components/DeviceDetailHeading-test.ts"]
+
+
+def test_git_inspection_commands_are_not_behavioral_validations() -> None:
+    diff_validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="git diff -- tests/test_app.py",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=8,
+        item={"type": "commandExecution", "stdout": "diff --git a/tests/test_app.py b/tests/test_app.py\n"},
+        changed_paths=["tests/test_app.py"],
+    )
+    check_validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="git diff --check",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=9,
+        item={"type": "commandExecution", "stdout": ""},
+        changed_paths=["tests/test_app.py"],
+    )
+
+    assert diff_validation is None
+    assert check_validation is not None
+    assert check_validation.type == "static"
+
+
+def test_evidence_provenance_marks_validation_before_latest_edit_as_stale() -> None:
+    summary = _evidence_provenance_summary(
+        validations=[
+            ValidationRun(
+                command="pytest tests/test_app_existing.py",
+                exit_code=0,
+                passed=True,
+                summary="tests/test_app_existing.py::test_requested_behavior PASSED\n1 passed",
+                captured_output="tests/test_app_existing.py::test_requested_behavior PASSED\n1 passed\n",
+                executed_test_files=["tests/test_app_existing.py"],
+                sequence=2,
+            )
+        ],
+        changed_files=[ChangedFile(path="src/app.py", status="M", sequence=5)],
+        latest_change_sequence=5,
+    )
+
+    provenance = summary.validations[0]
+    assert provenance.fresh_after_latest_relevant_change is False
+    assert provenance.independence_class == "stale"
+    assert provenance.risk_reasons == ["stale_after_latest_relevant_change"]
+
+
 async def test_completion_review_agent_reuses_thread_until_closed(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -863,6 +1233,132 @@ async def test_completion_review_agent_reuses_thread_until_closed(tmp_path: Path
     await agent.close_completion_review()
 
     assert client.archived == ["completion-thread"]
+
+
+async def test_completion_review_agent_overrides_stale_model_wake_sequence(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "completion-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            return {
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": json.dumps(
+                                {
+                                    "decision": "return",
+                                    "reason": "needs independent demo",
+                                    "files_reviewed": [],
+                                    "behavior_evidence_matrix": [],
+                                    "uncovered_behaviors": ["rendered element"],
+                                    "validation_gaps": ["missing factual demo output"],
+                                    "claim_evidence_mismatches": [],
+                                    "packet_or_access_limitations": [],
+                                    "changed_test_risks": [],
+                                    "message_to_coder": "provide a factual behavior_demo",
+                                    "persistent_decision": None,
+                                    "progress_update": None,
+                                    "clear_handoff": False,
+                                    "display_message": None,
+                                    "handoff": None,
+                                    "wake_sequence": 3,
+                                    "generation": 99,
+                                }
+                            ),
+                        }
+                    ],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    agent = StatelessSupervisorAgent(FakeClient(), store, task)  # type: ignore[arg-type]
+    packet = agent.build_packet(wake_sequence=11, current_summary="completion review")
+
+    decision = await agent.decide_completion(packet)
+
+    assert decision.wake_sequence == 11
+    assert decision.generation == 0
+    audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
+    assert audit["decision"]["wake_sequence"] == 11
+    assert '"wake_sequence": 3' in audit["raw_text"]
+
+
+async def test_completion_review_reads_assistant_message_content_from_turns_list(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    decision_text = json.dumps(
+        {
+            "decision": "return",
+            "reason": "needs captured output",
+            "files_reviewed": [],
+            "behavior_evidence_matrix": [],
+            "uncovered_behaviors": ["demo"],
+            "validation_gaps": ["missing captured demo output"],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": "record demo output",
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 7,
+            "generation": 0,
+        }
+    )
+
+    class FakeClient:
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "completion-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            return {"turn": {"id": "turn-1", "status": "completed", "items": []}}
+
+        async def thread_turns_list(self, thread_id, *, limit, items_view, timeout):
+            assert limit == 5
+            assert items_view == "full"
+            return {
+                "data": [
+                    {"id": "older-turn", "items": [{"type": "agentMessage", "text": "{}"}]},
+                    {
+                        "id": "turn-1",
+                        "items": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": decision_text}],
+                            }
+                        ],
+                    },
+                ]
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    agent = StatelessSupervisorAgent(FakeClient(), store, task)  # type: ignore[arg-type]
+    packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
+
+    decision = await agent.decide_completion(packet)
+
+    assert decision.decision == "return"
+    audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
+    assert audit["status"] == "decision"
+    assert audit["raw_text"] == decision_text
 
 
 async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_path: Path) -> None:
@@ -1056,7 +1552,16 @@ async def test_completion_accept_gate_allows_assessed_changed_test_contract_shif
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
     controller.validations = [
-        ValidationRun(command="pytest tests/test_flow.py", exit_code=0, passed=True, summary="passed", sequence=5)
+        ValidationRun(command="pytest tests/test_flow.py", exit_code=0, passed=True, summary="passed", sequence=5),
+        ValidationRun(
+            command="python - <<'PY'\nprint(flow_visible_state())\nPY",
+            exit_code=0,
+            type="behavior_demo",
+            passed=True,
+            summary="resend_allowed=True",
+            captured_output="resend_allowed=True\n",
+            sequence=6,
+        ),
     ]
     controller.prior_interventions = []
     controller.observed_changed_files = {}
@@ -1128,7 +1633,16 @@ async def test_completion_accept_gate_allows_assessed_changed_test_contract_shif
                                 "outcome": "pass",
                                 "freshness": "fresh",
                                 "why_it_covers_behavior": "runs the visible flow",
-                            }
+                            },
+                            {
+                                "validation_id": "validation-6",
+                                "command": "python - <<'PY'\nprint(flow_visible_state())\nPY",
+                                "sequence": 6,
+                                "validation_type": "behavior_demo",
+                                "outcome": "pass",
+                                "freshness": "fresh",
+                                "why_it_covers_behavior": "captures factual resend state outside the changed test",
+                            },
                         ],
                         "status": "covered",
                         "gap": None,
@@ -1426,7 +1940,18 @@ async def test_completion_accept_gate_allows_fresh_covered_code_change(tmp_path:
     controller.store = store
     controller.coder = None
     controller.pending_approvals = {}
-    controller.validations = [ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)]
+    controller.validations = [
+        ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3),
+        ValidationRun(
+            command="python - <<'PY'\nprint(app())\nPY",
+            exit_code=0,
+            type="behavior_demo",
+            passed=True,
+            summary='{"rendered_text":"requested behavior"}',
+            captured_output='{"rendered_text":"requested behavior"}\n',
+            sequence=4,
+        ),
+    ]
     controller.prior_interventions = []
     controller.observed_changed_files = {}
     controller.use_git_diff = False
@@ -1469,19 +1994,28 @@ async def test_completion_accept_gate_allows_fresh_covered_code_change(tmp_path:
                         "behavior": "requested behavior",
                         "task_basis": "TASK.md",
                         "files_considered": ["src/app.py", "tests/test_app.py"],
-                        "evidence": [
-                            {
-                                "validation_id": "validation-3",
-                                "command": "pytest tests/test_app.py",
-                                "sequence": 3,
-                                "validation_type": "behavioral",
-                                "outcome": "pass",
-                                "freshness": "fresh",
-                                "why_it_covers_behavior": "executes the changed behavior",
-                            }
-                        ],
-                        "status": "covered",
-                        "gap": None,
+                            "evidence": [
+                                {
+                                    "validation_id": "validation-3",
+                                    "command": "pytest tests/test_app.py",
+                                    "sequence": 3,
+                                    "validation_type": "behavioral",
+                                    "outcome": "pass",
+                                    "freshness": "fresh",
+                                    "why_it_covers_behavior": "executes the changed behavior",
+                                },
+                                {
+                                    "validation_id": "validation-4",
+                                    "command": "python - <<'PY'\nprint(app())\nPY",
+                                    "sequence": 4,
+                                    "validation_type": "behavior_demo",
+                                    "outcome": "pass",
+                                    "freshness": "fresh",
+                                    "why_it_covers_behavior": "captures factual behavior outside the changed test",
+                                },
+                            ],
+                            "status": "covered",
+                            "gap": None,
                     }
                 ],
                 "uncovered_behaviors": [],
@@ -1520,9 +2054,9 @@ async def test_completion_accept_gate_returns_for_self_confirming_added_test_and
             command="npm test -- DeviceDetailHeading",
             exit_code=0,
             passed=True,
-            summary="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed",
-            captured_output="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed\n",
-            executed_test_files=["src/components/DeviceDetailHeading-test.tsx"],
+            summary="PASS src/components/DeviceDetailHeading-test.ts\n1 passed",
+            captured_output="PASS src/components/DeviceDetailHeading-test.ts\n1 passed\n",
+            executed_test_files=["src/components/DeviceDetailHeading-test.ts"],
             sequence=3,
         )
     ]
@@ -1729,10 +2263,10 @@ async def test_completion_accept_gate_allows_behavior_demo_independent_evidence(
     assert store.get_sentinel_config().accept_gate_accepts == 1
 
 
-async def test_completion_accept_gate_rejects_empty_behavior_demo_output(tmp_path: Path) -> None:
+async def test_completion_accept_gate_returns_for_empty_behavior_demo_output(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
-            command="node -e \"demo()\"",
+            command="python -m docs.generate_settings",
             exit_code=0,
             passed=True,
             type="behavior_demo",
@@ -1743,7 +2277,8 @@ async def test_completion_accept_gate_rejects_empty_behavior_demo_output(tmp_pat
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "node -e \"demo()\""
+    payload["behavior_evidence_matrix"][0]["behavior"] = "Generated docs include the new setting"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "python -m docs.generate_settings"
     payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
 
     await controller.apply_completion_decision(
@@ -1754,10 +2289,66 @@ async def test_completion_accept_gate_rejects_empty_behavior_demo_output(tmp_pat
 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
     assert len(controller.completion_returns) == 1
-    assert "behavior_demo evidence validation-3 has no captured output" in coder.messages[0]
+    assert "full diff" in coder.messages[0]
+    assert "hand-picked grep/sed" in coder.messages[0]
+    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
+    assert "behavior_demo evidence validation-3 has no captured output" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
-async def test_completion_accept_gate_returns_to_coder_when_evidence_type_mismatches_ledger(tmp_path: Path) -> None:
+async def test_completion_accept_gate_does_not_repeat_bounded_empty_demo_return(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="python -m docs.generate_settings",
+            exit_code=0,
+            passed=True,
+            type="behavior_demo",
+            summary="command completed",
+            captured_output="",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller.completion_returns = [
+        CompletionReturnRecord(
+            reason="controller accept-gate rejection (evidence_binding): missing output",
+            message_to_coder="capture artifact diff",
+            accept_gate_check_name="evidence_binding",
+            accept_gate_details={
+                "check_name": "evidence_binding",
+                "details": {
+                    "bounded_coder_return_key": (
+                        "behavior_demo_missing_output:Generated docs include the new setting:validation-3"
+                    )
+                },
+            },
+            sequence=1,
+            generation=0,
+        )
+    ]
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["behavior"] = "Generated docs include the new setting"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "python -m docs.generate_settings"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert coder.messages == []
+    assert len(controller.completion_returns) == 1
+    assert store.get_sentinel_config().accept_gate_coder_returns == 0
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
+    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
+    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_rejection")
+    assert log_entry["failure_type"] == "reviewer-incomplete"
+    assert log_entry["details"]["bounded_coder_return_already_used"] is True
+
+
+async def test_completion_accept_gate_reruns_reviewer_when_evidence_type_mismatches_ledger(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -1779,13 +2370,15 @@ async def test_completion_accept_gate_returns_to_coder_when_evidence_type_mismat
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert "evidence type mismatch" in coder.messages[0]
-    assert "validation-3 declares static but ledger has behavioral" in coder.messages[0]
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "evidence type mismatch" in progress
+    assert "validation-3 declares static but ledger has behavioral" in progress
 
 
-async def test_completion_accept_gate_returns_to_coder_when_behavior_lacks_ledger_record(tmp_path: Path) -> None:
+async def test_completion_accept_gate_reruns_reviewer_when_behavior_lacks_ledger_record(tmp_path: Path) -> None:
     validations = [
         ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)
     ]
@@ -1798,11 +2391,12 @@ async def test_completion_accept_gate_returns_to_coder_when_behavior_lacks_ledge
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert "requested behavior" in coder.messages[0]
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    log_entry = json.loads(store.path(LOG).read_text(encoding="utf-8").splitlines()[-1])
-    assert log_entry["type"] == "completion_accept_gate_rejection"
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
+    assert "requested behavior" in store.path(PROGRESS).read_text(encoding="utf-8")
+    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
+    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_rejection")
     assert log_entry["check_name"] == "evidence_binding"
 
 
@@ -2009,6 +2603,126 @@ async def test_transport_error_writes_provider_failure_final_report(tmp_path: Pa
     assert "- Status: provider_failure" in text
     assert "app-server transport error" in text
     assert controller.running is False
+
+
+def test_attempt_image_build_includes_private_sentinel_python(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_container_runner()
+    captured: dict[str, list[str] | Path] = {}
+
+    def fake_copy_sentinel_source(src: Path, dest: Path) -> None:
+        captured["copied_from"] = src
+        dest.mkdir(parents=True)
+        (dest / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+
+    def fake_run(cmd: list[str], *, cwd: Path, log_path: Path) -> None:
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["log_path"] = log_path
+
+    monkeypatch.setattr(runner, "copy_sentinel_source", fake_copy_sentinel_source)
+    monkeypatch.setattr(runner, "run", fake_run)
+
+    runner.build_attempt_image(
+        base_image="example/base:latest",
+        attempt_image="attempt:test",
+        codex_version="0.0.0",
+        sentinel_src=tmp_path / "sentinel-src",
+        build_dir=tmp_path / "build",
+        platform="linux/amd64",
+    )
+
+    dockerfile = (tmp_path / "build" / "context" / "Dockerfile").read_text(encoding="utf-8")
+    assert "FROM python:3.11-slim-bullseye AS sentinel-python" in dockerfile
+    assert "FROM example/base:latest" in dockerfile
+    assert "COPY --from=sentinel-python /usr/local /opt/sentinel-python" in dockerfile
+    assert "/opt/sentinel-python/bin/python3.11" in dockerfile
+    assert "sys.version_info >= (3, 11)" in dockerfile
+    assert "Python >=3.11 required for sentinel venv" in dockerfile
+    assert captured["cmd"] == [
+        "docker",
+        "build",
+        "--platform",
+        "linux/amd64",
+        "-t",
+        "attempt:test",
+        str(tmp_path / "build" / "context"),
+    ]
+    assert captured["cwd"] == tmp_path / "build"
+
+
+def test_collect_rollouts_infers_pre_restart_coder_session_from_prompt(tmp_path: Path) -> None:
+    runner = _load_container_runner()
+    paths = runner.RunPaths(
+        root=tmp_path,
+        private=tmp_path / "private",
+        build=tmp_path / "build",
+        attempt=tmp_path / "attempt",
+        attempt_input=tmp_path / "attempt" / "input",
+        attempt_output=tmp_path / "attempt" / "output",
+        artifacts=tmp_path / "attempt" / "output" / "artifacts",
+        rollouts=tmp_path / "rollouts",
+        scoring=tmp_path / "scoring",
+    )
+    for path in paths.__dict__.values():
+        path.mkdir(parents=True, exist_ok=True)
+    supervisor_dir = paths.artifacts / ".supervisor"
+    supervisor_dir.mkdir(parents=True)
+    (supervisor_dir / "config.json").write_text(json.dumps({"coder_thread_id": "new-coder"}), encoding="utf-8")
+    (supervisor_dir / "supervisor_wakes.jsonl").write_text(
+        json.dumps({"thread_id": "supervisor-thread"}) + "\n",
+        encoding="utf-8",
+    )
+    sessions = paths.rollouts / "codex-home" / "sessions" / "2026" / "06" / "17"
+    sessions.mkdir(parents=True)
+
+    def write_rollout(thread_id: str, prompt: str) -> None:
+        (sessions / f"rollout-{thread_id}.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "timestamp": "2026-06-17T20:00:00.000Z",
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "cwd": "/app",
+                                "timestamp": "2026-06-17T20:00:00.000Z",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "timestamp": "2026-06-17T20:00:00.100Z",
+                            "type": "event_msg",
+                            "payload": {"type": "user_message", "message": prompt},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    write_rollout("old-coder", "You are the coding agent for this task. Read the task file first: /app/TASK.md")
+    write_rollout("new-coder", "ordinary follow-up")
+    write_rollout("supervisor-thread", '{"current_summary":"check","wake_sequence":1}')
+    write_rollout("preflight", "ordinary preflight")
+
+    summary = runner.collect_rollouts(
+        paths,
+        container_cwd="/app",
+        start_utc=datetime(2026, 6, 17, 19, 59, tzinfo=timezone.utc),
+        end_utc=datetime(2026, 6, 17, 20, 1, tzinfo=timezone.utc),
+    )
+
+    by_id = {item["id"]: item for item in summary["matched"]}
+    assert by_id["old-coder"]["bucket"] == "coder"
+    assert by_id["old-coder"]["role_hint"] == "coder"
+    assert by_id["new-coder"]["bucket"] == "coder"
+    assert by_id["supervisor-thread"]["bucket"] == "supervisor"
+    assert by_id["preflight"]["bucket"] == "other"
+    assert summary["coder_count"] == 2
+    assert summary["other_count"] == 1
 
 
 async def test_supervisor_turn_start_timeout_writes_provider_failure_final_report(tmp_path: Path) -> None:
@@ -2837,6 +3551,27 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     assert controller.running is False
 
 
+async def test_finalize_writes_report_and_status_before_terminal_shutdown(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    shutdown_seen = False
+
+    async def fake_prepare_terminal_shutdown(reason: str) -> None:
+        nonlocal shutdown_seen
+        shutdown_seen = True
+        assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+        report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+        assert "# Final Report" in report
+        assert "task complete" in report
+
+    controller._prepare_terminal_shutdown = fake_prepare_terminal_shutdown  # type: ignore[method-assign]
+
+    await controller.finalize("task complete", status=SentinelStatus.COMPLETE)
+
+    assert shutdown_seen is True
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.path(FINAL_REPORT).read_text(encoding="utf-8").strip()
+
+
 def test_run_async_cleanly_exits_zero_after_loop_cleanup() -> None:
     with pytest.raises(SystemExit) as exc_info:
         _run_async_cleanly(_async_noop())
@@ -2926,7 +3661,17 @@ class _RuntimeFakeSupervisor:
         return CompletionReviewDecision(
             decision="return",
             reason="not used",
+            uncovered_behaviors=[],
+            validation_gaps=["fake completion gap"],
+            claim_evidence_mismatches=[],
+            packet_or_access_limitations=[],
+            changed_test_risks=[],
             message_to_coder="not used",
+            persistent_decision=None,
+            progress_update=None,
+            clear_handoff=False,
+            display_message=None,
+            handoff=None,
             wake_sequence=packet.wake_sequence,
             generation=packet.generation,
         )
@@ -2978,6 +3723,54 @@ def _runtime_controller(tmp_path: Path) -> tuple[SentinelController, StateStore,
     controller._terminal_cleanup_started = False
     controller._command_output_chunks = {}
     return controller, store, fake
+
+
+async def test_controller_idle_guard_forces_completion_review_for_stalled_no_active_turn(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        active_turn_id = None
+
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def steer_or_start(self, message):
+            self.messages.append(message)
+            return "turn"
+
+    coder = FakeCoder()
+    controller.coder = coder
+    controller.running = True
+    controller._last_controller_activity_monotonic = 0.0
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "status": SentinelStatus.RUNNING,
+                "last_event_sequence": 17,
+                "active_coder_turn_id": None,
+            }
+        )
+    )
+
+    await controller._handle_controller_idle_guard(now=301.0)
+    await controller._supervisor_task
+
+    assert coder.messages == ["not used"]
+    assert coder.messages != [NO_MARKER_IDLE_NUDGE]
+    assert len(fake.completion_packets) == 1
+    log = store.path(LOG).read_text(encoding="utf-8")
+    assert '"type": "controller_idle_guard"' in log
+
+
+def _load_container_runner() -> ModuleType:
+    runner_path = Path(__file__).resolve().parents[1] / "scripts" / "run_sentinel_container_attempt.py"
+    spec = importlib.util.spec_from_file_location("run_sentinel_container_attempt", runner_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _covered_accept_decision(*, wake_sequence: int, validation_id: str = "validation-3") -> CompletionReviewDecision:

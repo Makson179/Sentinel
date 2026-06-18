@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from supervisor.schemas import (
     CompletionReviewDecision,
     CompletionReviewDecisionKind,
     DiffPacketLimits,
+    EvidenceProvenanceSummary,
     FinalReport,
     HealthDelta,
     HumanMessage,
@@ -42,6 +44,7 @@ from supervisor.schemas import (
     SupervisorWakePacket,
     TriggeringAction,
     ValidationOutput,
+    ValidationProvenance,
     ValidationRun,
 )
 from supervisor.schemas.models import ensure_relative_to
@@ -64,6 +67,8 @@ ACCEPT_GATE_CODER_CORRECTABLE = "coder-correctable"
 ACCEPT_GATE_AUDIT_FAILURE = "audit-failure"
 LARGE_DIFF_CHANGED_LINES_THRESHOLD = 500
 LARGE_DIFF_CHANGED_FILES_THRESHOLD = 10
+CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
+CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,19 @@ class AcceptGateResult:
 class RuntimeTriggerDecision:
     should_wake: bool
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EvidenceBindingIssue:
+    reason: str
+    kind: str
+    behavior: str | None = None
+    validation_id: str | None = None
+    validation_type: str | None = None
+    command: str | None = None
+    artifact_evidence_required: bool = False
+    coder_correctable: bool = False
+    bounded_coder_return_key: str | None = None
 
 
 class SentinelController:
@@ -149,6 +167,9 @@ class SentinelController:
         self._pending_completion_gate_rejection: dict[str, Any] | None = None
         self._current_accept_gate_rejection: dict[str, Any] | None = None
         self._terminal_cleanup_started = False
+        self._last_controller_activity_monotonic = time.monotonic()
+        self._idle_guard_fired_for_sequence: int | None = None
+        self._no_marker_completion_review_key: str | None = None
 
     async def run(self) -> None:
         self.initialize_state()
@@ -242,17 +263,67 @@ class SentinelController:
         while self.running:
             event_task = asyncio.create_task(self.event_queue.get())
             input_task = asyncio.create_task(self.tui.input_queue.get())
-            done, pending = await asyncio.wait({event_task, input_task}, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                {event_task, input_task},
+                timeout=CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
             for task in pending:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            if not done:
+                await self._handle_controller_idle_guard()
+                continue
             for done_task in done:
                 completed = done_task.result()
+                self._mark_controller_activity()
                 if isinstance(completed, ControllerEvent):
                     await self.handle_controller_event(completed)
                 elif isinstance(completed, UserCommand):
                     await self.handle_user_command(completed)
+
+    def _mark_controller_activity(self) -> None:
+        self._last_controller_activity_monotonic = time.monotonic()
+        self._idle_guard_fired_for_sequence = None
+
+    async def _handle_controller_idle_guard(self, *, now: float | None = None, force: bool = False) -> None:
+        if not self.running or getattr(self, "paused", False) or getattr(self, "_terminal_cleanup_started", False):
+            return
+        cfg = self.store.get_sentinel_config()
+        if cfg.active_coder_turn_id:
+            return
+        coder = getattr(self, "coder", None)
+        if coder is None:
+            await self.finalize(
+                "controller idle guard: no active coder session, no pending approvals, and no supervisor check",
+                status=SentinelStatus.PROVIDER_FAILURE,
+            )
+            return
+        if getattr(coder, "active_turn_id", None):
+            return
+        if getattr(self, "pending_approvals", None):
+            return
+        task = getattr(self, "_supervisor_task", None)
+        if task is not None and not task.done():
+            return
+        current_time = time.monotonic() if now is None else now
+        last_activity = getattr(self, "_last_controller_activity_monotonic", current_time)
+        if not force and current_time - last_activity < CONTROLLER_IDLE_GUARD_STALL_SECONDS:
+            return
+        sequence = cfg.last_event_sequence
+        if getattr(self, "_idle_guard_fired_for_sequence", None) == sequence:
+            return
+        self._idle_guard_fired_for_sequence = sequence
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "controller_idle_guard",
+                "sequence": sequence,
+                "reason": "running with no active coder turn, pending approval, or supervisor check",
+            }
+        )
+        await self._handle_no_marker_idle()
 
     async def handle_controller_event(self, event: ControllerEvent) -> None:
         try:
@@ -468,7 +539,7 @@ class SentinelController:
             await self._handle_coder_turn_completed(item_id=item_id)
 
     def _record_command_output_delta(self, method: str, params: dict[str, Any], *, item_id: str | None) -> None:
-        if method not in {"item/commandExecution/outputDelta", "command/exec/outputDelta", "process/outputDelta"}:
+        if not _is_command_output_delta_method(method):
             return
         if not item_id:
             return
@@ -528,6 +599,9 @@ class SentinelController:
                     completion_review=True,
                 )
             return
+        if message is not None and _reports_material_limitation(message.text):
+            await self._handle_coder_material_limitation(message)
+            return
         if message is not None and _has_malformed_readiness_marker(message.text):
             await self._steer_for_marker(
                 "Coder used a malformed readiness marker; require exact marker only after validation.",
@@ -547,6 +621,27 @@ class SentinelController:
             await self._handle_no_marker_idle()
             return
         self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
+
+    async def _handle_coder_material_limitation(self, message: CoderMessage) -> None:
+        cfg = self.store.get_sentinel_config()
+        summary = _material_limitation_summary(message.text)
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Coder reported material limitation without readiness marker: {summary}\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "coder/material_limitation",
+            reason=summary,
+        )
+        patch_health(
+            self.store,
+            HealthDelta(generation=cfg.generation, add_risk_signals=["coder_material_limitation"]),
+        )
+        await self.finalize(
+            f"escalated: coder reported material validation limitation without readiness marker: {summary}",
+            status=SentinelStatus.ESCALATED,
+        )
 
     async def _done_without_fresh_behavioral_validation(self) -> str | None:
         changed_files = await self.changed_files()
@@ -581,39 +676,26 @@ class SentinelController:
 
     async def _handle_no_marker_idle(self) -> None:
         cfg = self.store.get_sentinel_config()
-        max_nudges = getattr(cfg, "max_no_marker_idle_nudges", 2)
-        self.no_marker_idle_nudge_count = getattr(self, "no_marker_idle_nudge_count", 0)
-        if self.no_marker_idle_nudge_count < max_nudges:
-            self.no_marker_idle_nudge_count += 1
-            self.prior_interventions.append(
-                PriorIntervention(
-                    reason="Coder turn ended idle without readiness marker.",
-                    message_to_coder=NO_MARKER_IDLE_NUDGE,
-                    sequence=cfg.last_event_sequence,
-                )
-            )
-            self.prior_interventions = self.prior_interventions[-20:]
-            patch_health(self.store, HealthDelta(generation=cfg.generation, interventions=1))
-            self.tui.render("SUPERVISOR", "nudging coder for readiness marker or continued work")
-            if self.coder:
-                await self.coder.steer_or_start(NO_MARKER_IDLE_NUDGE)
+        if cfg.active_coder_turn_id:
             return
-        patch_health(
-            self.store,
-            HealthDelta(generation=cfg.generation, add_risk_signals=["no_marker_idle_loop"]),
+        latest_validation_sequence = max((validation.sequence for validation in self.validations), default=None)
+        last_message_sequence = self.last_coder_message.sequence if self.last_coder_message is not None else None
+        review_key = f"{cfg.generation}:{last_message_sequence}:{latest_validation_sequence}"
+        if getattr(self, "_no_marker_completion_review_key", None) == review_key:
+            return
+        self._no_marker_completion_review_key = review_key
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Controller forcing completion_review: coder is idle with no active turn and no readiness marker.\n",
         )
-        candidate, candidate_reason = kill_restart_candidate(self.store.get_health())
-        if candidate and cfg.restart_count < cfg.max_restarts:
-            handoff = _fallback_restart_handoff(
-                task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else cfg.task_path,
-                reason=candidate_reason or "coder repeatedly idled without readiness marker",
-                last_actions=self.store.read_recent_actions(10),
-            )
-            await self.restart(candidate_reason or "coder repeatedly idled without readiness marker", handoff=handoff)
-            return
-        await self.finalize(
-            "escalated: coder repeatedly idled without readiness marker or progress",
-            status=SentinelStatus.ESCALATED,
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "completion/no_marker_idle_review",
+            reason="coder idle with no active turn and no readiness marker",
+        )
+        self._schedule_supervisor_check(
+            "Coder is idle with no active turn and no readiness marker. Run completion_review on the current state.",
+            completion_review=True,
         )
 
     async def pause(self) -> None:
@@ -688,7 +770,6 @@ class SentinelController:
         status: SentinelStatus = SentinelStatus.COMPLETE,
         completion_review_accepted: bool = False,
     ) -> None:
-        await self._prepare_terminal_shutdown(result)
         self._reconcile_intervention_accounting()
         diff = await self.diff_summary()
         changed_files = await self.changed_files()
@@ -698,7 +779,8 @@ class SentinelController:
             task_path=str(self.task_path),
             status=status,
             result=result,
-            files_changed=[file.path for file in changed_files] or _changed_files_from_diff_summary(diff),
+            files_changed=[file.path for file in changed_files]
+            or _changed_files_from_diff_summary(diff, project_root=self.project_root, task_path=self.task_path),
             validations=[_format_validation(validation) for validation in self.validations],
             denied_actions=[],
             interventions=health.interventions,
@@ -721,6 +803,7 @@ class SentinelController:
         self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": status}))
         self.tui.render("SUPERVISOR", result)
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
+        await self._prepare_terminal_shutdown(result)
         self.running = False
         self._wake_event_loop_for_shutdown()
 
@@ -1007,6 +1090,7 @@ class SentinelController:
                 patch_summary,
                 completion_review,
             )
+            self._mark_controller_activity()
             if not self._supervisor_dirty:
                 return
             if not self.running:
@@ -1048,6 +1132,11 @@ class SentinelController:
             completion_details = await self.completion_packet_details(
                 changed_files,
                 since_sequence=completion_payload_since_sequence,
+            )
+            completion_details["evidence_provenance_summary"] = _evidence_provenance_summary(
+                validations=list(self.validations),
+                changed_files=changed_files,
+                latest_change_sequence=latest_change_sequence,
             )
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
@@ -1355,11 +1444,24 @@ class SentinelController:
 
         binding_issue = _accept_evidence_binding_issue(decision, validations, latest_change=latest_change)
         if binding_issue is not None:
+            details = _evidence_binding_issue_details(binding_issue)
+            failure_type = (
+                ACCEPT_GATE_CODER_CORRECTABLE
+                if binding_issue.coder_correctable
+                else ACCEPT_GATE_REVIEWER_INCOMPLETE
+            )
+            if (
+                failure_type == ACCEPT_GATE_CODER_CORRECTABLE
+                and self._bounded_accept_gate_coder_return_used("evidence_binding", details)
+            ):
+                failure_type = ACCEPT_GATE_REVIEWER_INCOMPLETE
+                details["bounded_coder_return_already_used"] = True
             return AcceptGateResult(
                 passed=False,
-                failure_type=ACCEPT_GATE_CODER_CORRECTABLE,
+                failure_type=failure_type,
                 check_name="evidence_binding",
-                reason=binding_issue,
+                reason=binding_issue.reason,
+                details=details,
             )
         passed_checks.append("evidence_binding")
 
@@ -1487,6 +1589,24 @@ class SentinelController:
             lambda current: current.model_copy(update={field: getattr(current, field, 0) + 1})
         )
 
+    def _bounded_accept_gate_coder_return_used(self, check_name: str, details: dict[str, Any]) -> bool:
+        key = details.get("bounded_coder_return_key")
+        if not key:
+            return False
+        for record in getattr(self, "completion_returns", []):
+            if isinstance(record, CompletionReturnRecord):
+                gate_context = record.accept_gate_details
+            elif isinstance(record, dict):
+                gate_context = record.get("accept_gate_details") or {}
+            else:
+                continue
+            if not isinstance(gate_context, dict) or gate_context.get("check_name") != check_name:
+                continue
+            previous_details = gate_context.get("details") if isinstance(gate_context.get("details"), dict) else {}
+            if previous_details.get("bounded_coder_return_key") == key:
+                return True
+        return False
+
     async def _return_completion_to_coder(self, decision: CompletionReviewDecision) -> None:
         cfg = self.store.get_sentinel_config()
         record = CompletionReturnRecord(
@@ -1575,6 +1695,12 @@ class SentinelController:
         for command in commands:
             output = await self._git_output(command)
             if output is not None:
+                output = _filter_internal_git_output(
+                    output,
+                    command=command,
+                    project_root=self.project_root,
+                    task_path=self.task_path,
+                )
                 parts.append(f"$ {' '.join(command)}\n{output}")
         return "\n\n".join(parts)
 
@@ -1595,7 +1721,7 @@ class SentinelController:
             path = _path_from_git_status_line(line)
             if " -> " in path:
                 path = path.rsplit(" -> ", 1)[1].strip()
-            if path:
+            if path and not _is_internal_runtime_path(path, project_root=self.project_root, task_path=self.task_path):
                 files[path] = ChangedFile(path=path, status=status)
         for line in (numstat_text or "").splitlines():
             parts = line.split("\t")
@@ -1606,7 +1732,7 @@ class SentinelController:
             path = parts[2].strip()
             if " => " in path:
                 path = path.rsplit(" => ", 1)[1].strip("{}")
-            if not path:
+            if not path or _is_internal_runtime_path(path, project_root=self.project_root, task_path=self.task_path):
                 continue
             existing = files.get(path)
             status = existing.status if existing else "modified"
@@ -1627,7 +1753,7 @@ class SentinelController:
             self.observed_changed_files = observed
         for raw_path in action.paths:
             path = _workspace_display_path(self.project_root, raw_path)
-            if path and not path.startswith(".supervisor/"):
+            if path and not _is_internal_runtime_path(path, project_root=self.project_root, task_path=self.task_path):
                 observed[path] = ChangedFile(path=path, status="modified", sequence=getattr(self, "_sequence", None))
 
     async def _is_git_work_tree(self) -> bool:
@@ -1986,6 +2112,8 @@ def _validation_from_action(
 
 
 def _classify_validation_command(command: str, *, changed_paths: list[str]) -> str | None:
+    if _is_git_inspection_command(command):
+        return "static" if _is_git_diff_check_command(command) else None
     if _is_static_validation_command(command):
         return "static"
     if _is_behavioral_validation_command(command):
@@ -2015,6 +2143,18 @@ def _is_static_validation_command(command: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
+def _is_git_inspection_command(command: str) -> bool:
+    lowered = command.lower()
+    pattern = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*git\s+(diff|status|log|show|branch|remote|rev-parse|for-each-ref)\b"
+    return bool(re.search(pattern, lowered))
+
+
+def _is_git_diff_check_command(command: str) -> bool:
+    lowered = command.lower()
+    pattern = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*git\s+diff(?:\s+[^;&|()'\"]+)*\s+--check(\s|$)"
+    return bool(re.search(pattern, lowered))
+
+
 def _is_behavioral_validation_command(command: str) -> bool:
     lowered = command.lower()
     executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
@@ -2025,7 +2165,7 @@ def _is_behavioral_validation_command(command: str) -> bool:
         r"(^|[\s;&|()'\"])(node|nodejs)\s+--test(\s|$)",
         r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
         executable_prefix + r"(jest|ava|tap|vitest|playwright|cypress|pytest|tox|rspec)(\s|$)",
-        r"(^|[\s;&|()'\"])(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
+        executable_prefix + r"(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
     )
     return any(re.search(pattern, lowered) for pattern in patterns) or _is_test_wrapper_script_command(command)
 
@@ -2074,10 +2214,23 @@ def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool
     )
     return (
         _is_direct_script_execution_command(command)
+        or _is_stdin_script_demo_command(command)
         or _command_requires_changed_module(command, changed_paths)
         or any(re.search(pattern, lowered) for pattern in inline_patterns)
         or any(re.search(pattern, lowered) for pattern in http_patterns)
     )
+
+
+def _is_stdin_script_demo_command(command: str) -> bool:
+    lowered = command.lower()
+    if "<<" not in lowered:
+        return False
+    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    patterns = (
+        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-?\s*<<",
+        r"(^|[\s;&|()'\"])(node|nodejs|ruby|bash|sh|zsh)\s+-?\s*<<",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
 
 
 def _command_requires_changed_module(command: str, changed_paths: list[str]) -> bool:
@@ -2089,7 +2242,7 @@ def _command_requires_changed_module(command: str, changed_paths: list[str]) -> 
     normalized_command = lowered.replace("\\", "/")
     for raw_path in changed_paths:
         path = raw_path.replace("\\", "/").lstrip("./").lower()
-        if not path or path.startswith(".supervisor/"):
+        if not path or _is_internal_runtime_path(path, project_root=None, task_path=None):
             continue
         candidates = {path}
         if path.endswith((".js", ".ts", ".jsx", ".tsx", ".py", ".rb")):
@@ -2126,7 +2279,10 @@ def _item_with_recorded_output(item: Any, output: str) -> Any:
     if not output or not isinstance(item, dict):
         return item
     existing = _command_output_from_item(item)
-    merged = output if not existing else f"{existing}\n{output}"
+    if existing.strip() == output.strip():
+        merged = existing
+    else:
+        merged = output if not existing else f"{existing}\n{output}"
     enriched = dict(item)
     enriched["output"] = merged
     return enriched
@@ -2279,6 +2435,23 @@ def _test_names_from_output(output: str, *, limit: int = 50) -> list[str]:
 
 def _test_files_from_output(output: str, *, limit: int = 100) -> list[str]:
     files: list[str] = []
+    runner_patterns = (
+        # Jest/Vitest style suite lines. Prefer these over the broad fallback so stack traces
+        # through test helpers do not look like independently executed test files.
+        r"(?m)^\s*(?:PASS|FAIL)\s+((?:\.{0,2}/)?[\w@+./-]+\.(?:py|js|jsx|ts|tsx|mjs|cjs|rb|go|rs|java|cs|php|vue|svelte|snap|snapshot|golden))\b",
+        # Pytest verbose output.
+        r"(?m)^\s*((?:\.{0,2}/)?[\w@+./-]+\.py)::[^\s]+\s+(?:PASSED|FAILED|SKIPPED|XFAIL|XPASS|ERROR)\b",
+    )
+    for pattern in runner_patterns:
+        for match in re.finditer(pattern, output):
+            path = _normalize_output_test_path(match.group(1))
+            if path and _file_kind(path) == "test":
+                files.append(path)
+            if len(files) >= limit:
+                return list(dict.fromkeys(files))[:limit]
+    if files:
+        return list(dict.fromkeys(files))[:limit]
+
     path_pattern = re.compile(
         r"(?<![\w./-])((?:\.{0,2}/)?[\w@+./-]*(?:test|spec|tests|__tests__|snapshots|__snapshots__|golden|goldens)"
         r"[\w@+./-]*\.(?:py|js|jsx|ts|tsx|mjs|cjs|rb|go|rs|java|cs|php|snap|snapshot|golden))"
@@ -2351,7 +2524,7 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
         key_text = str(key).lower()
         if key_text in {"output", "stdout", "stderr", "text", "content", "message", "summary"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
-        elif key_text in {"outputs", "chunks", "lines", "items"}:
+        elif key_text in {"outputs", "chunks", "lines", "items", "result", "results"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
 
 
@@ -2376,6 +2549,8 @@ def _has_readiness_marker(text: str) -> bool:
 def _has_malformed_readiness_marker(text: str) -> bool:
     if _has_readiness_marker(text):
         return False
+    if _readiness_reference_is_negated(text):
+        return False
     lowered = text.lower()
     compact = re.sub(r"[\s_\-]+", "_", lowered)
     return any(
@@ -2389,7 +2564,61 @@ def _has_malformed_readiness_marker(text: str) -> bool:
     )
 
 
+def _readiness_reference_is_negated(text: str) -> bool:
+    lowered = " ".join(text.lower().split())
+    marker = r"(?:sentinel[\s_`'\-]*ready[\s_`'\-]*for[\s_`'\-]*review|ready[\s_`'\-]*for[\s_`'\-]*review|readiness marker)"
+    negator = r"(?:do not|don't|not|cannot|can't|will not|won't|without|no)"
+    return bool(re.search(rf"\b{negator}\b.{{0,120}}\b{marker}\b", lowered))
+
+
+def _reports_material_limitation(text: str) -> bool:
+    lowered = " ".join(text.lower().split())
+    markers = (
+        "material limitation",
+        "validation limitation",
+        "independent behavioral evidence is still missing",
+        "independent behavioral evidence is missing",
+        "independent evidence is still missing",
+        "independent evidence is missing",
+        "no untouched output-identified",
+        "no compliant next validation step",
+        "no compliant validation step",
+        "cannot provide independent",
+        "can't provide independent",
+        "not ready under the independent-evidence requirement",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _material_limitation_summary(text: str) -> str:
+    lines = [line.strip(" `\t\r\n-*") for line in text.splitlines()]
+    candidates = [line for line in lines if line]
+    preferred_prefixes = ("material limitation", "validation limitation")
+    for line in candidates:
+        if line.lower().startswith(preferred_prefixes):
+            return _truncate_summary(line)
+    for line in candidates:
+        lowered = line.lower()
+        if (
+            "independent" in lowered
+            or "no untouched" in lowered
+            or "no compliant" in lowered
+            or "not ready" in lowered
+        ):
+            return _truncate_summary(line)
+    return _truncate_summary(candidates[0] if candidates else "coder reported a material limitation")
+
+
+def _truncate_summary(text: str, *, limit: int = 280) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1].rstrip() + "..."
+
+
 def _appears_to_claim_readiness(text: str) -> bool:
+    if _reports_material_limitation(text) or _readiness_reference_is_negated(text):
+        return False
     lowered = " ".join(text.lower().split())
     phrases = (
         "done",
@@ -2577,7 +2806,7 @@ def _accept_evidence_binding_issue(
     validations: list[ValidationRun],
     *,
     latest_change: int | None,
-) -> str | None:
+) -> EvidenceBindingIssue | None:
     by_id = {validation.validation_id: validation for validation in validations}
     for row in decision.behavior_evidence_matrix:
         if row.status != "covered":
@@ -2600,18 +2829,48 @@ def _accept_evidence_binding_issue(
                 break
         if not fresh_pass_found:
             if not linked_evidence_found:
-                return f"behavior '{row.behavior}' is covered but has no evidence linked by validation_id"
+                return EvidenceBindingIssue(
+                    reason=f"behavior '{row.behavior}' is covered but has no evidence linked by validation_id",
+                    kind="missing_linked_evidence",
+                    behavior=row.behavior,
+                )
             type_mismatch = _evidence_type_mismatch(row.evidence, by_id)
             if type_mismatch:
-                return f"behavior '{row.behavior}' evidence type mismatch: {type_mismatch}"
-            demo_output_issue = _behavior_demo_output_issue(row.evidence, by_id, latest_change=latest_change)
+                return EvidenceBindingIssue(
+                    reason=f"behavior '{row.behavior}' evidence type mismatch: {type_mismatch}",
+                    kind="type_mismatch",
+                    behavior=row.behavior,
+                )
+            demo_output_issue = _behavior_demo_output_issue(
+                row.evidence,
+                by_id,
+                latest_change=latest_change,
+                behavior=row.behavior,
+            )
             if demo_output_issue:
-                return f"behavior '{row.behavior}' {demo_output_issue}"
-            return (
-                f"behavior '{row.behavior}' is covered but has no linked fresh passing validation "
-                "record in the ledger"
+                return demo_output_issue
+            return EvidenceBindingIssue(
+                reason=(
+                    f"behavior '{row.behavior}' is covered but has no linked fresh passing validation "
+                    "record in the ledger"
+                ),
+                kind="no_fresh_linked_validation",
+                behavior=row.behavior,
             )
     return None
+
+
+def _evidence_binding_issue_details(issue: EvidenceBindingIssue) -> dict[str, Any]:
+    return {
+        "kind": issue.kind,
+        "behavior": issue.behavior,
+        "validation_id": issue.validation_id,
+        "validation_type": issue.validation_type,
+        "command": issue.command,
+        "artifact_evidence_required": issue.artifact_evidence_required,
+        "coder_correctable": issue.coder_correctable,
+        "bounded_coder_return_key": issue.bounded_coder_return_key,
+    }
 
 
 def _validation_has_captured_output(validation: ValidationRun) -> bool:
@@ -2623,7 +2882,8 @@ def _behavior_demo_output_issue(
     validations_by_id: dict[str, ValidationRun],
     *,
     latest_change: int | None,
-) -> str | None:
+    behavior: str,
+) -> EvidenceBindingIssue | None:
     for evidence in evidence_items:
         if not evidence.validation_id:
             continue
@@ -2633,8 +2893,50 @@ def _behavior_demo_output_issue(
         if not _validation_is_fresh_pass(validation, latest_change):
             continue
         if not _validation_has_captured_output(validation):
-            return f"behavior_demo evidence {evidence.validation_id} has no captured output"
+            artifact_required = _looks_like_artifact_generator_evidence(
+                behavior=behavior,
+                command=validation.command,
+                evidence=evidence,
+            )
+            return EvidenceBindingIssue(
+                reason=f"behavior '{behavior}' behavior_demo evidence {evidence.validation_id} has no captured output",
+                kind="behavior_demo_missing_output",
+                behavior=behavior,
+                validation_id=evidence.validation_id,
+                validation_type="behavior_demo",
+                command=validation.command,
+                artifact_evidence_required=artifact_required,
+                coder_correctable=True,
+                bounded_coder_return_key=f"behavior_demo_missing_output:{behavior}:{evidence.validation_id}",
+            )
     return None
+
+
+def _looks_like_artifact_generator_evidence(*, behavior: str, command: str | None, evidence: Any) -> bool:
+    text_parts = [
+        behavior or "",
+        command or "",
+        str(getattr(evidence, "command", "") or ""),
+        str(getattr(evidence, "why_it_covers_behavior", "") or ""),
+    ]
+    lowered = " ".join(text_parts).lower()
+    tokens = (
+        "artifact",
+        "generated",
+        "generator",
+        "generate",
+        "regen",
+        "transform",
+        "docs",
+        "doc/",
+        "doc\\",
+        "documentation",
+        "asciidoc",
+        "markdown",
+        "snapshot",
+        "golden",
+    )
+    return any(token in lowered for token in tokens)
 
 
 def _evidence_type_mismatch(evidence_items: list[Any], validations_by_id: dict[str, ValidationRun]) -> str | None:
@@ -2660,16 +2962,14 @@ def _self_confirming_test_evidence_issue(
 ) -> dict[str, Any] | None:
     if packet is None:
         return None
-    surfaces = _coder_authored_test_surfaces(packet)
-    if not surfaces:
+    changed_test_files = _changed_test_files(packet.changed_files)
+    if not changed_test_files:
         return None
+    changed_test_identities = _changed_test_file_identity_map(changed_test_files)
     validations_by_id = {validation.validation_id: validation for validation in validations}
     behavior_issues: list[dict[str, Any]] = []
     for row in decision.behavior_evidence_matrix:
         if row.status != "covered":
-            continue
-        relevant_surfaces = _relevant_coder_authored_test_surfaces(row, surfaces, packet.changed_files)
-        if not relevant_surfaces:
             continue
         independent_found = False
         self_confirming_validations: list[dict[str, Any]] = []
@@ -2705,12 +3005,11 @@ def _self_confirming_test_evidence_issue(
                     )
                 )
                 continue
-            coder_authored_files = [
-                path
-                for path in executed_files
-                if _test_file_is_coder_authored_for_behavior(path, relevant_surfaces)
-            ]
-            if len(coder_authored_files) < len(executed_files):
+            coder_authored_files, untouched_files = _partition_executed_test_files(
+                executed_files,
+                changed_test_identities=changed_test_identities,
+            )
+            if untouched_files:
                 independent_found = True
                 break
             self_confirming_validations.append(
@@ -2727,7 +3026,7 @@ def _self_confirming_test_evidence_issue(
             {
                 "behavior": row.behavior,
                 "requirement": "independent_evidence_binding",
-                "coder_authored_test_surfaces": relevant_surfaces,
+                "coder_authored_test_files": changed_test_files,
                 "self_confirming_validations": self_confirming_validations,
             }
         )
@@ -2999,6 +3298,9 @@ def _completion_accept_rejection_decision(
     if check_name == "self_confirming_test_evidence" and details:
         validation_gaps.extend(_self_confirming_validation_gaps(details, fallback_reason=reason))
         message_to_coder = _self_confirming_message_to_coder(details, fallback_reason=reason)
+    elif check_name == "evidence_binding" and details and details.get("kind") == "behavior_demo_missing_output":
+        validation_gaps.extend(_evidence_binding_validation_gaps(details, fallback_reason=reason))
+        message_to_coder = _evidence_binding_message_to_coder(details, fallback_reason=reason)
     else:
         validation_gaps.append(f"Controller accept-gate rejection ({check_name}): {reason}")
         message_to_coder = (
@@ -3054,10 +3356,63 @@ def _completion_gate_followup_summary(context: dict[str, Any]) -> str:
             "or a behavior_demo with factual captured output/state; compare that output to task_contents "
             "and bind accepted behavior_evidence_matrix rows to its validation_id before accepting."
         )
+    if check_name == "evidence_binding":
+        return (
+            "Coder provided exact readiness marker after deterministic accept-gate return. "
+            f"Previous gate rejection: evidence_binding failed: {reason}. Repair the "
+            "behavior_evidence_matrix: each covered behavior must cite a validation_id present in the "
+            "ledger with matching validation_type and a fresh passing trusted outcome. If no ledger "
+            "validation actually covers the behavior, return to the coder with the concrete validation gap."
+        )
     return (
         "Coder provided exact readiness marker after deterministic accept-gate return. "
         f"Previous gate rejection: {check_name} failed: {reason}."
     )
+
+
+def _evidence_binding_validation_gaps(details: dict[str, Any], *, fallback_reason: str) -> list[str]:
+    behavior = str(details.get("behavior") or "<unnamed behavior>")
+    validation_id = str(details.get("validation_id") or "<unknown validation>")
+    if details.get("artifact_evidence_required"):
+        return [
+            (
+                f"behavior '{behavior}' is bound to {validation_id}, but that behavior_demo has no captured "
+                "produced-artifact output; provide full artifact diff or all objective changed hunks"
+            )
+        ]
+    return [
+        (
+            f"behavior '{behavior}' is bound to {validation_id}, but that behavior_demo has no captured "
+            f"factual output/state: {fallback_reason}"
+        )
+    ]
+
+
+def _evidence_binding_message_to_coder(details: dict[str, Any], *, fallback_reason: str) -> str:
+    behavior = str(details.get("behavior") or "<unnamed behavior>")
+    validation_id = str(details.get("validation_id") or "<unknown validation>")
+    command = str(details.get("command") or "<unknown command>")
+    lines = [
+        "Continue working. Completion accept was rejected by the deterministic accept gate evidence_binding.",
+        f"Behavior missing usable evidence: {behavior}",
+        f"Invalid evidence: {validation_id} from command `{command}` had no captured output.",
+    ]
+    if details.get("artifact_evidence_required"):
+        lines.append(
+            "For generated/docs/static artifact behavior, produce raw artifact evidence by rerunning the "
+            "generator/transform step and capturing the produced artifact as a full diff. If the full diff is "
+            "too large, capture all changed hunks selected by the diff itself. Do not provide a hand-picked "
+            "grep/sed snippet, PASS/OK, or a narrative conclusion as the evidence."
+        )
+    else:
+        lines.append(
+            "Provide a behavior_demo with raw factual observed output/state for this behavior, such as rendered "
+            "DOM, a function return value, CLI output for scenario inputs, or an HTTP response body. Do not use "
+            "a bare PASS/OK/self-verdict or a wrapper around changed tests as the demo."
+        )
+    lines.append(f"Gate reason: {fallback_reason}")
+    lines.append("Then use the exact readiness marker on its own line.")
+    return _bounded_text("\n".join(lines), limit=3000)
 
 
 def _self_confirming_validation_gaps(details: dict[str, Any], *, fallback_reason: str) -> list[str]:
@@ -3436,6 +3791,7 @@ def _file_kind(path: str) -> str:
         or ".snap." in name
         or ".snapshot." in name
         or ".golden." in name
+        or re.search(r"(?:^|[._-])(test|tests|spec|specs|case|cases)(?:\.[^.]+)+$", name)
         or name.startswith("test_")
         or name.endswith("_test.py")
         or name.endswith("_spec.rb")
@@ -3629,6 +3985,216 @@ def _validation_output(validation: ValidationRun) -> ValidationOutput:
     )
 
 
+def _evidence_provenance_summary(
+    *,
+    validations: list[ValidationRun],
+    changed_files: list[ChangedFile],
+    latest_change_sequence: int | None,
+) -> EvidenceProvenanceSummary:
+    changed_test_files = _changed_test_files(changed_files)
+    return EvidenceProvenanceSummary(
+        latest_relevant_change_sequence=latest_change_sequence,
+        changed_test_files=changed_test_files,
+        validations=[
+            _validation_provenance(
+                validation,
+                changed_test_files=changed_test_files,
+                latest_change_sequence=latest_change_sequence,
+            )
+            for validation in validations[-VALIDATION_LEDGER_LIMIT:]
+        ],
+    )
+
+
+def _changed_test_files(changed_files: list[ChangedFile]) -> list[str]:
+    files = [
+        _normalize_review_path(changed.path)
+        for changed in changed_files
+        if _file_kind(changed.path) == "test"
+    ]
+    return list(dict.fromkeys(path for path in files if path))
+
+
+def _changed_test_file_identity_map(changed_test_files: list[str]) -> dict[str, str]:
+    identities: dict[str, str] = {}
+    for path in changed_test_files:
+        identity = _canonical_test_file_identity(path)
+        if identity and identity not in identities:
+            identities[identity] = path
+    return identities
+
+
+def _partition_executed_test_files(
+    executed_files: list[str],
+    *,
+    changed_test_identities: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    coder_authored_files: list[str] = []
+    untouched_files: list[str] = []
+    for path in executed_files:
+        identity = _canonical_test_file_identity(path)
+        changed_path = changed_test_identities.get(identity)
+        if changed_path:
+            coder_authored_files.append(changed_path)
+        else:
+            untouched_files.append(path)
+    return list(dict.fromkeys(coder_authored_files)), list(dict.fromkeys(untouched_files))
+
+
+def _canonical_test_file_identity(path: str) -> str:
+    normalized = _normalize_review_path(path)
+    if not normalized:
+        return ""
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return ""
+    name = parts[-1]
+    stem = _strip_test_path_extensions(name)
+    if not stem:
+        stem = name
+    prefix = "/".join(parts[:-1])
+    identity = f"{prefix}/{stem}" if prefix else stem
+    return identity.lower()
+
+
+def _validation_provenance(
+    validation: ValidationRun,
+    *,
+    changed_test_files: list[str],
+    latest_change_sequence: int | None,
+) -> ValidationProvenance:
+    executed_files = list(dict.fromkeys(_normalize_review_path(path) for path in validation.executed_test_files if path))
+    coder_authored_files, untouched_files = _partition_executed_test_files(
+        executed_files,
+        changed_test_identities=_changed_test_file_identity_map(changed_test_files),
+    )
+    captured_output = validation.captured_output or ""
+    captured_output_present = bool(captured_output.strip())
+    fresh = None if latest_change_sequence is None else validation.sequence > latest_change_sequence
+    output_kind = _validation_output_kind(validation, captured_output_present=captured_output_present)
+    independence_class, risk_reasons = _validation_independence(
+        validation,
+        fresh_after_latest_relevant_change=fresh,
+        captured_output_present=captured_output_present,
+        output_kind=output_kind,
+        executed_test_files=executed_files,
+        coder_authored_test_files=coder_authored_files,
+        untouched_executed_test_files=untouched_files,
+    )
+    return ValidationProvenance(
+        validation_id=validation.validation_id,
+        command=validation.command,
+        type=validation.type,
+        passed=validation.outcome == "pass" and validation.passed,
+        trusted_validation_outcome=validation.trusted_validation_outcome,
+        sequence=validation.sequence,
+        fresh_after_latest_relevant_change=fresh,
+        captured_output_present=captured_output_present,
+        output_identifies_test_files=bool(executed_files),
+        executed_test_files=executed_files,
+        coder_authored_test_files=coder_authored_files,
+        untouched_executed_test_files=untouched_files,
+        target_files_or_test_files=validation.target_files_or_test_files
+        or _target_files_or_test_files(validation.command),
+        output_kind=output_kind,
+        independence_class=independence_class,
+        risk_reasons=risk_reasons,
+    )
+
+
+def _validation_output_kind(
+    validation: ValidationRun,
+    *,
+    captured_output_present: bool,
+) -> str:
+    if validation.type == "static":
+        return "not_applicable"
+    if not captured_output_present:
+        return "missing"
+    if validation.type == "behavioral":
+        if validation.executed_test_files or validation.passed_count is not None or validation.failed_count is not None:
+            return "test_runner_output"
+        return "unknown"
+    if validation.type == "behavior_demo":
+        if _captured_output_looks_like_test_runner(validation.captured_output):
+            return "test_runner_output"
+        if _captured_output_is_self_verdict_only(validation.captured_output):
+            return "self_verdict_only"
+        return "factual_observation_candidate"
+    return "unknown"
+
+
+def _validation_independence(
+    validation: ValidationRun,
+    *,
+    fresh_after_latest_relevant_change: bool | None,
+    captured_output_present: bool,
+    output_kind: str,
+    executed_test_files: list[str],
+    coder_authored_test_files: list[str],
+    untouched_executed_test_files: list[str],
+) -> tuple[str, list[str]]:
+    risk_reasons: list[str] = []
+    if validation.trusted_validation_outcome == "masked_or_unknown":
+        risk_reasons.append(validation.masking_reason or "masked_or_unknown_validation")
+        return "masked_or_unknown", risk_reasons
+    if validation.outcome != "pass" or not validation.passed or validation.trusted_validation_outcome != "passed":
+        risk_reasons.append("failed_validation")
+        return "failed", risk_reasons
+    if fresh_after_latest_relevant_change is False:
+        risk_reasons.append("stale_after_latest_relevant_change")
+        return "stale", risk_reasons
+    if validation.type == "static":
+        risk_reasons.append("static_validation_not_behavioral_evidence")
+        return "not_independent", risk_reasons
+    if validation.type == "behavior_demo":
+        if not captured_output_present:
+            risk_reasons.append("behavior_demo_missing_captured_output")
+            return "not_independent", risk_reasons
+        if output_kind == "self_verdict_only":
+            risk_reasons.append("behavior_demo_self_verdict_only")
+            return "not_independent", risk_reasons
+        if output_kind == "test_runner_output":
+            risk_reasons.append("behavior_demo_looks_like_test_runner_output")
+            return "not_independent", risk_reasons
+        return "independent_candidate", risk_reasons
+    if validation.type == "behavioral":
+        if not executed_test_files:
+            risk_reasons.append("unknown_test_file_provenance")
+            return "unknown", risk_reasons
+        if untouched_executed_test_files:
+            return "independent", risk_reasons
+        if coder_authored_test_files and len(coder_authored_test_files) == len(executed_test_files):
+            risk_reasons.append("all_output_identified_tests_were_coder_authored")
+            return "self_confirming", risk_reasons
+        risk_reasons.append("unknown_test_file_provenance")
+        return "unknown", risk_reasons
+    return "unknown", risk_reasons
+
+
+def _captured_output_is_self_verdict_only(output: str) -> bool:
+    lines = [line.strip().strip(".!").lower() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return False
+    verdict_pattern = re.compile(
+        r"^(?:pass(?:ed)?|ok|success(?:ful)?|works?|correct|done|green|valid|all good)$"
+    )
+    return all(verdict_pattern.fullmatch(line) for line in lines)
+
+
+def _captured_output_looks_like_test_runner(output: str) -> bool:
+    text = output.strip()
+    if not text:
+        return False
+    patterns = (
+        r"(?m)^\s*(?:PASS|FAIL)\s+[\w@+./-]+",
+        r"(?m)\b[\w@+./-]+::test_[\w.\[\]-]+\s+(?:PASSED|FAILED|SKIPPED|XFAIL|XPASS)\b",
+        r"(?i)\b\d+\s+(?:passed|passing|failed|failing|skipped)\b",
+        r"(?i)\btest result:\s+(?:ok|failed)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def _detect_test_names(text: str, *, limit: int = 50) -> list[str]:
     names: list[str] = []
     patterns = (
@@ -3775,7 +4341,13 @@ def _observed_changed_files(controller: Any) -> list[ChangedFile]:
     observed = getattr(controller, "observed_changed_files", None)
     if not isinstance(observed, dict):
         return []
-    return list(observed.values())[:200]
+    project_root = getattr(controller, "project_root", None)
+    task_path = getattr(controller, "task_path", None)
+    return [
+        changed
+        for changed in observed.values()
+        if not _is_internal_runtime_path(changed.path, project_root=project_root, task_path=task_path)
+    ][:200]
 
 
 def _path_from_git_status_line(line: str) -> str:
@@ -3799,6 +4371,84 @@ def _workspace_display_path(project_root: Path, raw_path: str) -> str:
         return str(path.resolve().relative_to(project_root.resolve()))
     except ValueError:
         return raw_path
+
+
+def _is_internal_runtime_path(path: str, *, project_root: Path | None, task_path: Path | str | None) -> bool:
+    normalized = _normalize_internal_workspace_path(str(path).strip().strip("'\""))
+    if not normalized:
+        return False
+    if normalized == ".supervisor" or normalized.startswith(".supervisor/"):
+        return True
+    task_relative = _task_relative_workspace_path(project_root=project_root, task_path=task_path)
+    return bool(task_relative and normalized == task_relative)
+
+
+def _task_relative_workspace_path(*, project_root: Path | None, task_path: Path | str | None) -> str | None:
+    if task_path is None:
+        return None
+    task = Path(task_path)
+    if project_root is not None:
+        try:
+            task = task.resolve()
+            return _normalize_internal_workspace_path(str(task.relative_to(Path(project_root).resolve())))
+        except (OSError, ValueError):
+            pass
+    if task.is_absolute():
+        return _normalize_internal_workspace_path(task.name)
+    return _normalize_internal_workspace_path(str(task))
+
+
+def _normalize_internal_workspace_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def _filter_internal_git_output(
+    output: str,
+    *,
+    command: list[str],
+    project_root: Path,
+    task_path: Path,
+) -> str:
+    if not output:
+        return output
+    if command[:2] == ["git", "status"]:
+        lines = [
+            line
+            for line in output.splitlines()
+            if not _is_internal_runtime_path(
+                _git_status_changed_path(line),
+                project_root=project_root,
+                task_path=task_path,
+            )
+        ]
+        return "\n".join(lines)
+    if command[:2] == ["git", "diff"] and "--name-only" in command:
+        lines = [
+            line
+            for line in output.splitlines()
+            if not _is_internal_runtime_path(line.strip(), project_root=project_root, task_path=task_path)
+        ]
+        return "\n".join(lines)
+    if command[:2] == ["git", "diff"] and "--stat" in command:
+        lines: list[str] = []
+        for line in output.splitlines():
+            if "|" not in line:
+                continue
+            path = line.split("|", 1)[0].strip()
+            if not _is_internal_runtime_path(path, project_root=project_root, task_path=task_path):
+                lines.append(line)
+        return "\n".join(lines)
+    return output
+
+
+def _git_status_changed_path(line: str) -> str:
+    path = _path_from_git_status_line(line)
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[1].strip()
+    return path
 
 
 def _turn_id_from_params(params: dict[str, Any]) -> str | None:
@@ -3841,7 +4491,8 @@ def _is_completed_action(item: Any) -> bool:
 
 
 def _is_stream_delta_method(method: str) -> bool:
-    return method.endswith("/delta") or method.endswith("/outputDelta") or method in {
+    lowered = method.lower()
+    return lowered.endswith("delta") or method in {
         "item/reasoning/summaryTextDelta",
         "item/reasoning/textDelta",
         "command/exec/outputDelta",
@@ -3851,7 +4502,27 @@ def _is_stream_delta_method(method: str) -> bool:
     }
 
 
-def _changed_files_from_diff_summary(diff: str | None) -> list[str]:
+def _is_command_output_delta_method(method: str) -> bool:
+    lowered = method.lower()
+    if method in {
+        "item/commandExecution/outputDelta",
+        "command/exec/outputDelta",
+        "process/outputDelta",
+    }:
+        return True
+    return any(token in lowered for token in ("command", "exec", "process")) and (
+        lowered.endswith("outputdelta")
+        or lowered.endswith("stdoutdelta")
+        or lowered.endswith("stderrdelta")
+    )
+
+
+def _changed_files_from_diff_summary(
+    diff: str | None,
+    *,
+    project_root: Path | None = None,
+    task_path: Path | str | None = None,
+) -> list[str]:
     if not diff:
         return []
     files: list[str] = []
@@ -3862,15 +4533,19 @@ def _changed_files_from_diff_summary(diff: str | None) -> list[str]:
             stripped = line.strip()
             if not stripped or stripped.startswith("$"):
                 continue
-            path = stripped[3:] if len(stripped) > 3 else stripped
-            path = path.strip()
-            if path and not path.startswith(".supervisor/") and path not in files:
+            path = _git_status_changed_path(stripped)
+            if path and not _is_internal_runtime_path(path, project_root=project_root, task_path=task_path) and path not in files:
                 files.append(path)
     marker = "$ git diff --name-only"
     if marker in diff:
         tail = diff.split(marker, 1)[1]
         for line in tail.splitlines():
             path = line.strip()
-            if path and not path.startswith("$") and path not in files:
+            if (
+                path
+                and not path.startswith("$")
+                and not _is_internal_runtime_path(path, project_root=project_root, task_path=task_path)
+                and path not in files
+            ):
                 files.append(path)
     return files

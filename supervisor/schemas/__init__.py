@@ -24,6 +24,7 @@ from supervisor.schemas.models import (
     PolicyDecisionKind,
     PriorIntervention,
     DiffPacketLimits,
+    EvidenceProvenanceSummary,
     EvidenceItem,
     RestartHandoff,
     ReviewedFile,
@@ -34,6 +35,7 @@ from supervisor.schemas.models import (
     SupervisorWakePacket,
     TriggeringAction,
     ValidationOutput,
+    ValidationProvenance,
     ValidationRun,
 )
 
@@ -63,6 +65,7 @@ __all__ = [
     "PolicyDecisionKind",
     "PriorIntervention",
     "DiffPacketLimits",
+    "EvidenceProvenanceSummary",
     "EvidenceItem",
     "RestartHandoff",
     "ReviewedFile",
@@ -73,5 +76,6 @@ __all__ = [
     "SupervisorWakePacket",
     "TriggeringAction",
     "ValidationOutput",
+    "ValidationProvenance",
     "ValidationRun",
 ]
