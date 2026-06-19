@@ -490,6 +490,39 @@ async def test_camelcase_stdout_delta_is_attached_to_validation_ledger(tmp_path:
     assert "ok pkg/a" in validation.summary
 
 
+async def test_command_aggregated_output_is_attached_to_validation_ledger(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "python3 hello.py",
+                        "cwd": str(tmp_path),
+                        "exitCode": 0,
+                        "status": "completed",
+                        "aggregatedOutput": "Hello world\n",
+                    },
+                },
+            }
+        )
+    )
+
+    assert len(controller.validations) == 1
+    validation = controller.validations[0]
+    assert validation.command == "python3 hello.py"
+    assert validation.type == "behavior_demo"
+    assert validation.passed is True
+    assert validation.captured_output == "Hello world\n"
+    assert "Hello world" in validation.summary
+
+
 def test_readiness_marker_detection_requires_own_exact_line() -> None:
     assert _has_readiness_marker("Summary\n  SENTINEL_READY_FOR_REVIEW  \n")
     assert not _has_readiness_marker("Summary SENTINEL_READY_FOR_REVIEW")

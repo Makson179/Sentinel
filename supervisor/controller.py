@@ -2634,7 +2634,7 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
         return
     for key, nested in value.items():
         key_text = str(key).lower()
-        if key_text in {"output", "stdout", "stderr", "text", "content", "message", "summary"}:
+        if key_text in {"output", "aggregatedoutput", "stdout", "stderr", "text", "content", "message", "summary"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
         elif key_text in {"outputs", "chunks", "lines", "items", "result", "results"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
