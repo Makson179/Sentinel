@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from supervisor.approval_triage import (
+    CheapApprovalReviewer,
+    CheapApprovalReviewerError,
+    CheapApprovalTriageConfig,
+    cheap_approval_triage_config_from_env,
+)
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import CODER_SANDBOX_DANGER_FULL_ACCESS, CoderSession, coder_sandbox_mode, coder_thread_params
@@ -22,8 +28,10 @@ from supervisor.schemas import (
     AppEvent,
     AppEventSource,
     ApprovalContext,
+    ApprovalRequestType,
     ApprovalWakeContext,
     BreadthRiskSummary,
+    CheapApprovalDecision,
     ChangedFile,
     ChangedFileContext,
     ChangedFileDiff,
@@ -40,6 +48,7 @@ from supervisor.schemas import (
     InspectionOutput,
     InspectionRun,
     PriorIntervention,
+    PolicyDecision,
     RestartHandoff,
     SentinelConfig,
     SentinelStatus,
@@ -189,6 +198,8 @@ class SentinelController:
         self.tui = tui or TerminalTUI()
         self.supervisor: StatelessSupervisorAgent | None = None
         self.approvals: ApprovalManager | None = None
+        self.approval_triage_config: CheapApprovalTriageConfig = cheap_approval_triage_config_from_env()
+        self.approval_triage_reviewer: CheapApprovalReviewer | None = None
         self.coder: CoderSession | None = None
         self.pending_approvals: dict[int | str, ApprovalContext] = {}
         self.last_coder_message: CoderMessage | None = None
@@ -236,7 +247,13 @@ class SentinelController:
                 self.task_path,
                 model=self.model,
             )
-            self.approvals = ApprovalManager(self.project_root, supervisor=self)
+            self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
+            self.approvals = ApprovalManager(
+                self.project_root,
+                supervisor=self,
+                cheap_reviewer=self.approval_triage_reviewer,
+                cheap_review_timeout_seconds=self.approval_triage_config.timeout_seconds,
+            )
             self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
             await self.coder.start_thread()
             await self.coder.start_initial_turn()
@@ -295,6 +312,7 @@ class SentinelController:
             self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"model": self.model}))
         self.tui.status("checking supervisor structured output")
         await self._structured_output_self_test()
+        await self._configure_approval_triage()
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
@@ -471,6 +489,7 @@ class SentinelController:
         else:
             resolution = await self.approvals.decide(context)
             response = self.approvals.response_payload(context, resolution)
+            self._record_cheap_approval_attempt(context, self.approvals)
         await self.client.respond(context.server_request_id, response)
         is_denial = _approval_resolution_is_denial(resolution.decision)
         decision_key = _approval_resolution_metric_key(resolution.decision)
@@ -518,6 +537,11 @@ class SentinelController:
             patch_summary=_patch_summary_from_approval_context(context) or await self.patch_summary(),
         )
         return await self.supervisor.decide(packet)
+
+    async def decide_cheap_approval(self, context: ApprovalContext, evaluation: PolicyDecision) -> CheapApprovalDecision:
+        if self.approval_triage_reviewer is None:
+            raise CheapApprovalReviewerError("cheap approval triage not configured")
+        return await self.approval_triage_reviewer.review(context, evaluation)
 
     async def handle_notification(self, message: AppServerMessage) -> None:
         params = message.params
@@ -2151,6 +2175,94 @@ class SentinelController:
         decision = await asyncio.wait_for(agent.decide(packet), timeout=120)
         if decision.decision not in {SupervisorDecisionKind.NOOP, SupervisorDecisionKind.PAUSE}:
             raise RuntimeError("structured-output supervisor self-test returned an unexpected decision")
+
+    async def _configure_approval_triage(self) -> None:
+        config = cheap_approval_triage_config_from_env()
+        self.approval_triage_config = config
+        self.approval_triage_reviewer = None
+        if not config.enabled:
+            self.tui.render("SYSTEM", "cheap approval triage disabled by configuration")
+            return
+        if config.model is None:
+            self.tui.render(
+                "SYSTEM",
+                "cheap approval triage disabled: SENTINEL_APPROVAL_TRIAGE_MODEL is not configured",
+            )
+            self.approval_triage_config = CheapApprovalTriageConfig(
+                enabled=False,
+                model=None,
+                timeout_seconds=config.timeout_seconds,
+            )
+            return
+        reviewer = CheapApprovalReviewer(
+            self.client,
+            self.project_root,
+            model=config.model,
+            timeout_seconds=config.timeout_seconds,
+        )
+        try:
+            await self._cheap_approval_structured_output_self_test(reviewer)
+        except Exception as exc:
+            self.tui.render(
+                "SYSTEM",
+                f"cheap approval triage unavailable; falling back to full supervisor ({exc.__class__.__name__})",
+            )
+            self.approval_triage_config = CheapApprovalTriageConfig(
+                enabled=False,
+                model=config.model,
+                timeout_seconds=config.timeout_seconds,
+            )
+            return
+        self.approval_triage_reviewer = reviewer
+        self.tui.render("SYSTEM", f"cheap approval triage enabled with model {config.model}")
+
+    async def _cheap_approval_structured_output_self_test(self, reviewer: CheapApprovalReviewer) -> None:
+        command = "git status --short && git diff --stat"
+        context = ApprovalContext(
+            server_request_id="cheap-approval-self-test",
+            server_request_method="item/commandExecution/requestApproval",
+            request_type=ApprovalRequestType.COMMAND,
+            command=command,
+            cwd=str(self.project_root),
+            available_decisions=["accept", "decline", "cancel"],
+        )
+        evaluation = ApprovalManager(self.project_root).policy.evaluate({"command": command, "cwd": str(self.project_root)})
+        decision = await asyncio.wait_for(reviewer.review(context, evaluation), timeout=reviewer.timeout_seconds)
+        if decision.decision not in {"approve_low_impact", "escalate"}:
+            raise RuntimeError("cheap approval structured-output self-test returned an unexpected decision")
+
+    def _build_cheap_approval_reviewer(self) -> CheapApprovalReviewer | None:
+        if self.approval_triage_reviewer is not None:
+            return self.approval_triage_reviewer
+        config = self.approval_triage_config
+        if not config.enabled or config.model is None:
+            return None
+        return CheapApprovalReviewer(
+            self.client,
+            self.project_root,
+            model=config.model,
+            timeout_seconds=config.timeout_seconds,
+        )
+
+    def _record_cheap_approval_attempt(self, context: ApprovalContext, manager: ApprovalManager) -> None:
+        attempt = manager.last_cheap_review_attempt
+        if attempt is None:
+            return
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "cheap_approval_review",
+                "server_request_id": context.server_request_id,
+                "request_type": context.request_type.value,
+                "eligible": attempt.eligible,
+                "attempted": attempt.attempted,
+                "outcome": attempt.outcome,
+                "reason_code": attempt.reason_code,
+                "latency_seconds": attempt.latency_seconds,
+                "model": attempt.model,
+                "full_supervisor_fallback": attempt.full_supervisor_fallback,
+            }
+        )
 
 
 def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:

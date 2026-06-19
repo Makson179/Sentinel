@@ -9,6 +9,7 @@ import pytest
 
 from supervisor.prompts import (
     PROMPTS_ENV_VAR,
+    build_cheap_approval_prompt,
     build_completion_review_prompt,
     build_coder_prompt,
     build_restart_prompt,
@@ -16,11 +17,13 @@ from supervisor.prompts import (
 )
 from supervisor.schemas.models import (
     HumanMessage,
+    CheapApprovalDecision,
     CompletionReviewDecision,
     RestartHandoff,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
+    openai_strict_json_schema_for_cheap_approval_decision,
     openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
@@ -59,6 +62,32 @@ def test_completion_review_decision_schema_is_strict() -> None:
     assert "BehaviorEvidence" in schema["$defs"]
     assert "EvidenceItem" in schema["$defs"]
     assert "validation_id" in schema["$defs"]["EvidenceItem"]["properties"]
+
+
+def test_cheap_approval_decision_schema_is_strict() -> None:
+    schema = openai_strict_json_schema_for_cheap_approval_decision()
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+    assert "noop" not in schema["properties"]["decision"]["enum"]
+    assert schema["properties"]["decision"]["enum"] == ["approve_low_impact", "escalate"]
+
+
+def test_cheap_approval_decision_rejects_malformed_authority() -> None:
+    accepted = CheapApprovalDecision.model_validate(
+        {"decision": "approve_low_impact", "reason_code": "bounded_read_only"}
+    )
+    escalated = CheapApprovalDecision.model_validate(
+        {"decision": "escalate", "reason_code": "needs_task_judgment"}
+    )
+
+    assert accepted.decision == "approve_low_impact"
+    assert escalated.decision == "escalate"
+    with pytest.raises(ValueError):
+        CheapApprovalDecision.model_validate({"decision": "approve_low_impact", "reason_code": "possible_side_effect"})
+    with pytest.raises(ValueError):
+        CheapApprovalDecision.model_validate({"decision": "noop", "reason_code": "bounded_read_only"})
 
 
 def test_completion_review_decision_accepts_expected_shapes() -> None:
@@ -270,6 +299,9 @@ template = '''initial {task_path}'''
 [coder_restart]
 template = '''restart {task_path}'''
 
+[cheap_approval]
+text = '''cheap instruction'''
+
 [stateless_supervisor]
 body_sections = ["role"]
 completion_body_sections = ["completion_role"]
@@ -306,6 +338,9 @@ text = '''completion instruction'''
         assert "last_action" not in supervisor_payload
         completion_payload = json.loads(build_completion_review_prompt(packet))
         assert completion_payload["instructions"] == ["completion instruction"]
+        cheap_payload = json.loads(build_cheap_approval_prompt({"command": "pwd"}))
+        assert cheap_payload["instructions"] == ["cheap instruction"]
+        assert cheap_payload["command"] == "pwd"
     finally:
         monkeypatch.delenv(PROMPTS_ENV_VAR, raising=False)
 

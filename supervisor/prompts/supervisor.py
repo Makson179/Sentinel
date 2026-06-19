@@ -38,6 +38,12 @@ def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def build_cheap_approval_prompt(packet: dict[str, Any]) -> str:
+    payload = dict(packet)
+    payload["instructions"] = [_cheap_approval_prompt_text()]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def _load_prompt_config() -> dict[str, Any]:
     override = os.environ.get(PROMPTS_ENV_VAR)
     if override:
@@ -62,6 +68,13 @@ def _template(name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"prompt section [{name}] must define a non-empty template")
     return value
+
+
+def _cheap_approval_prompt_text() -> str:
+    value = _section("cheap_approval").get("text")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("[cheap_approval] must define non-empty text")
+    return value.strip()
 
 
 def _stateless_supervisor_section_names(packet: SupervisorWakePacket) -> list[str]:
