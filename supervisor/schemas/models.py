@@ -15,6 +15,12 @@ class PolicyDecisionKind(str, Enum):
     ROUTE_LLM = "route_llm"
 
 
+class Certainty(str, Enum):
+    TRUE = "true"
+    FALSE = "false"
+    UNKNOWN = "unknown"
+
+
 class SentinelStatus(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
@@ -135,6 +141,13 @@ class SentinelConfig(BaseModel):
     last_validation_sequence: int | None = None
     last_trusted_behavioral_validation_sequence: int | None = None
     last_trusted_passing_behavioral_validation_sequence: int | None = None
+    runtime_wake_gate_mode: Literal["disabled", "shadow", "enforce"] = "disabled"
+    completion_preflight_gate_mode: Literal["disabled", "shadow", "enforce"] = "disabled"
+    packet_budget_gate_mode: Literal["disabled", "shadow", "enforce"] = "shadow"
+    runtime_large_diff_bands: list[int] = Field(default_factory=lambda: [1, 2, 4, 8])
+    completion_packet_manifest_threshold_chars: int = 120_000
+    reviewer_formatting_retry_count: int = 1
+    fresh_reviewer_fallback_count: int = 1
 
 
 class AppEvent(BaseModel):
@@ -240,6 +253,7 @@ class EvidenceItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     validation_id: str | None = None
+    validation_run_id: str | None = None
     inspection_id: str | None = None
     command: str
     sequence: int | None = None
@@ -351,6 +365,8 @@ class CoderMessage(BaseModel):
 
 class ValidationRun(BaseModel):
     validation_id: str
+    validation_signature_id: str | None = None
+    validation_run_id: str | None = None
     command: str
     raw_command: str | None = None
     normalized_command: str | None = None
@@ -373,6 +389,18 @@ class ValidationRun(BaseModel):
     passed_count: int | None = None
     failed_count: int | None = None
     target_files_or_test_files: list[str] = Field(default_factory=list)
+    coder_generation: int | None = None
+    turn_id: str | None = None
+    command_item_id: str | None = None
+    started_sequence: int | None = None
+    completed_sequence: int | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    workspace_state_before_id: str | None = None
+    workspace_state_after_id: str | None = None
+    output_capture_status: Literal["complete", "truncated", "missing"] = "missing"
+    completion_status: Literal["completed", "failed", "cancelled", "timed_out", "unknown"] = "unknown"
 
     @model_validator(mode="before")
     @classmethod
@@ -404,6 +432,25 @@ class ValidationRun(BaseModel):
             sequence = data.get("sequence")
             if isinstance(sequence, int) and isinstance(command, str):
                 data["validation_id"] = f"validation-{sequence}"
+        if "validation_signature_id" not in data and isinstance(data.get("validation_id"), str):
+            data["validation_signature_id"] = data["validation_id"]
+        if "output_capture_status" not in data:
+            if data.get("captured_output_truncated"):
+                data["output_capture_status"] = "truncated"
+            elif str(data.get("captured_output") or "").strip():
+                data["output_capture_status"] = "complete"
+            else:
+                data["output_capture_status"] = "missing"
+        if "completion_status" not in data:
+            status = str(data.get("status") or "").lower()
+            if status in {"completed", "failed", "cancelled", "timed_out", "unknown"}:
+                data["completion_status"] = status
+            elif data.get("exit_code") is None:
+                data["completion_status"] = "unknown"
+            else:
+                data["completion_status"] = "completed"
+        if "completed_sequence" not in data and isinstance(data.get("sequence"), int):
+            data["completed_sequence"] = data["sequence"]
         return data
 
 
@@ -422,6 +469,13 @@ class InspectionRun(BaseModel):
     captured_output_truncated: bool = False
     sequence: int
     inspected_paths: list[str] = Field(default_factory=list)
+    coder_generation: int | None = None
+    turn_id: str | None = None
+    command_item_id: str | None = None
+    completed_sequence: int | None = None
+    workspace_state_after_id: str | None = None
+    output_capture_status: Literal["complete", "truncated", "missing"] = "missing"
+    completion_status: Literal["completed", "failed", "cancelled", "timed_out", "unknown"] = "unknown"
 
     @model_validator(mode="before")
     @classmethod
@@ -449,6 +503,17 @@ class InspectionRun(BaseModel):
             sequence = data.get("sequence")
             if isinstance(sequence, int) and isinstance(command, str):
                 data["inspection_id"] = f"inspection-{sequence}"
+        if "output_capture_status" not in data:
+            if data.get("captured_output_truncated"):
+                data["output_capture_status"] = "truncated"
+            elif str(data.get("captured_output") or "").strip():
+                data["output_capture_status"] = "complete"
+            else:
+                data["output_capture_status"] = "missing"
+        if "completion_status" not in data:
+            data["completion_status"] = "completed" if data.get("exit_code") is not None else "unknown"
+        if "completed_sequence" not in data and isinstance(data.get("sequence"), int):
+            data["completed_sequence"] = data["sequence"]
         return data
 
 
@@ -463,6 +528,23 @@ class PriorIntervention(BaseModel):
     sequence: int
 
 
+class CompletionRequirement(BaseModel):
+    requirement_id: str
+    kind: Literal[
+        "validation_for_final_state",
+        "captured_behavior_demo",
+        "controller_evidence_exists",
+        "semantic_review",
+        "code_change",
+        "other",
+    ]
+    description: str
+    target: str | None = None
+    created_at_state_id: str | None = None
+    safe_for_preflight: bool = False
+    resolution_status: Literal["open", "resolved", "unknown"] = "open"
+
+
 class CompletionReturnRecord(BaseModel):
     reason: str
     uncovered_behaviors: list[str] = Field(default_factory=list)
@@ -474,6 +556,7 @@ class CompletionReturnRecord(BaseModel):
     accept_gate_details: dict[str, Any] = Field(default_factory=dict)
     sequence: int
     generation: int
+    requirements: list[CompletionRequirement] = Field(default_factory=list)
 
 
 class ChangedFile(BaseModel):
@@ -509,6 +592,8 @@ class ChangedTestsSummary(BaseModel):
 
 class ValidationOutput(BaseModel):
     validation_id: str
+    validation_signature_id: str | None = None
+    validation_run_id: str | None = None
     command: str
     raw_command: str | None = None
     normalized_command: str | None = None
@@ -533,6 +618,9 @@ class ValidationOutput(BaseModel):
     executed_test_files: list[str] = Field(default_factory=list)
     passed_count: int | None = None
     failed_count: int | None = None
+    workspace_state_after_id: str | None = None
+    output_capture_status: Literal["complete", "truncated", "missing"] = "missing"
+    completion_status: Literal["completed", "failed", "cancelled", "timed_out", "unknown"] = "unknown"
 
 
 class InspectionOutput(BaseModel):
@@ -554,6 +642,8 @@ class InspectionOutput(BaseModel):
 
 class ValidationProvenance(BaseModel):
     validation_id: str
+    validation_signature_id: str | None = None
+    validation_run_id: str | None = None
     command: str
     type: Literal["static", "behavioral", "behavior_demo"]
     passed: bool
@@ -585,6 +675,7 @@ class ValidationProvenance(BaseModel):
         "unknown",
     ] = "unknown"
     risk_reasons: list[str] = Field(default_factory=list)
+    workspace_state_after_id: str | None = None
 
 
 class EvidenceProvenanceSummary(BaseModel):
@@ -656,10 +747,14 @@ class SupervisorWakePacket(BaseModel):
     evidence_provenance_summary: EvidenceProvenanceSummary | None = None
     diff_packet_limits: DiffPacketLimits = Field(default_factory=DiffPacketLimits)
     breadth_risk_summary: BreadthRiskSummary | None = None
-    completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
+    completion_payload_mode: Literal["full", "manifest", "true_delta", "delta", "full_fallback"] | None = None
     completion_payload_since_sequence: int | None = None
     completion_review_thread_id: str | None = None
     pending_accept_gate_rejection: dict[str, Any] | None = None
+    completion_attempt_id: str | None = None
+    review_workspace_state_id: str | None = None
+    post_review_workspace_state_id: str | None = None
+    review_artifact_manifest: dict[str, Any] | None = None
 
 
 class FinalReport(BaseModel):

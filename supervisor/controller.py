@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+from enum import Enum
 import shlex
 import shutil
 import subprocess
@@ -23,11 +24,22 @@ from supervisor.approval_triage import (
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import CODER_SANDBOX_DANGER_FULL_ACCESS, CoderSession, coder_sandbox_mode, coder_thread_params
+from supervisor.gates.completion_preflight import (
+    AcceptanceFacts,
+    CompletionAttempt,
+    CompletionPreflightDisposition,
+    build_completion_attempt_id,
+    evaluate_completion_preflight,
+    evaluate_final_behavioral_floor,
+)
+from supervisor.gates.runtime_wake import RuntimeWakeGate
 from supervisor.health import kill_restart_candidate, patch_health
+from supervisor.review_artifacts import manifest_to_packet_dict, write_review_artifacts
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
     ApprovalContext,
+    Certainty,
     ApprovalRequestType,
     ApprovalWakeContext,
     BreadthRiskSummary,
@@ -62,6 +74,7 @@ from supervisor.schemas import (
 )
 from supervisor.schemas.models import ensure_relative_to
 from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
+from supervisor.workspace_state import WorkspaceState, capture_workspace_state_async
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.task_select import resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
@@ -167,6 +180,13 @@ class EvidenceBindingIssue:
     inspection_id: str | None = None
 
 
+class ValidationCommandClassification(str, Enum):
+    DEFINITE_BEHAVIORAL = "definite_behavioral"
+    DEFINITE_STATIC = "definite_static"
+    DEFINITE_NON_VALIDATION = "definite_non_validation"
+    UNCERTAIN = "uncertain"
+
+
 class SentinelController:
     def __init__(
         self,
@@ -232,6 +252,9 @@ class SentinelController:
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
         self._last_large_diff_signature: str | None = None
+        self.runtime_wake_gate = RuntimeWakeGate()
+        self._pending_completion_attempt: CompletionAttempt | None = None
+        self._completion_fresh_reviewer_fallbacks = 0
 
     async def run(self) -> None:
         self.initialize_state()
@@ -563,6 +586,7 @@ class SentinelController:
             self.store.update_sentinel_config(
                 lambda current: current.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
             )
+            await self._resume_pending_completion_if_unblocked()
             return
         if method == "turn/started" and thread_id == cfg.coder_thread_id and isinstance(turn_id, str):
             if self.coder:
@@ -591,12 +615,22 @@ class SentinelController:
                     sequence=self._sequence,
                     item=validation_item,
                     changed_paths=list(getattr(self, "observed_changed_files", {}) or {}),
+                    generation=cfg.generation,
+                    turn_id=turn_id if isinstance(turn_id, str) else None,
                 )
                 inspection = _inspection_from_action(
                     triggering_action,
                     sequence=self._sequence,
                     item=validation_item,
+                    generation=cfg.generation,
+                    turn_id=turn_id if isinstance(turn_id, str) else None,
                 )
+                if validation is not None or inspection is not None:
+                    post_command_state = await self._capture_workspace_state_safe(boundary="validation_completed")
+                    if validation is not None:
+                        validation.workspace_state_after_id = post_command_state.state_id
+                    if inspection is not None:
+                        inspection.workspace_state_after_id = post_command_state.state_id
                 validation_trigger_reasons: tuple[str, ...] = ()
                 if validation is not None:
                     self.validations.append(validation)
@@ -658,43 +692,33 @@ class SentinelController:
         return "".join(chunks.pop(item_id, []))
 
     async def _handle_coder_turn_completed(self, *, item_id: str | None) -> None:
+        await self._flush_runtime_wake_gate_at_turn_end(item_id=item_id)
         message = self.last_coder_message
         if message is not None and _has_readiness_marker(message.text):
             if self._last_completion_marker_sequence != message.sequence:
-                self._last_completion_marker_sequence = message.sequence
-                self.no_marker_idle_nudge_count = 0
-                self.completion_reviewer_rerun_count = 0
-                done_gap = await self._done_without_fresh_behavioral_validation()
-                if done_gap is not None:
-                    self._record_runtime_trigger_trace(
-                        event_type="turn/completed",
-                        action=TriggeringAction(
-                            item_id=item_id,
-                            kind="done",
-                            status="completed",
-                            summary=done_gap,
+                defer_reasons = self._completion_barrier_defer_reasons()
+                if defer_reasons:
+                    cfg = self.store.get_sentinel_config()
+                    self._pending_completion_attempt = CompletionAttempt(
+                        completion_attempt_id=build_completion_attempt_id(
+                            generation=cfg.generation,
+                            marker_sequence=message.sequence,
+                            state_id=None,
                         ),
-                        validation=None,
-                        changed_files=await self.changed_files(),
-                        decision=RuntimeTriggerDecision(
-                            should_wake=True,
-                            reasons=("done_without_fresh_validation",),
-                        ),
+                        generation=cfg.generation,
+                        marker_sequence=message.sequence,
+                        coder_message_sequence=message.sequence,
+                        created_at_sequence=cfg.last_event_sequence,
+                        deferred=True,
+                        defer_reasons=defer_reasons,
                     )
-                    self._schedule_supervisor_check(
-                        f"Runtime trigger (done_without_fresh_validation): {done_gap}",
-                        triggering_item_id=item_id,
+                    self._record_gate_decision(
+                        gate="completion_preflight",
+                        action="defer",
+                        details={"reasons": defer_reasons, "completion_attempt_id": self._pending_completion_attempt.completion_attempt_id},
                     )
                     return
-                summary = "Coder provided exact readiness marker; running completion_review."
-                pending_gate = getattr(self, "_pending_completion_gate_rejection", None)
-                if pending_gate:
-                    summary = _completion_gate_followup_summary(pending_gate)
-                self._schedule_supervisor_check(
-                    summary,
-                    triggering_item_id=item_id,
-                    completion_review=True,
-                )
+                await self._prepare_completion_from_readiness(message=message, item_id=item_id)
             return
         if message is not None and _reports_material_limitation(message.text):
             await self._handle_coder_material_limitation(message)
@@ -718,6 +742,201 @@ class SentinelController:
             await self._handle_no_marker_idle()
             return
         self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
+
+    def _completion_barrier_defer_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        cfg = self.store.get_sentinel_config()
+        if cfg.active_coder_turn_id:
+            reasons.append("active_coder_turn")
+        if getattr(self, "pending_approvals", None):
+            reasons.append("pending_approval")
+        return reasons
+
+    async def _resume_pending_completion_if_unblocked(self) -> None:
+        attempt = getattr(self, "_pending_completion_attempt", None)
+        if attempt is None or self._completion_barrier_defer_reasons():
+            return
+        message = self.last_coder_message
+        if message is None or message.sequence != attempt.coder_message_sequence or not _has_readiness_marker(message.text):
+            self._pending_completion_attempt = None
+            return
+        self._pending_completion_attempt = None
+        await self._prepare_completion_from_readiness(message=message, item_id=None)
+
+    async def _prepare_completion_from_readiness(self, *, message: CoderMessage, item_id: str | None) -> None:
+        cfg = self.store.get_sentinel_config()
+        self._last_completion_marker_sequence = message.sequence
+        self.no_marker_idle_nudge_count = 0
+        self.completion_reviewer_rerun_count = 0
+        state = await self._capture_workspace_state_safe(boundary="readiness_marker")
+        attempt_id = build_completion_attempt_id(
+            generation=cfg.generation,
+            marker_sequence=message.sequence,
+            state_id=state.state_id,
+        )
+        attempt = CompletionAttempt(
+            completion_attempt_id=attempt_id,
+            generation=cfg.generation,
+            marker_sequence=message.sequence,
+            coder_message_sequence=message.sequence,
+            review_state_id=state.state_id,
+            created_at_sequence=cfg.last_event_sequence,
+        )
+        self._pending_completion_attempt = attempt
+        facts = await self._build_acceptance_facts(attempt=attempt, final_workspace_state=state)
+        mode = self.store.get_sentinel_config().completion_preflight_gate_mode
+        if mode == "disabled":
+            done_gap = await self._done_without_fresh_behavioral_validation()
+            if done_gap is not None:
+                self._record_runtime_trigger_trace(
+                    event_type="turn/completed",
+                    action=TriggeringAction(item_id=item_id, kind="done", status="completed", summary=done_gap),
+                    validation=None,
+                    changed_files=await self.changed_files(),
+                    decision=RuntimeTriggerDecision(should_wake=True, reasons=("done_without_fresh_validation",)),
+                )
+                self._schedule_supervisor_check(
+                    f"Runtime trigger (done_without_fresh_validation): {done_gap}",
+                    triggering_item_id=item_id,
+                )
+                return
+        else:
+            preflight = evaluate_completion_preflight(facts)
+            action = preflight.disposition.value
+            self._record_gate_decision(
+                gate="completion_preflight",
+                action=("would_request_evidence" if mode == "shadow" and action == "certainly_inadmissible" else action),
+                details=preflight.model_dump(mode="json"),
+            )
+            if mode == "enforce" and preflight.disposition is CompletionPreflightDisposition.DEFER:
+                self._pending_completion_attempt = attempt.model_copy(update={"deferred": True, "defer_reasons": preflight.review_risk_flags})
+                return
+            if mode == "enforce" and preflight.disposition is CompletionPreflightDisposition.CERTAINLY_INADMISSIBLE:
+                await self._send_completion_preflight_evidence_request(preflight, facts=facts)
+                return
+        summary = "Coder provided exact readiness marker; running completion_review."
+        pending_gate = getattr(self, "_pending_completion_gate_rejection", None)
+        if pending_gate:
+            summary = _completion_gate_followup_summary(pending_gate)
+        self._schedule_supervisor_check(summary, triggering_item_id=item_id, completion_review=True)
+
+    async def _build_acceptance_facts(
+        self,
+        *,
+        attempt: CompletionAttempt,
+        final_workspace_state: WorkspaceState | None,
+    ) -> AcceptanceFacts:
+        changed_files = await self.changed_files()
+        self._update_relevant_edit_state(changed_files)
+        cfg = self.store.get_sentinel_config()
+        latest = cfg.last_relevant_edit_sequence or _latest_relevant_change_sequence(changed_files)
+        unsupported: list[str] = []
+        if final_workspace_state is not None and final_workspace_state.certainty is not Certainty.TRUE:
+            unsupported.extend(final_workspace_state.unknown_reasons)
+        return AcceptanceFacts(
+            completion_attempt_id=attempt.completion_attempt_id,
+            generation=cfg.generation,
+            final_workspace_state=final_workspace_state,
+            changed_files=changed_files,
+            latest_relevant_change_sequence=latest,
+            validations=list(self.validations),
+            inspections=list(getattr(self, "inspections", [])),
+            previous_completion_returns=list(getattr(self, "completion_returns", [])),
+            pending_approvals=list(getattr(self, "pending_approvals", {}).values()),
+            task_contents=_read_task_text(self.task_path),
+            unsupported_reasons=unsupported,
+        )
+
+    async def _send_completion_preflight_evidence_request(
+        self,
+        preflight: Any,
+        *,
+        facts: AcceptanceFacts,
+    ) -> None:
+        changed_paths = [changed.path for changed in facts.changed_files if changed.sequence == facts.latest_relevant_change_sequence]
+        latest_validation_state = next(
+            (
+                validation.workspace_state_after_id
+                for validation in reversed(facts.validations)
+                if validation.workspace_state_after_id
+                and validation.trusted_validation_outcome == "passed"
+                and validation.type in {"behavioral", "behavior_demo"}
+            ),
+            None,
+        )
+        state_id = preflight.final_workspace_state_id or "unknown"
+        message = (
+            "Completion review was not started because the current acceptance policy requires trusted "
+            "behavioral validation for the final code state.\n\n"
+            f"Current state: {state_id}\n"
+            f"Most recent trusted validation state: {latest_validation_state or 'none'}\n"
+            f"Relevant changed paths after that validation: {', '.join(changed_paths[:12]) or 'unknown'}\n\n"
+            "Run appropriate behavioral validation against the current state and emit the readiness marker again."
+        )
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Completion preflight requested fresh validation for the exact final state without starting completion_review.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "completion/preflight_evidence_request",
+            decision="certainly_inadmissible",
+            reason=", ".join(preflight.hard_gap_codes),
+        )
+        self.tui.render("SUPERVISOR", "completion preflight requested fresh validation")
+        if self.coder:
+            await self.coder.steer_or_start(message)
+
+    async def _flush_runtime_wake_gate_at_turn_end(self, *, item_id: str | None) -> None:
+        gate = getattr(self, "runtime_wake_gate", None)
+        if gate is None:
+            return
+        cfg = self.store.get_sentinel_config()
+        decision = gate.flush_turn_end(generation=cfg.generation, turn_id=cfg.active_coder_turn_id)
+        if decision is None:
+            return
+        self._record_gate_decision(
+            gate="runtime_wake",
+            action="turn_end_coalesced_flush",
+            details=decision.model_dump(mode="json"),
+        )
+        self._schedule_supervisor_check(
+            f"Runtime trigger ({', '.join(decision.reason_codes)}): coalesced runtime state at turn end",
+            triggering_item_id=item_id,
+        )
+
+    async def _capture_workspace_state_safe(self, *, boundary: str) -> WorkspaceState:
+        try:
+            state = await capture_workspace_state_async(self.project_root)
+        except Exception as exc:
+            state = WorkspaceState(certainty=Certainty.UNKNOWN, unknown_reasons=[f"capture_exception:{exc.__class__.__name__}"])
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "workspace_state_capture",
+                "boundary": boundary,
+                "state_id": state.state_id,
+                "certainty": state.certainty.value,
+                "unknown_reasons": state.unknown_reasons,
+            }
+        )
+        return state
+
+    def _record_gate_decision(self, *, gate: str, action: str, details: dict[str, Any]) -> None:
+        try:
+            cfg = self.store.get_sentinel_config()
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "gate_decision",
+                    "gate": gate,
+                    "action": action,
+                    "generation": cfg.generation,
+                    "details": details,
+                }
+            )
+        except Exception:
+            return
 
     async def _handle_coder_material_limitation(self, message: CoderMessage) -> None:
         cfg = self.store.get_sentinel_config()
@@ -836,6 +1055,9 @@ class SentinelController:
         self.completion_review_return_sequence = None
         self.completion_review_return_validation_sequence = None
         self.validation_runtime_state = {}
+        self._pending_completion_attempt = None
+        if getattr(self, "runtime_wake_gate", None) is not None:
+            self.runtime_wake_gate.reset()
         patch_health(
             self.store,
             HealthDelta(
@@ -1115,15 +1337,51 @@ class SentinelController:
         if restart_candidate and restart_reason and not read_only_action:
             reasons.append("restart_budget")
         reasons = list(dict.fromkeys(reasons))
-        if (
-            reasons == ["large_diff"]
-            and large_diff_signature is not None
-            and getattr(self, "_last_large_diff_signature", None) == large_diff_signature
-        ):
-            reasons = []
-        elif large_diff_signature is not None and "large_diff" in reasons:
-            self._last_large_diff_signature = large_diff_signature
-        return RuntimeTriggerDecision(should_wake=bool(reasons), reasons=tuple(reasons))
+        old_decision = RuntimeTriggerDecision(should_wake=bool(reasons), reasons=tuple(reasons))
+        if not old_decision.should_wake:
+            return old_decision
+        cfg = self.store.get_sentinel_config()
+        mode = getattr(cfg, "runtime_wake_gate_mode", "disabled")
+        if mode == "disabled":
+            if (
+                reasons == ["large_diff"]
+                and large_diff_signature is not None
+                and getattr(self, "_last_large_diff_signature", None) == large_diff_signature
+            ):
+                return RuntimeTriggerDecision(should_wake=False, reasons=())
+            if large_diff_signature is not None and "large_diff" in reasons:
+                self._last_large_diff_signature = large_diff_signature
+            return old_decision
+        try:
+            gate = getattr(self, "runtime_wake_gate", None)
+            if gate is None:
+                gate = RuntimeWakeGate()
+                self.runtime_wake_gate = gate
+            gate_decision = gate.evaluate(
+                generation=cfg.generation,
+                turn_id=cfg.active_coder_turn_id,
+                reasons=reasons,
+                action=action,
+                changed_files=changed_files,
+                validation=validation,
+                pending_approval_ids=list(getattr(self, "pending_approvals", {}) or {}),
+                large_diff_threshold_lines=LARGE_DIFF_CHANGED_LINES_THRESHOLD,
+            )
+            self._record_gate_decision(
+                gate="runtime_wake",
+                action=(f"would_{gate_decision.action}" if mode == "shadow" else gate_decision.action),
+                details={
+                    **gate_decision.model_dump(mode="json"),
+                    "old_path_would_call_llm": old_decision.should_wake,
+                },
+            )
+        except Exception:
+            return old_decision
+        if mode == "shadow":
+            return old_decision
+        if gate_decision.action == "emit_wake":
+            return old_decision
+        return RuntimeTriggerDecision(should_wake=False, reasons=())
 
     def _record_runtime_trigger_trace(
         self,
@@ -1271,10 +1529,34 @@ class SentinelController:
             validations=list(self.validations),
             changed_files=changed_files,
         )
-        completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
+        completion_payload_mode: Literal["full", "manifest", "true_delta", "delta", "full_fallback"] | None = None
         completion_payload_since_sequence: int | None = None
         completion_details: dict[str, Any] = {}
+        completion_attempt_id: str | None = None
+        review_workspace_state_id: str | None = None
+        review_artifact_manifest: dict[str, Any] | None = None
         if completion_review:
+            review_state = await self._capture_workspace_state_safe(boundary="completion_packet")
+            marker_sequence = getattr(self, "_last_completion_marker_sequence", None) or cfg.last_event_sequence
+            pending_attempt = getattr(self, "_pending_completion_attempt", None)
+            if pending_attempt is not None and pending_attempt.generation == cfg.generation:
+                attempt = pending_attempt.model_copy(update={"review_state_id": review_state.state_id})
+            else:
+                attempt = CompletionAttempt(
+                    completion_attempt_id=build_completion_attempt_id(
+                        generation=cfg.generation,
+                        marker_sequence=marker_sequence,
+                        state_id=review_state.state_id,
+                    ),
+                    generation=cfg.generation,
+                    marker_sequence=marker_sequence,
+                    coder_message_sequence=marker_sequence,
+                    review_state_id=review_state.state_id,
+                    created_at_sequence=cfg.last_event_sequence,
+                )
+            self._pending_completion_attempt = attempt
+            completion_attempt_id = attempt.completion_attempt_id
+            review_workspace_state_id = review_state.state_id
             completion_payload_mode, completion_payload_since_sequence = self._completion_payload_window(changed_files)
             completion_details = await self.completion_packet_details(
                 changed_files,
@@ -1284,6 +1566,12 @@ class SentinelController:
                 validations=list(self.validations),
                 changed_files=changed_files,
                 latest_change_sequence=latest_change_sequence,
+            )
+            completion_payload_mode, review_artifact_manifest, completion_details = self._maybe_apply_packet_budget_gate(
+                mode=completion_payload_mode,
+                completion_attempt_id=completion_attempt_id,
+                workspace_state_id=review_workspace_state_id,
+                completion_details=completion_details,
             )
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
@@ -1312,6 +1600,9 @@ class SentinelController:
             pending_accept_gate_rejection=(
                 getattr(self, "_pending_completion_gate_rejection", None) if completion_review else None
             ),
+            completion_attempt_id=completion_attempt_id,
+            review_workspace_state_id=review_workspace_state_id,
+            review_artifact_manifest=review_artifact_manifest,
             **completion_details,
         )
         try:
@@ -1337,6 +1628,8 @@ class SentinelController:
                     "- Runtime supervisor check timed out after newer coder activity; continuing with the latest queued review.\n",
                 )
                 return
+            if completion_review and await self._try_fresh_completion_reviewer_fallback(message):
+                return
             await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
             return
         if completion_review:
@@ -1344,10 +1637,95 @@ class SentinelController:
         else:
             await self.apply_supervisor_decision(decision, packet_thread_id=packet.coder_thread_id)
 
+    def _maybe_apply_packet_budget_gate(
+        self,
+        *,
+        mode: str | None,
+        completion_attempt_id: str,
+        workspace_state_id: str | None,
+        completion_details: dict[str, Any],
+    ) -> tuple[str | None, dict[str, Any] | None, dict[str, Any]]:
+        cfg = self.store.get_sentinel_config()
+        gate_mode = getattr(cfg, "packet_budget_gate_mode", "disabled")
+        if gate_mode == "disabled" or mode not in {"full", "true_delta"}:
+            return mode, None, completion_details
+        serialized_size = len(json.dumps(completion_details, default=str, sort_keys=True))
+        should_manifest = mode == "full" and serialized_size > cfg.completion_packet_manifest_threshold_chars
+        action = "select_manifest" if should_manifest else "select_full"
+        self._record_gate_decision(
+            gate="packet_budget",
+            action=(f"would_{action}" if gate_mode == "shadow" else action),
+            details={
+                "mode": mode,
+                "serialized_detail_chars": serialized_size,
+                "threshold": cfg.completion_packet_manifest_threshold_chars,
+                "completion_attempt_id": completion_attempt_id,
+                "workspace_state_id": workspace_state_id,
+            },
+        )
+        if gate_mode != "enforce" or not should_manifest:
+            return mode, None, completion_details
+        try:
+            artifacts: list[tuple[str, str | None, str, bool]] = []
+            for item in completion_details.get("changed_file_diffs", []) or []:
+                artifacts.append(("diff", getattr(item, "path", None), getattr(item, "diff", ""), bool(getattr(item, "diff_truncated", False))))
+            for item in completion_details.get("changed_file_contexts", []) or []:
+                artifacts.append((
+                    "context",
+                    getattr(item, "path", None),
+                    getattr(item, "final_snippets_around_changed_hunks", ""),
+                    bool(getattr(item, "context_truncated", False)),
+                ))
+            for item in completion_details.get("validation_outputs", []) or []:
+                artifacts.append(("validation", getattr(item, "validation_id", None), item.model_dump_json(indent=2), bool(getattr(item, "output_truncated", False))))
+            for item in completion_details.get("inspection_outputs", []) or []:
+                artifacts.append(("inspection", getattr(item, "inspection_id", None), item.model_dump_json(indent=2), bool(getattr(item, "output_truncated", False))))
+            manifest = write_review_artifacts(
+                self.store,
+                completion_attempt_id=completion_attempt_id,
+                workspace_state_id=workspace_state_id,
+                artifacts=artifacts,
+            )
+            reduced = dict(completion_details)
+            reduced["changed_file_diffs"] = []
+            reduced["changed_file_contexts"] = []
+            reduced["validation_outputs"] = []
+            reduced["inspection_outputs"] = []
+            return "manifest", manifest_to_packet_dict(manifest), reduced
+        except Exception as exc:
+            self._record_gate_decision(
+                gate="packet_budget",
+                action="full_fallback",
+                details={"reason": f"artifact_failure:{exc.__class__.__name__}"},
+            )
+            return "full_fallback", None, completion_details
+
+    async def _try_fresh_completion_reviewer_fallback(self, message: str) -> bool:
+        cfg = self.store.get_sentinel_config()
+        used = getattr(self, "_completion_fresh_reviewer_fallbacks", 0)
+        if used >= cfg.fresh_reviewer_fallback_count:
+            return False
+        self._completion_fresh_reviewer_fallbacks = used + 1
+        await self._close_completion_review_session()
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Completion reviewer failed structurally/provider-side; starting fresh reviewer fallback: {message}\n",
+        )
+        self._record_gate_decision(
+            gate="reviewer_repair",
+            action="fresh_reviewer_fallback",
+            details={"message": message, "fallback_index": used + 1},
+        )
+        self._schedule_supervisor_check(
+            "Completion reviewer failed to return usable structured output; rerun completion_review with fresh reviewer fallback.",
+            completion_review=True,
+        )
+        return True
+
     def _completion_payload_window(
         self,
         changed_files: list[ChangedFile],
-    ) -> tuple[Literal["full", "delta", "full_fallback"], int | None]:
+    ) -> tuple[Literal["full", "true_delta", "full_fallback"], int | None]:
         since_sequence = getattr(self, "completion_review_return_sequence", None)
         if since_sequence is None:
             return "full", None
@@ -1358,7 +1736,7 @@ class SentinelController:
         )
         if has_unknown_relevant_sequence:
             return "full_fallback", None
-        return "delta", since_sequence
+        return "true_delta", since_sequence
 
     async def apply_supervisor_decision(self, decision: SupervisorDecision, *, packet_thread_id: str | None) -> None:
         cfg = self.store.get_sentinel_config()
@@ -1428,6 +1806,9 @@ class SentinelController:
             return
         if decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
             return
+        if packet is not None and packet.review_workspace_state_id:
+            if not await self._review_workspace_state_still_current(packet):
+                return
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence})
         )
@@ -1474,6 +1855,35 @@ class SentinelController:
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)
             return
 
+    async def _review_workspace_state_still_current(self, packet: SupervisorWakePacket) -> bool:
+        reviewed_state_id = packet.review_workspace_state_id
+        if not reviewed_state_id:
+            return True
+        current = await self._capture_workspace_state_safe(boundary="post_completion_review")
+        if current.certainty is Certainty.TRUE and current.state_id == reviewed_state_id:
+            packet.post_review_workspace_state_id = current.state_id
+            return True
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Completion review decision discarded because workspace state changed or became unknown after review; rerunning completion_review.\n",
+        )
+        self._record_gate_decision(
+            gate="workspace_consistency",
+            action="discard_stale_completion_decision",
+            details={
+                "reviewed_state_id": reviewed_state_id,
+                "current_state_id": current.state_id,
+                "current_certainty": current.certainty.value,
+                "unknown_reasons": current.unknown_reasons,
+                "completion_attempt_id": packet.completion_attempt_id,
+            },
+        )
+        self._schedule_supervisor_check(
+            "Workspace state changed or became unknown after completion_review; rerun completion_review for the current state.",
+            completion_review=True,
+        )
+        return False
+
     def _append_completion_anchor_log(
         self,
         decision: CompletionReviewDecision,
@@ -1502,7 +1912,12 @@ class SentinelController:
         packet: SupervisorWakePacket | None,
     ) -> AcceptGateResult:
         changed_files = packet.changed_files if packet is not None else await self.changed_files()
-        validations = packet.validations if packet is not None else list(self.validations)
+        packet_mode = packet.completion_payload_mode if packet is not None else None
+        validations = (
+            list(self.validations)
+            if packet_mode in {"manifest", "true_delta"}
+            else (packet.validations if packet is not None else list(self.validations))
+        )
         inspections = packet.inspections if packet is not None else list(getattr(self, "inspections", []))
         code_review_files = _material_code_review_files(changed_files)
         passed_checks: list[str] = []
@@ -1587,14 +2002,32 @@ class SentinelController:
         )
 
         if code_review_files:
-            if latest_change is None:
+            final_state = (
+                WorkspaceState(state_id=packet.review_workspace_state_id, certainty=Certainty.TRUE)
+                if packet is not None and packet.review_workspace_state_id
+                else None
+            )
+            floor_facts = AcceptanceFacts(
+                completion_attempt_id=packet.completion_attempt_id if packet is not None and packet.completion_attempt_id else "accept-gate",
+                generation=self.store.get_sentinel_config().generation,
+                final_workspace_state=final_state,
+                changed_files=changed_files,
+                latest_relevant_change_sequence=latest_change,
+                validations=list(validations),
+                inspections=list(inspections),
+                previous_completion_returns=list(getattr(self, "completion_returns", [])),
+                pending_approvals=list(getattr(self, "pending_approvals", {}).values()),
+                task_contents=packet.task_contents if packet is not None else _read_task_text(self.task_path),
+            )
+            floor = evaluate_final_behavioral_floor(floor_facts)
+            if floor is Certainty.UNKNOWN:
                 return AcceptGateResult(
                     passed=False,
                     failure_type=ACCEPT_GATE_CODER_CORRECTABLE,
                     check_name="behavioral_floor",
-                    reason="latest relevant source/test change sequence is unknown, so validation freshness is not proven",
+                    reason="behavioral validation freshness for the reviewed final state is unknown",
                 )
-            if not any(_validation_is_fresh_behavioral_pass(validation, latest_change) for validation in validations):
+            if floor is Certainty.FALSE:
                 return AcceptGateResult(
                     passed=False,
                     failure_type=ACCEPT_GATE_CODER_CORRECTABLE,
@@ -2323,6 +2756,8 @@ def _validation_from_action(
     sequence: int,
     item: Any = None,
     changed_paths: list[str] | None = None,
+    generation: int | None = None,
+    turn_id: str | None = None,
 ) -> ValidationRun | None:
     if action.kind != "commandExecution" or not action.command:
         return None
@@ -2352,14 +2787,25 @@ def _validation_from_action(
         passed = False
     passed_count, failed_count = _test_count_summary(output)
     summary = _validation_summary(action.summary, output)
+    signature_id = _stable_validation_id(
+        normalized_command=normalized_command,
+        cwd=action.cwd,
+        validation_type=validation_type,
+        raw_selector=raw_selector,
+        executed_test_names=executed_test_names,
+    )
+    run_id = _stable_validation_run_id(
+        validation_signature_id=signature_id,
+        normalized_command=normalized_command,
+        cwd=action.cwd,
+        generation=generation,
+        command_item_id=action.item_id,
+        completed_sequence=sequence,
+    )
     return ValidationRun(
-        validation_id=_stable_validation_id(
-            normalized_command=normalized_command,
-            cwd=action.cwd,
-            validation_type=validation_type,
-            raw_selector=raw_selector,
-            executed_test_names=executed_test_names,
-        ),
+        validation_id=signature_id,
+        validation_signature_id=signature_id,
+        validation_run_id=run_id,
         command=action.command,
         raw_command=action.command,
         normalized_command=normalized_command,
@@ -2382,6 +2828,12 @@ def _validation_from_action(
         passed_count=passed_count,
         failed_count=failed_count,
         target_files_or_test_files=_target_files_or_test_files(action.command),
+        coder_generation=generation,
+        turn_id=turn_id,
+        command_item_id=action.item_id,
+        completed_sequence=sequence,
+        output_capture_status=_output_capture_status(output),
+        completion_status=_completion_status_from_action(action),
     )
 
 
@@ -2390,6 +2842,8 @@ def _inspection_from_action(
     *,
     sequence: int,
     item: Any = None,
+    generation: int | None = None,
+    turn_id: str | None = None,
 ) -> InspectionRun | None:
     if action.kind != "commandExecution" or not action.command:
         return None
@@ -2419,6 +2873,12 @@ def _inspection_from_action(
         captured_output_truncated=output.endswith("...<truncated>"),
         sequence=sequence,
         inspected_paths=inspected_paths,
+        coder_generation=generation,
+        turn_id=turn_id,
+        command_item_id=action.item_id,
+        completed_sequence=sequence,
+        output_capture_status=_output_capture_status(output),
+        completion_status=_completion_status_from_action(action),
     )
 
 
@@ -2434,6 +2894,34 @@ def _classify_validation_command(command: str, *, changed_paths: list[str]) -> s
     if _is_behavior_demo_command(command, changed_paths=changed_paths):
         return "behavior_demo"
     return None
+
+
+def _classify_validation_command_tri_state(
+    command: str,
+    *,
+    changed_paths: list[str] | None = None,
+) -> ValidationCommandClassification:
+    if _is_git_inspection_command(command):
+        return (
+            ValidationCommandClassification.DEFINITE_STATIC
+            if _is_git_diff_check_command(command)
+            else ValidationCommandClassification.DEFINITE_NON_VALIDATION
+        )
+    if _is_read_only_inspection_command(command):
+        return ValidationCommandClassification.DEFINITE_NON_VALIDATION
+    if _is_static_validation_command(command):
+        return ValidationCommandClassification.DEFINITE_STATIC
+    if _is_behavioral_validation_command(command):
+        return ValidationCommandClassification.DEFINITE_BEHAVIORAL
+    if _is_behavior_demo_command(command, changed_paths=changed_paths or []):
+        if _is_direct_script_execution_command(command) and not (_has_behavior_demo_marker(command) or changed_paths):
+            return ValidationCommandClassification.UNCERTAIN
+        return ValidationCommandClassification.DEFINITE_BEHAVIORAL
+    if _is_observationless_output_command(command):
+        return ValidationCommandClassification.DEFINITE_NON_VALIDATION
+    if _looks_like_unknown_wrapper_command(command):
+        return ValidationCommandClassification.UNCERTAIN
+    return ValidationCommandClassification.UNCERTAIN
 
 
 def _is_static_validation_command(command: str) -> bool:
@@ -2760,6 +3248,63 @@ def _stable_validation_id(
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return f"validation-{digest[:16]}"
+
+
+def _stable_validation_run_id(
+    *,
+    validation_signature_id: str,
+    normalized_command: str,
+    cwd: str | None,
+    generation: int | None,
+    command_item_id: str | None,
+    completed_sequence: int,
+) -> str:
+    payload = {
+        "validation_signature_id": validation_signature_id,
+        "normalized_command": normalized_command,
+        "cwd": cwd or "",
+        "generation": generation,
+        "command_item_id": command_item_id or "",
+        "completed_sequence": completed_sequence,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"validation-run-{digest[:20]}"
+
+
+def _output_capture_status(output: str) -> str:
+    if output.endswith("...<truncated>"):
+        return "truncated"
+    if output.strip():
+        return "complete"
+    return "missing"
+
+
+def _completion_status_from_action(action: TriggeringAction) -> str:
+    status = (action.status or "").lower().replace("-", "_")
+    if status in {"completed", "failed", "cancelled", "timed_out", "unknown"}:
+        return status
+    if _action_timed_out(action):
+        return "timed_out"
+    if action.exit_code is None:
+        return "unknown"
+    return "completed"
+
+
+def _looks_like_unknown_wrapper_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return True
+    while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable in {"make", "npm", "pnpm", "yarn", "python", "python3", "node", "bash", "sh", "zsh"}:
+        return True
+    if tokens[0].startswith(("./", "../", "/")):
+        return True
+    return executable.endswith((".sh", ".py", ".js", ".rb"))
 
 
 def _stable_inspection_id(
@@ -3149,7 +3694,7 @@ def _validation_freshness_summary(
             f"Last passing behavioral validation sequence {last_behavioral}; "
             "latest relevant change sequence is unknown."
         )
-    freshness = "fresh" if last_behavioral >= latest_change else "stale"
+    freshness = "fresh" if last_behavioral > latest_change else "stale"
     return (
         f"Last passing behavioral validation sequence {last_behavioral}; "
         f"latest relevant change sequence {latest_change}; behavioral validation is {freshness}."
@@ -3225,7 +3770,7 @@ def _accept_structural_issue(decision: CompletionReviewDecision, *, code_changin
         )
         or (
             evidence.validation_type != "inspection"
-            and not evidence.validation_id
+            and not (evidence.validation_id or getattr(evidence, "validation_run_id", None))
         )
         or (
             evidence.validation_id
@@ -3492,6 +4037,9 @@ def _accept_evidence_binding_issue(
     latest_change: int | None,
 ) -> EvidenceBindingIssue | None:
     by_id = {validation.validation_id: validation for validation in validations}
+    for validation in validations:
+        if validation.validation_run_id:
+            by_id[validation.validation_run_id] = validation
     inspections_by_id = {inspection.inspection_id: inspection for inspection in inspections}
     inspections_by_command: dict[str, list[InspectionRun]] = {}
     for inspection in inspections:
@@ -3529,10 +4077,11 @@ def _accept_evidence_binding_issue(
                     fresh_pass_found = True
                     break
                 continue
-            if not evidence.validation_id:
+            evidence_validation_key = getattr(evidence, "validation_run_id", None) or evidence.validation_id
+            if not evidence_validation_key:
                 continue
             linked_evidence_found = True
-            validation = by_id.get(evidence.validation_id or "")
+            validation = by_id.get(evidence_validation_key or "")
             if validation is None:
                 continue
             if evidence.validation_type != validation.type:
@@ -3670,9 +4219,10 @@ def _behavior_demo_output_issue(
     behavior: str,
 ) -> EvidenceBindingIssue | None:
     for evidence in evidence_items:
-        if not evidence.validation_id:
+        evidence_validation_key = getattr(evidence, "validation_run_id", None) or evidence.validation_id
+        if not evidence_validation_key:
             continue
-        validation = validations_by_id.get(evidence.validation_id)
+        validation = validations_by_id.get(evidence_validation_key)
         if validation is None or evidence.validation_type != "behavior_demo" or validation.type != "behavior_demo":
             continue
         if not _validation_is_fresh_pass(validation, latest_change):
@@ -3738,9 +4288,10 @@ def _evidence_type_mismatch(
                 f"{evidence.inspection_id} declares {evidence.validation_type} "
                 "but inspection ledger requires inspection"
             )
-        if not evidence.validation_id:
+        evidence_validation_key = getattr(evidence, "validation_run_id", None) or evidence.validation_id
+        if not evidence_validation_key:
             continue
-        validation = validations_by_id.get(evidence.validation_id)
+        validation = validations_by_id.get(evidence_validation_key)
         if validation is None or evidence.validation_type == validation.type:
             continue
         return (
@@ -3764,6 +4315,9 @@ def _self_confirming_test_evidence_issue(
         return None
     changed_test_identities = _changed_test_file_identity_map(changed_test_files)
     validations_by_id = {validation.validation_id: validation for validation in validations}
+    for validation in validations:
+        if validation.validation_run_id:
+            validations_by_id[validation.validation_run_id] = validation
     behavior_issues: list[dict[str, Any]] = []
     for row in decision.behavior_evidence_matrix:
         if row.status != "covered":
@@ -3771,7 +4325,7 @@ def _self_confirming_test_evidence_issue(
         independent_found = False
         self_confirming_validations: list[dict[str, Any]] = []
         for evidence in row.evidence:
-            validation = validations_by_id.get(evidence.validation_id or "")
+            validation = validations_by_id.get(getattr(evidence, "validation_run_id", None) or evidence.validation_id or "")
             if validation is None or evidence.validation_type != validation.type:
                 continue
             if not _validation_is_fresh_pass(validation, latest_change):
@@ -4860,6 +5414,8 @@ def _changed_tests_summary(path: str, text: str, validations: list[ValidationRun
 def _validation_output(validation: ValidationRun) -> ValidationOutput:
     return ValidationOutput(
         validation_id=validation.validation_id,
+        validation_signature_id=validation.validation_signature_id,
+        validation_run_id=validation.validation_run_id,
         command=validation.command,
         raw_command=validation.raw_command,
         normalized_command=validation.normalized_command,
@@ -4885,6 +5441,9 @@ def _validation_output(validation: ValidationRun) -> ValidationOutput:
         executed_test_files=validation.executed_test_files,
         passed_count=validation.passed_count,
         failed_count=validation.failed_count,
+        workspace_state_after_id=validation.workspace_state_after_id,
+        output_capture_status=validation.output_capture_status,
+        completion_status=validation.completion_status,
     )
 
 
@@ -5005,6 +5564,8 @@ def _validation_provenance(
     )
     return ValidationProvenance(
         validation_id=validation.validation_id,
+        validation_signature_id=validation.validation_signature_id,
+        validation_run_id=validation.validation_run_id,
         command=validation.command,
         type=validation.type,
         passed=validation.outcome == "pass" and validation.passed,
@@ -5021,6 +5582,7 @@ def _validation_provenance(
         output_kind=output_kind,
         independence_class=independence_class,
         risk_reasons=risk_reasons,
+        workspace_state_after_id=validation.workspace_state_after_id,
     )
 
 

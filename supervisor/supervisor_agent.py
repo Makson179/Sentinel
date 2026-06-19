@@ -375,10 +375,13 @@ class StatelessSupervisorAgent:
         evidence_provenance_summary: EvidenceProvenanceSummary | None = None,
         diff_packet_limits: DiffPacketLimits | None = None,
         breadth_risk_summary: BreadthRiskSummary | None = None,
-        completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
+        completion_payload_mode: Literal["full", "manifest", "true_delta", "delta", "full_fallback"] | None = None,
         completion_payload_since_sequence: int | None = None,
         completion_review_thread_id: str | None = None,
         pending_accept_gate_rejection: dict[str, Any] | None = None,
+        completion_attempt_id: str | None = None,
+        review_workspace_state_id: str | None = None,
+        review_artifact_manifest: dict[str, Any] | None = None,
     ) -> SupervisorWakePacket:
         cfg = self.store.get_sentinel_config()
         health = self.store.get_health()
@@ -389,13 +392,16 @@ class StatelessSupervisorAgent:
                 int(health_payload.get("interventions") or 0),
                 len(prior_interventions),
             )
+        task_contents = self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else ""
+        if completion_payload_mode == "true_delta":
+            task_contents = ""
         return SupervisorWakePacket(
             wake_sequence=wake_sequence,
             latest_event_sequence=cfg.last_event_sequence,
             generation=cfg.generation,
             restart_count=cfg.restart_count,
             task_path=str(self.task_path),
-            task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else "",
+            task_contents=task_contents,
             progress=self.store.read_text(PROGRESS, ""),
             decisions=self.store.read_text(DECISIONS, ""),
             last_actions=self.store.read_recent_actions(10),
@@ -437,6 +443,9 @@ class StatelessSupervisorAgent:
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=completion_review_thread_id,
             pending_accept_gate_rejection=pending_accept_gate_rejection,
+            completion_attempt_id=completion_attempt_id,
+            review_workspace_state_id=review_workspace_state_id,
+            review_artifact_manifest=review_artifact_manifest,
         )
 
     def _thread_params(self) -> dict[str, Any]:
