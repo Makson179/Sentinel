@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -230,3 +231,23 @@ async def test_execpolicy_amendment_requires_exact_offer(tmp_path: Path) -> None
     decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision == "accept"
+
+
+@pytest.mark.asyncio
+async def test_recursive_delete_of_tracked_path_is_denied(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('tracked')\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "add", "src/app.py"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            19,
+            {"command": "rm -rf src", "cwd": str(tmp_path), "availableDecisions": ["accept", "decline", "cancel"]},
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "git-tracked" in decision.reason

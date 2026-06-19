@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -22,6 +23,7 @@ from supervisor.schemas import (
     AppEventSource,
     ApprovalContext,
     ApprovalWakeContext,
+    BreadthRiskSummary,
     ChangedFile,
     ChangedFileContext,
     ChangedFileDiff,
@@ -35,6 +37,8 @@ from supervisor.schemas import (
     FinalReport,
     HealthDelta,
     HumanMessage,
+    InspectionOutput,
+    InspectionRun,
     PriorIntervention,
     RestartHandoff,
     SentinelConfig,
@@ -56,6 +60,7 @@ from supervisor.workspace_clean import clean_workspace_except_task
 
 
 VALIDATION_LEDGER_LIMIT = 50
+INSPECTION_LEDGER_LIMIT = 50
 READINESS_MARKER = "SENTINEL_READY_FOR_REVIEW"
 READINESS_MARKER_RE = re.compile(r"^\s*SENTINEL_READY_FOR_REVIEW\s*$", re.MULTILINE)
 NO_MARKER_IDLE_NUDGE = (
@@ -69,6 +74,49 @@ LARGE_DIFF_CHANGED_LINES_THRESHOLD = 500
 LARGE_DIFF_CHANGED_FILES_THRESHOLD = 10
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
+BREADTH_FEATURE_TERMS = (
+    "api",
+    "abi",
+    "array",
+    "auth",
+    "cache",
+    "case",
+    "cli",
+    "compatibility",
+    "concurrency",
+    "config",
+    "constraint",
+    "database",
+    "delete",
+    "enum",
+    "error",
+    "expression",
+    "fallback",
+    "function",
+    "group",
+    "index",
+    "insert",
+    "join",
+    "limit",
+    "migration",
+    "null",
+    "parser",
+    "permission",
+    "persistence",
+    "pointer",
+    "preprocessor",
+    "query",
+    "routing",
+    "select",
+    "snapshot",
+    "sort",
+    "storage",
+    "struct",
+    "transaction",
+    "type",
+    "update",
+    "validation",
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +155,7 @@ class EvidenceBindingIssue:
     artifact_evidence_required: bool = False
     coder_correctable: bool = False
     bounded_coder_return_key: str | None = None
+    inspection_id: str | None = None
 
 
 class SentinelController:
@@ -144,6 +193,7 @@ class SentinelController:
         self.pending_approvals: dict[int | str, ApprovalContext] = {}
         self.last_coder_message: CoderMessage | None = None
         self.validations: list[ValidationRun] = []
+        self.inspections: list[InspectionRun] = []
         self.observed_changed_files: dict[str, ChangedFile] = {}
         self._command_output_chunks: dict[str, list[str]] = {}
         self.prior_interventions: list[PriorIntervention] = []
@@ -170,6 +220,7 @@ class SentinelController:
         self._last_controller_activity_monotonic = time.monotonic()
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
+        self._last_large_diff_signature: str | None = None
 
     async def run(self) -> None:
         self.initialize_state()
@@ -208,6 +259,7 @@ class SentinelController:
             model=self.model,
         )
         self.store.initialize_sentinel(config, overwrite=self.overwrite_state)
+        _ensure_internal_runtime_git_excluded(self.project_root)
 
     async def preflight(self) -> None:
         self.tui.status("checking Codex version")
@@ -421,12 +473,24 @@ class SentinelController:
             response = self.approvals.response_payload(context, resolution)
         await self.client.respond(context.server_request_id, response)
         is_denial = _approval_resolution_is_denial(resolution.decision)
+        decision_key = _approval_resolution_metric_key(resolution.decision)
+        self._record_approval_metric(decision=decision_key, from_supervisor=resolution.from_supervisor)
         self.tui.render("DENIED" if is_denial else "APPROVAL", f"{resolution.decision}: {resolution.reason}")
         if resolution.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {resolution.persistent_decision}\n")
         if is_denial:
             if self.coder is not None:
-                await self.coder.steer_or_start(resolution.reason)
+                try:
+                    await self.coder.steer_or_start(resolution.reason)
+                except AppServerError as exc:
+                    if not _is_no_active_turn_to_steer_error(exc):
+                        raise
+                    self.tui.render("SUPERVISOR", f"denial delivered as approval response; coder steer skipped: {exc}")
+                    self.store.append_text_locked(
+                        PROGRESS,
+                        "- Approval denial was returned to app-server, but direct coder steering was skipped "
+                        f"because no active turn was available: {resolution.reason}\n",
+                    )
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
@@ -448,6 +512,7 @@ class SentinelController:
             ],
             last_coder_message=self.last_coder_message,
             validations=list(self.validations),
+            inspections=list(getattr(self, "inspections", [])),
             prior_interventions=list(self.prior_interventions),
             changed_files=await self.changed_files(),
             patch_summary=_patch_summary_from_approval_context(context) or await self.patch_summary(),
@@ -503,12 +568,20 @@ class SentinelController:
                     item=validation_item,
                     changed_paths=list(getattr(self, "observed_changed_files", {}) or {}),
                 )
+                inspection = _inspection_from_action(
+                    triggering_action,
+                    sequence=self._sequence,
+                    item=validation_item,
+                )
                 validation_trigger_reasons: tuple[str, ...] = ()
                 if validation is not None:
                     self.validations.append(validation)
                     self.validations = self.validations[-VALIDATION_LEDGER_LIMIT:]
                     self._record_validation_progress(validation)
                     validation_trigger_reasons = self._record_validation_runtime_state(validation)
+                if inspection is not None:
+                    self.inspections.append(inspection)
+                    self.inspections = self.inspections[-INSPECTION_LEDGER_LIMIT:]
                 changed_files = await self.changed_files()
                 self._update_relevant_edit_state(changed_files)
                 runtime_decision = self.should_wake_runtime_supervisor(
@@ -716,6 +789,7 @@ class SentinelController:
         if cfg.restart_count >= cfg.max_restarts:
             await self.finalize("restart cap reached", status=SentinelStatus.STUCK)
             return
+        self._append_event(AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
         await self._close_completion_review_session()
         self.store.update_sentinel_config(lambda current: current.model_copy(update={"status": SentinelStatus.RESTARTING}))
         if self.coder:
@@ -993,20 +1067,38 @@ class SentinelController:
         validation_trigger_reasons: tuple[str, ...] = (),
     ) -> RuntimeTriggerDecision:
         reasons: list[str] = list(validation_trigger_reasons)
-        if action.exit_code is not None and action.exit_code != 0:
+        read_only_action = bool(action.command and _is_read_only_inspection_command(action.command))
+        if (
+            action.exit_code is not None
+            and action.exit_code != 0
+            and not (
+                action.command
+                and _is_read_only_inspection_command(action.command)
+                and _inspection_exit_is_usable(action.command, action.exit_code)
+            )
+        ):
             reasons.append("nonzero_exit")
         if _action_timed_out(action):
             reasons.append("timeout")
         if validation is not None and validation.trusted_validation_outcome == "masked_or_unknown":
             reasons.append("masked_validation")
-        if _has_large_diff(changed_files):
+        large_diff_signature = _large_diff_signature(changed_files) if _has_large_diff(changed_files) else None
+        if large_diff_signature is not None and not read_only_action:
             reasons.append("large_diff")
         if any(_is_suspicious_changed_path(changed.path) for changed in changed_files):
             reasons.append("suspicious_file_touched")
         restart_candidate, restart_reason = kill_restart_candidate(self.store.get_health())
-        if restart_candidate and restart_reason:
+        if restart_candidate and restart_reason and not read_only_action:
             reasons.append("restart_budget")
         reasons = list(dict.fromkeys(reasons))
+        if (
+            reasons == ["large_diff"]
+            and large_diff_signature is not None
+            and getattr(self, "_last_large_diff_signature", None) == large_diff_signature
+        ):
+            reasons = []
+        elif large_diff_signature is not None and "large_diff" in reasons:
+            self._last_large_diff_signature = large_diff_signature
         return RuntimeTriggerDecision(should_wake=bool(reasons), reasons=tuple(reasons))
 
     def _record_runtime_trigger_trace(
@@ -1067,6 +1159,37 @@ class SentinelController:
                 metric_name = f"runtime_trigger_{reason}_total"
                 current[metric_name] = int(current.get(metric_name) or 0) + 1
             current["runtime_trigger_reason_counts"] = counts
+            return current
+
+        self.store.update_runtime_metrics(patch)
+
+    def _record_supervisor_decision_metric(self, *, use_case: str, decision: str) -> None:
+        def patch(current: dict[str, Any]) -> dict[str, Any]:
+            counts = current.get("supervisor_decision_counts")
+            if not isinstance(counts, dict):
+                counts = {}
+            scope_counts = counts.get(use_case)
+            if not isinstance(scope_counts, dict):
+                scope_counts = {}
+            scope_counts[decision] = int(scope_counts.get(decision) or 0) + 1
+            counts[use_case] = scope_counts
+            current["supervisor_decision_counts"] = counts
+            current[f"{use_case}_{decision}_total"] = int(current.get(f"{use_case}_{decision}_total") or 0) + 1
+            return current
+
+        self.store.update_runtime_metrics(patch)
+
+    def _record_approval_metric(self, *, decision: str, from_supervisor: bool) -> None:
+        def patch(current: dict[str, Any]) -> dict[str, Any]:
+            counts = current.get("approval_decision_counts")
+            if not isinstance(counts, dict):
+                counts = {}
+            counts[decision] = int(counts.get(decision) or 0) + 1
+            current["approval_decision_counts"] = counts
+            current["approval_requests_total"] = int(current.get("approval_requests_total") or 0) + 1
+            current[f"approval_{decision}_total"] = int(current.get(f"approval_{decision}_total") or 0) + 1
+            if from_supervisor:
+                current["approval_from_supervisor_total"] = int(current.get("approval_from_supervisor_total") or 0) + 1
             return current
 
         self.store.update_runtime_metrics(patch)
@@ -1147,6 +1270,7 @@ class SentinelController:
             triggering_action=triggering_action,
             last_coder_message=self.last_coder_message,
             validations=list(self.validations),
+            inspections=list(getattr(self, "inspections", [])),
             human_message=human_message,
             prior_interventions=list(self.prior_interventions),
             changed_files=changed_files,
@@ -1223,6 +1347,7 @@ class SentinelController:
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence or current.last_applied_supervisor_sequence})
         )
+        self._record_supervisor_decision_metric(use_case="runtime", decision=decision.decision.value)
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
         if decision.progress_update:
@@ -1283,6 +1408,7 @@ class SentinelController:
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence})
         )
         self._append_completion_anchor_log(decision, packet=packet)
+        self._record_supervisor_decision_metric(use_case="completion", decision=decision.decision.value)
         if decision.decision == CompletionReviewDecisionKind.ACCEPT:
             gate_result = await self._completion_accept_gate(decision, packet=packet)
             if not gate_result.passed:
@@ -1353,6 +1479,7 @@ class SentinelController:
     ) -> AcceptGateResult:
         changed_files = packet.changed_files if packet is not None else await self.changed_files()
         validations = packet.validations if packet is not None else list(self.validations)
+        inspections = packet.inspections if packet is not None else list(getattr(self, "inspections", []))
         code_review_files = _material_code_review_files(changed_files)
         passed_checks: list[str] = []
 
@@ -1419,6 +1546,16 @@ class SentinelController:
                 )
             passed_checks.append("parallel_persistence_assessment")
 
+            breadth_issue = _accept_breadth_issue(packet, decision)
+            if breadth_issue is not None:
+                return AcceptGateResult(
+                    passed=False,
+                    failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
+                    check_name="breadth_risk_assessment",
+                    reason=breadth_issue,
+                )
+            passed_checks.append("breadth_risk_assessment")
+
         latest_change = (
             packet.latest_relevant_change_sequence
             if packet is not None
@@ -1442,7 +1579,12 @@ class SentinelController:
                 )
             passed_checks.append("behavioral_floor")
 
-        binding_issue = _accept_evidence_binding_issue(decision, validations, latest_change=latest_change)
+        binding_issue = _accept_evidence_binding_issue(
+            decision,
+            validations,
+            inspections,
+            latest_change=latest_change,
+        )
         if binding_issue is not None:
             details = _evidence_binding_issue_details(binding_issue)
             failure_type = (
@@ -1721,7 +1863,7 @@ class SentinelController:
             path = _path_from_git_status_line(line)
             if " -> " in path:
                 path = path.rsplit(" -> ", 1)[1].strip()
-            if path and not _is_internal_runtime_path(path, project_root=self.project_root, task_path=self.task_path):
+            if path and not _is_ignored_changed_path(path, project_root=self.project_root, task_path=self.task_path):
                 files[path] = ChangedFile(path=path, status=status)
         for line in (numstat_text or "").splitlines():
             parts = line.split("\t")
@@ -1732,7 +1874,7 @@ class SentinelController:
             path = parts[2].strip()
             if " => " in path:
                 path = path.rsplit(" => ", 1)[1].strip("{}")
-            if not path or _is_internal_runtime_path(path, project_root=self.project_root, task_path=self.task_path):
+            if not path or _is_ignored_changed_path(path, project_root=self.project_root, task_path=self.task_path):
                 continue
             existing = files.get(path)
             status = existing.status if existing else "modified"
@@ -1753,7 +1895,7 @@ class SentinelController:
             self.observed_changed_files = observed
         for raw_path in action.paths:
             path = _workspace_display_path(self.project_root, raw_path)
-            if path and not _is_internal_runtime_path(path, project_root=self.project_root, task_path=self.task_path):
+            if path and not _is_ignored_changed_path(path, project_root=self.project_root, task_path=self.task_path):
                 observed[path] = ChangedFile(path=path, status="modified", sequence=getattr(self, "_sequence", None))
 
     async def _is_git_work_tree(self) -> bool:
@@ -1812,6 +1954,11 @@ class SentinelController:
         detail_validations = [
             validation for validation in self.validations if since_sequence is None or validation.sequence > since_sequence
         ]
+        detail_inspections = [
+            inspection
+            for inspection in getattr(self, "inspections", [])
+            if since_sequence is None or inspection.sequence > since_sequence
+        ]
 
         for changed in detail_changed_files[:200]:
             file_kind = _file_kind(changed.path)
@@ -1869,6 +2016,11 @@ class SentinelController:
             "changed_file_contexts": changed_file_contexts,
             "changed_tests_summary": changed_tests_summary,
             "validation_outputs": [_validation_output(validation) for validation in detail_validations],
+            "inspection_outputs": [_inspection_output(inspection) for inspection in detail_inspections],
+            "breadth_risk_summary": _breadth_risk_summary(
+                task_contents=_read_task_text(self.task_path),
+                changed_files=changed_files,
+            ),
             "diff_packet_limits": DiffPacketLimits(
                 total_diff_chars=total_diff_chars,
                 total_context_chars=total_context_chars,
@@ -2019,6 +2171,10 @@ def _approval_wake_context(context: ApprovalContext, reason: str | None = None) 
     )
 
 
+def _is_no_active_turn_to_steer_error(exc: AppServerError) -> bool:
+    return "no active turn to steer" in str(exc).lower()
+
+
 def _fallback_restart_handoff(*, task_contents: str, reason: str, last_actions: list[str]) -> RestartHandoff:
     objective = " ".join(task_contents.strip().split())[:1000] or "Continue the selected task."
     known_evidence = "; ".join(last_actions[-5:]) or "No completed coder actions are recorded."
@@ -2069,7 +2225,13 @@ def _validation_from_action(
     outcome = "pass" if action.exit_code == 0 else "fail"
     if validation_type == "behavioral" and outcome == "pass" and not _tests_executed(action.command, output):
         outcome = "fail"
-    masking_reason = _validation_masking_reason(action.command)
+    masking_reason = _validation_masking_reason(
+        action.command,
+        validation_type=validation_type,
+        changed_paths=changed_paths or [],
+    )
+    if masking_reason is None and validation_type == "behavior_demo" and outcome == "pass":
+        masking_reason = _behavior_demo_output_masking_reason(output)
     trusted_outcome = "passed" if outcome == "pass" else "failed"
     passed = outcome == "pass"
     if masking_reason is not None:
@@ -2111,9 +2273,48 @@ def _validation_from_action(
     )
 
 
+def _inspection_from_action(
+    action: TriggeringAction,
+    *,
+    sequence: int,
+    item: Any = None,
+) -> InspectionRun | None:
+    if action.kind != "commandExecution" or not action.command:
+        return None
+    if not _is_read_only_inspection_command(action.command):
+        return None
+    output = _command_output_from_item(item)
+    normalized_command = _normalize_command(action.command)
+    inspected_paths = _inspected_paths_from_command(action.command)
+    outcome = "pass" if _inspection_exit_is_usable(action.command, action.exit_code) else "fail"
+    summary = _validation_summary(action.summary, output)
+    return InspectionRun(
+        inspection_id=_stable_inspection_id(
+            normalized_command=normalized_command,
+            cwd=action.cwd,
+            inspected_paths=inspected_paths,
+        ),
+        command=action.command,
+        raw_command=action.command,
+        normalized_command=normalized_command,
+        cwd=action.cwd,
+        exit_code=action.exit_code,
+        shell_exit_code=action.exit_code,
+        outcome=outcome,
+        passed=outcome == "pass",
+        summary=summary,
+        captured_output=output,
+        captured_output_truncated=output.endswith("...<truncated>"),
+        sequence=sequence,
+        inspected_paths=inspected_paths,
+    )
+
+
 def _classify_validation_command(command: str, *, changed_paths: list[str]) -> str | None:
     if _is_git_inspection_command(command):
         return "static" if _is_git_diff_check_command(command) else None
+    if _is_read_only_inspection_command(command):
+        return None
     if _is_static_validation_command(command):
         return "static"
     if _is_behavioral_validation_command(command):
@@ -2126,17 +2327,19 @@ def _classify_validation_command(command: str, *, changed_paths: list[str]) -> s
 def _is_static_validation_command(command: str) -> bool:
     lowered = command.lower()
     executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
+    node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
+    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
     patterns = (
-        r"(^|[\s;&|()'\"])(node|nodejs)\s+-c(\s|$)",
-        r"(^|[\s;&|()'\"])(node|nodejs)\s+--check(\s|$)",
+        r"(^|[\s;&|()'\"])" + node_exec + r"\s+-c(\s|$)",
+        r"(^|[\s;&|()'\"])" + node_exec + r"\s+--check(\s|$)",
         r"(^|[\s;&|()'\"])git\s+diff\s+--check(\s|$)",
         executable_prefix + r"eslint(\s|$)",
         r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?lint(\s|$|:)",
         r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?type-?check(\s|$|:)",
         executable_prefix + r"prettier\s+--check(\s|$)",
         executable_prefix + r"tsc(?:\s+[^;&|()]*)?\s+--noemit(\s|$)",
-        r"(^|[\s;&|()'\"])(python|python3)\s+-m\s+(py_compile|compileall)(\s|$)",
-        r"(^|[\s;&|()'\"])(python|python3)\s+-m\s+json\.tool(\s|$)",
+        r"(^|[\s;&|()'\"])" + python_exec + r"\s+-m\s+(py_compile|compileall)(\s|$)",
+        r"(^|[\s;&|()'\"])" + python_exec + r"\s+-m\s+json\.tool(\s|$)",
         r"(^|[\s;&|()'\"])jq\s+['\"]?\.['\"]?(\s|$)",
         r"json\.parse\s*\(",
     )
@@ -2155,15 +2358,50 @@ def _is_git_diff_check_command(command: str) -> bool:
     return bool(re.search(pattern, lowered))
 
 
+def _is_read_only_inspection_command(command: str) -> bool:
+    lowered = command.lower()
+    if any(marker in lowered for marker in ("<<", "$(", "`")):
+        return False
+    if re.search(r"(?<![12])>(?!&)", command) or re.search(r"(^|[^<])<(?!<)", command):
+        return False
+    segments = [segment.strip() for segment in re.split(r"\s*(?:&&|;|\|)\s*", command) if segment.strip()]
+    if not segments:
+        return False
+    return all(_is_read_only_inspection_segment(segment) for segment in segments)
+
+
+def _is_read_only_inspection_segment(segment: str) -> bool:
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+    tokens = [token for token in tokens if token]
+    while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    args = [token.lower() for token in tokens[1:]]
+    if executable == "git":
+        return bool(args) and args[0] in {"diff", "status", "log", "show", "branch", "remote", "rev-parse", "for-each-ref"}
+    if executable in {"cat", "sed", "grep", "egrep", "fgrep", "rg", "head", "tail", "nl", "ls", "wc", "pwd", "stat", "file", "find"}:
+        if executable == "find" and any(arg in {"-delete", "-exec", "-execdir"} for arg in args):
+            return False
+        return True
+    return False
+
+
 def _is_behavioral_validation_command(command: str) -> bool:
     lowered = command.lower()
     executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
+    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
     patterns = (
         executable_prefix + r"mocha(\s|$)",
         r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?test(\s|$|:)",
-        r"(^|[\s;&|()'\"])(node|nodejs)\s+--test(\s|$)",
-        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
+        r"(^|[\s;&|()'\"])" + node_exec + r"\s+--test(\s|$)",
+        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
         executable_prefix + r"(jest|ava|tap|vitest|playwright|cypress|pytest|tox|rspec)(\s|$)",
         executable_prefix + r"(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
     )
@@ -2177,9 +2415,10 @@ def _is_test_wrapper_script_command(command: str) -> bool:
     script_with_test_token = (
         r"(?:\.{1,2}/|/)?(?:[\w.-]+/)*" + test_script_basename + r"\.(py|js|mjs|cjs|rb|sh)"
     )
+    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:python(?:3(?:\.\d+)?)?|node(?:js)?|ruby|bash|sh)"
     shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
     patterns = (
-        r"(^|[\s;&|()'\"])(python|python3|node|nodejs|ruby|bash|sh)\s+(?!-)" + script_with_test_token + boundary,
+        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(?!-)" + script_with_test_token + boundary,
         r"(^|[\s;&|()'\"])" + script_with_test_token + boundary,
         shell_prefix + r"\s+-[a-z]*c\s+['\"]?" + script_with_test_token + boundary,
     )
@@ -2190,10 +2429,12 @@ def _is_direct_script_execution_command(command: str) -> bool:
     lowered = command.lower()
     boundary = r"(?=$|[\s;&|()'\"])"
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
+    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:node(?:js)?|ruby|bash|sh)"
     shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
     patterns = (
-        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+(?!-)[\w./-]+\.py" + boundary,
-        r"(^|[\s;&|()'\"])(node|nodejs|ruby|bash|sh)\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
+        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+(?!-)[\w./-]+\.py" + boundary,
+        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
         r"(^|[\s;&|()'\"])(?:\.{1,2}/|/)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
         shell_prefix + r"\s+-[a-z]*c\s+['\"]?(?!-)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
     )
@@ -2203,17 +2444,21 @@ def _is_direct_script_execution_command(command: str) -> bool:
 def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool:
     lowered = command.lower()
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
+    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
+    ruby_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*ruby"
     inline_patterns = (
-        r"(^|[\s;&|()'\"])(node|nodejs)\s+-e(\s|$)",
-        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-c(\s|$)",
-        r"(^|[\s;&|()'\"])(ruby)\s+-e(\s|$)",
+        r"(^|[\s;&|()'\"])" + node_exec + r"\s+-e(\s|$)",
+        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+-c(\s|$)",
+        r"(^|[\s;&|()'\"])" + ruby_exec + r"\s+-e(\s|$)",
     )
     http_patterns = (
         r"(^|[\s;&|()'\"])(curl|wget|http|https)\s+",
         r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?)",
     )
     return (
-        _is_direct_script_execution_command(command)
+        (_has_behavior_demo_marker(command) and _marked_behavior_demo_command_is_plausible(command, changed_paths))
+        or _is_direct_script_execution_command(command)
         or _is_stdin_script_demo_command(command)
         or _command_requires_changed_module(command, changed_paths)
         or any(re.search(pattern, lowered) for pattern in inline_patterns)
@@ -2221,21 +2466,75 @@ def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool
     )
 
 
+def _has_behavior_demo_marker(command: str) -> bool:
+    return bool(re.search(r"\bSENTINEL_BEHAVIOR_DEMO\s*=\s*(?:1|true|yes)\b", command, re.IGNORECASE))
+
+
+def _marked_behavior_demo_command_is_plausible(command: str, changed_paths: list[str]) -> bool:
+    if _is_read_only_inspection_command(command):
+        return False
+    if _is_observationless_output_command(command):
+        return False
+    if _is_direct_script_execution_command(command) or _is_stdin_script_demo_command(command):
+        return True
+    if _command_requires_changed_module(command, changed_paths):
+        return True
+    lowered = command.lower()
+    if re.search(r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?)", lowered):
+        return True
+    normalized_command = lowered.replace("\\", "/")
+    for raw_path in changed_paths:
+        path = raw_path.replace("\\", "/").lstrip("./").lower()
+        if not path or _is_internal_runtime_path(path, project_root=None, task_path=None):
+            continue
+        name = path.rsplit("/", 1)[-1]
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        if path in normalized_command or (stem and len(stem) >= 3 and stem in normalized_command):
+            return True
+    return bool(re.search(r"(^|[\s;&|()'\"])(?:\.{1,2}/|/)[\w./-]+(?:\s|$)", lowered))
+
+
+def _is_observationless_output_command(command: str) -> bool:
+    segments = [segment.strip() for segment in re.split(r"\s*(?:&&|;|\|)\s*", command) if segment.strip()]
+    if not segments:
+        return False
+    output_only = {"echo", "printf", "true", "false", "yes"}
+    read_only_excerpt = {"cat", "sed", "grep", "egrep", "fgrep", "rg", "head", "tail", "nl", "ls", "wc", "pwd"}
+    seen_executable = False
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            return False
+        while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        executable = tokens[0].rsplit("/", 1)[-1].lower()
+        seen_executable = True
+        if executable not in output_only and executable not in read_only_excerpt:
+            return False
+    return seen_executable
+
+
 def _is_stdin_script_demo_command(command: str) -> bool:
     lowered = command.lower()
     if "<<" not in lowered:
         return False
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
+    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
+    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:node(?:js)?|ruby|bash|sh|zsh)"
     patterns = (
-        r"(^|[\s;&|()'\"])(python|python3)" + python_flags + r"*\s+-?\s*<<",
-        r"(^|[\s;&|()'\"])(node|nodejs|ruby|bash|sh|zsh)\s+-?\s*<<",
+        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+-?\s*<<",
+        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+-?\s*<<",
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
 def _command_requires_changed_module(command: str, changed_paths: list[str]) -> bool:
     lowered = command.lower()
-    if not re.search(r"(^|[\s;&|()'\"])(node|nodejs|python|python3|ruby)\s+(-e|-c|\S+)", lowered):
+    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:node(?:js)?|python(?:3(?:\.\d+)?)?|ruby)"
+    if not re.search(r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(-e|-c|\S+)", lowered):
         return False
     if not re.search(r"\b(require|import|node|nodejs|python|python3|ruby)\b", lowered):
         return False
@@ -2309,7 +2608,7 @@ def _collect_output_delta_strings(value: Any, parts: list[str], *, depth: int) -
         return
     for key, nested in value.items():
         key_text = str(key).lower()
-        if key_text in {"delta", "output", "stdout", "stderr", "text", "content", "message", "chunk", "data"}:
+        if key_text in {"delta", "output", "aggregatedoutput", "stdout", "stderr", "text", "content", "message", "chunk", "data"}:
             _collect_output_delta_strings(nested, parts, depth=depth + 1)
         elif key_text in {"outputs", "chunks", "lines", "items"}:
             _collect_output_delta_strings(nested, parts, depth=depth + 1)
@@ -2351,7 +2650,57 @@ def _stable_validation_id(
     return f"validation-{digest[:16]}"
 
 
-def _validation_masking_reason(command: str) -> str | None:
+def _stable_inspection_id(
+    *,
+    normalized_command: str,
+    cwd: str | None,
+    inspected_paths: list[str],
+) -> str:
+    payload = {
+        "normalized_command": normalized_command,
+        "cwd": cwd or "",
+        "inspected_paths": sorted(dict.fromkeys(inspected_paths)),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"inspection-{digest[:16]}"
+
+
+def _inspection_exit_is_usable(command: str, exit_code: int | None) -> bool:
+    if exit_code == 0:
+        return True
+    if exit_code == 1 and re.search(r"(^|[\s;&|()'\"])(?:rg|grep|egrep|fgrep)\b", command.lower()):
+        return True
+    return False
+
+
+def _validation_masking_reason(
+    command: str,
+    *,
+    validation_type: str | None = None,
+    changed_paths: list[str] | None = None,
+) -> str | None:
+    if (
+        validation_type == "behavior_demo"
+        and _has_behavior_demo_marker(command)
+        and _marked_behavior_demo_command_is_plausible(command, changed_paths or [])
+    ):
+        return _marked_behavior_demo_masking_reason(command)
+    return _generic_validation_masking_reason(command)
+
+
+def _marked_behavior_demo_masking_reason(command: str) -> str | None:
+    lowered = command.lower()
+    pipeline_probe = lowered.replace("||", "")
+    if "|" in pipeline_probe and "pipefail" not in lowered:
+        return "pipeline_without_pipefail"
+    if "||" in lowered and not re.search(r"\|\|\s*exit\s+1(\s|$)", lowered):
+        return "logical_or_may_mask_validation_failure"
+    if ("$(" in command or "`" in command) and not _shell_errexit_is_enabled(command):
+        return "command_substitution_may_mask_failure"
+    return None
+
+
+def _generic_validation_masking_reason(command: str) -> str | None:
     lowered = command.lower()
     pipeline_probe = lowered.replace("||", "")
     if "|" in pipeline_probe and "pipefail" not in lowered:
@@ -2363,6 +2712,18 @@ def _validation_masking_reason(command: str) -> str | None:
     if ";" in lowered:
         return "command_separator_may_mask_validation_failure"
     return None
+
+
+def _behavior_demo_output_masking_reason(output: str) -> str | None:
+    if _captured_output_is_self_verdict_only(output):
+        return "behavior_demo_self_verdict_only"
+    if _captured_output_looks_like_test_runner(output):
+        return "behavior_demo_looks_like_test_runner_output"
+    return None
+
+
+def _shell_errexit_is_enabled(command: str) -> bool:
+    return bool(re.search(r"(^|[\s;&|()'\"])(?:set\s+-[a-z]*e[a-z]*|set\s+-o\s+errexit)\b", command.lower()))
 
 
 def _command_was_filtered(command: str) -> bool:
@@ -2522,7 +2883,7 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
         return
     for key, nested in value.items():
         key_text = str(key).lower()
-        if key_text in {"output", "stdout", "stderr", "text", "content", "message", "summary"}:
+        if key_text in {"output", "aggregatedoutput", "stdout", "stderr", "text", "content", "message", "summary"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
         elif key_text in {"outputs", "chunks", "lines", "items", "result", "results"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
@@ -2692,6 +3053,8 @@ def _material_code_review_files(changed_files: list[ChangedFile]) -> list[Change
 
 
 def _is_non_material_changed_path(path: str) -> bool:
+    if _is_generated_or_cache_artifact_path(path, project_root=None):
+        return True
     normalized = path.replace("\\", "/").lower().strip("/")
     parts = set(normalized.split("/"))
     if parts & {
@@ -2740,6 +3103,28 @@ def _accept_structural_issue(decision: CompletionReviewDecision, *, code_changin
     ]
     if empty_evidence_fields:
         return f"behavior_evidence_matrix has evidence with missing required text fields: {', '.join(empty_evidence_fields[:5])}"
+    missing_evidence_ids = [
+        row.behavior
+        for row in decision.behavior_evidence_matrix
+        for evidence in row.evidence
+        if (
+            evidence.validation_type == "inspection"
+            and not (evidence.inspection_id or evidence.command.strip())
+        )
+        or (
+            evidence.validation_type != "inspection"
+            and not evidence.validation_id
+        )
+        or (
+            evidence.validation_id
+            and evidence.inspection_id
+        )
+    ]
+    if missing_evidence_ids:
+        return (
+            "behavior_evidence_matrix has evidence with missing or ambiguous validation_id/inspection_id: "
+            + ", ".join(missing_evidence_ids[:5])
+        )
     if decision.uncovered_behaviors:
         return f"uncovered_behaviors is not empty: {', '.join(decision.uncovered_behaviors[:5])}"
     if decision.validation_gaps:
@@ -2772,6 +3157,101 @@ def _accept_file_review_issue(decision: CompletionReviewDecision, files: list[Ch
     return None
 
 
+def _accept_breadth_issue(packet: SupervisorWakePacket, decision: CompletionReviewDecision) -> str | None:
+    summary = packet.breadth_risk_summary
+    if summary is None or not summary.flags:
+        return None
+    min_rows = max(summary.suggested_min_behavior_rows, 1)
+    matrix_rows = decision.behavior_evidence_matrix
+    if len(matrix_rows) >= min_rows:
+        return None
+    decision_text = _completion_decision_text(decision)
+    generic_rows = [
+        row.behavior
+        for row in matrix_rows
+        if _behavior_row_looks_generic_for_broad_spec(row)
+    ]
+    missing_terms = [
+        term
+        for term in summary.task_feature_terms
+        if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}s?(?![A-Za-z0-9_])", decision_text)
+    ]
+    if not generic_rows and _decision_addresses_breadth_scope(decision_text, missing_terms=missing_terms):
+        return None
+    reason_parts = [
+        "matrix narrow relative to spec",
+        f"flags={', '.join(summary.flags)}",
+        f"rows={len(matrix_rows)} < suggested_min={min_rows}",
+    ]
+    if generic_rows:
+        reason_parts.append("generic rows=" + ", ".join(generic_rows[:3]))
+    if missing_terms:
+        reason_parts.append("unaddressed task terms=" + ", ".join(missing_terms[:8]))
+    return "; ".join(reason_parts)
+
+
+def _completion_decision_text(decision: CompletionReviewDecision) -> str:
+    parts = [
+        decision.reason,
+        decision.persistent_decision or "",
+        decision.progress_update or "",
+        " ".join(decision.uncovered_behaviors),
+        " ".join(decision.validation_gaps),
+        " ".join(decision.claim_evidence_mismatches),
+        " ".join(decision.packet_or_access_limitations),
+        " ".join(decision.changed_test_risks),
+    ]
+    for file in decision.files_reviewed:
+        parts.extend([file.path, file.reason, file.limitation or ""])
+    for row in decision.behavior_evidence_matrix:
+        parts.extend([row.behavior, row.task_basis, row.gap or "", " ".join(row.files_considered)])
+        for evidence in row.evidence:
+            parts.extend([evidence.command, evidence.why_it_covers_behavior])
+    return " ".join(parts).lower()
+
+
+def _behavior_row_looks_generic_for_broad_spec(row: Any) -> bool:
+    text = " ".join(
+        [
+            getattr(row, "behavior", "") or "",
+            getattr(row, "task_basis", "") or "",
+            getattr(row, "gap", "") or "",
+        ]
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "test coverage",
+            "tests cover",
+            "visible coverage",
+            "available coverage",
+            "public coverage",
+            "covered by tests",
+            "coverage set",
+        )
+    )
+
+
+def _decision_addresses_breadth_scope(decision_text: str, *, missing_terms: list[str]) -> bool:
+    if not missing_terms:
+        return True
+    scope_markers = (
+        "out of scope",
+        "outside scope",
+        "not in scope",
+        "not required",
+        "not requested",
+        "task does not require",
+        "outside task",
+        "not material",
+        "immaterial",
+    )
+    if not any(marker in decision_text for marker in scope_markers):
+        return False
+    mentioned_missing = sum(1 for term in missing_terms if term in decision_text)
+    return mentioned_missing >= min(3, len(missing_terms))
+
+
 def _review_marks_non_material(file: Any) -> bool:
     text = " ".join(
         str(value or "")
@@ -2801,19 +3281,142 @@ def _validation_is_fresh_pass(validation: ValidationRun, latest_change: int | No
     return validation.sequence > latest_change
 
 
+def _inspection_is_fresh_pass(inspection: InspectionRun, latest_change: int | None) -> bool:
+    if inspection.outcome != "pass" or not inspection.passed:
+        return False
+    if latest_change is None:
+        return True
+    return inspection.sequence > latest_change
+
+
+def _row_allows_inspection_evidence(row: Any) -> bool:
+    text_parts = [
+        getattr(row, "behavior", "") or "",
+        getattr(row, "task_basis", "") or "",
+        getattr(row, "gap", "") or "",
+    ]
+    for evidence in getattr(row, "evidence", []) or []:
+        text_parts.extend(
+            [
+                getattr(evidence, "command", "") or "",
+                getattr(evidence, "why_it_covers_behavior", "") or "",
+            ]
+        )
+    lowered = " ".join(text_parts).lower()
+    static_markers = (
+        "anti-hack",
+        "anti hack",
+        "anti-hacking",
+        "source inspection",
+        "static",
+        "source constraint",
+        "implementation constraint",
+        "must not",
+        "does not",
+        "do not",
+        "forbid",
+        "forbidden",
+        "no shell",
+        "shell out",
+        "subprocess",
+        "system(",
+        "exec",
+        "network",
+        "external service",
+        "hidden",
+        "private",
+        "hardcod",
+        "benchmark",
+        "verifier",
+        "harness",
+        "fixture",
+        "golden",
+        "snapshot",
+        "lockfile",
+        "no sqlite",
+    )
+    behavior_markers = (
+        "renders",
+        "returns",
+        "responds",
+        "executes",
+        "parses",
+        "compiles",
+        "handles",
+        "persists",
+        "updates",
+        "calculates",
+        "selects",
+        "joins",
+    )
+    if any(marker in lowered for marker in static_markers):
+        return True
+    return "inspection" in lowered and not any(marker in lowered for marker in behavior_markers)
+
+
+def _inspection_for_evidence(
+    evidence: Any,
+    *,
+    inspections_by_id: dict[str, InspectionRun],
+    inspections_by_command: dict[str, list[InspectionRun]],
+) -> InspectionRun | None:
+    inspection_id = getattr(evidence, "inspection_id", None)
+    if inspection_id:
+        return inspections_by_id.get(inspection_id)
+    command = getattr(evidence, "command", None)
+    if not isinstance(command, str) or not command.strip():
+        return None
+    matches = inspections_by_command.get(_normalize_command(command), [])
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def _accept_evidence_binding_issue(
     decision: CompletionReviewDecision,
     validations: list[ValidationRun],
+    inspections: list[InspectionRun],
     *,
     latest_change: int | None,
 ) -> EvidenceBindingIssue | None:
     by_id = {validation.validation_id: validation for validation in validations}
+    inspections_by_id = {inspection.inspection_id: inspection for inspection in inspections}
+    inspections_by_command: dict[str, list[InspectionRun]] = {}
+    for inspection in inspections:
+        inspections_by_command.setdefault(_normalize_command(inspection.command), []).append(inspection)
     for row in decision.behavior_evidence_matrix:
         if row.status != "covered":
             continue
         fresh_pass_found = False
         linked_evidence_found = False
+        demo_quality_issue: EvidenceBindingIssue | None = None
         for evidence in row.evidence:
+            if evidence.inspection_id or evidence.validation_type == "inspection":
+                linked_evidence_found = True
+                inspection = _inspection_for_evidence(
+                    evidence,
+                    inspections_by_id=inspections_by_id,
+                    inspections_by_command=inspections_by_command,
+                )
+                if inspection is None:
+                    continue
+                inspection_id = evidence.inspection_id or inspection.inspection_id
+                if evidence.validation_type != "inspection":
+                    continue
+                if not _row_allows_inspection_evidence(row):
+                    return EvidenceBindingIssue(
+                        reason=(
+                            f"behavior '{row.behavior}' is covered by inspection_id {inspection_id}, "
+                            "but inspection evidence only covers static/source constraints"
+                        ),
+                        kind="inspection_not_static_source",
+                        behavior=row.behavior,
+                        inspection_id=inspection_id,
+                    )
+                if _inspection_is_fresh_pass(inspection, latest_change):
+                    fresh_pass_found = True
+                    break
+                continue
             if not evidence.validation_id:
                 continue
             linked_evidence_found = True
@@ -2822,25 +3425,35 @@ def _accept_evidence_binding_issue(
                 continue
             if evidence.validation_type != validation.type:
                 continue
-            if validation.type == "behavior_demo" and not _validation_has_captured_output(validation):
-                continue
+            if validation.type == "behavior_demo":
+                demo_issue = _behavior_demo_quality_issue(
+                    validation,
+                    latest_change=latest_change,
+                    behavior=row.behavior,
+                    evidence=evidence,
+                )
+                if demo_issue is not None:
+                    demo_quality_issue = demo_issue
+                    continue
             if _validation_is_fresh_pass(validation, latest_change):
                 fresh_pass_found = True
                 break
         if not fresh_pass_found:
             if not linked_evidence_found:
                 return EvidenceBindingIssue(
-                    reason=f"behavior '{row.behavior}' is covered but has no evidence linked by validation_id",
+                    reason=f"behavior '{row.behavior}' is covered but has no evidence linked by validation_id or inspection_id",
                     kind="missing_linked_evidence",
                     behavior=row.behavior,
                 )
-            type_mismatch = _evidence_type_mismatch(row.evidence, by_id)
+            type_mismatch = _evidence_type_mismatch(row.evidence, by_id, inspections_by_id)
             if type_mismatch:
                 return EvidenceBindingIssue(
                     reason=f"behavior '{row.behavior}' evidence type mismatch: {type_mismatch}",
                     kind="type_mismatch",
                     behavior=row.behavior,
                 )
+            if demo_quality_issue:
+                return demo_quality_issue
             demo_output_issue = _behavior_demo_output_issue(
                 row.evidence,
                 by_id,
@@ -2852,7 +3465,7 @@ def _accept_evidence_binding_issue(
             return EvidenceBindingIssue(
                 reason=(
                     f"behavior '{row.behavior}' is covered but has no linked fresh passing validation "
-                    "record in the ledger"
+                    "or allowed inspection record in the ledger"
                 ),
                 kind="no_fresh_linked_validation",
                 behavior=row.behavior,
@@ -2865,6 +3478,7 @@ def _evidence_binding_issue_details(issue: EvidenceBindingIssue) -> dict[str, An
         "kind": issue.kind,
         "behavior": issue.behavior,
         "validation_id": issue.validation_id,
+        "inspection_id": issue.inspection_id,
         "validation_type": issue.validation_type,
         "command": issue.command,
         "artifact_evidence_required": issue.artifact_evidence_required,
@@ -2875,6 +3489,65 @@ def _evidence_binding_issue_details(issue: EvidenceBindingIssue) -> dict[str, An
 
 def _validation_has_captured_output(validation: ValidationRun) -> bool:
     return bool((validation.captured_output or "").strip())
+
+
+def _behavior_demo_quality_issue(
+    validation: ValidationRun,
+    *,
+    latest_change: int | None,
+    behavior: str,
+    evidence: Any,
+) -> EvidenceBindingIssue | None:
+    if not _validation_is_fresh_pass(validation, latest_change):
+        return None
+    if not _validation_has_captured_output(validation):
+        artifact_required = _looks_like_artifact_generator_evidence(
+            behavior=behavior,
+            command=validation.command,
+            evidence=evidence,
+        )
+        return EvidenceBindingIssue(
+            reason=f"behavior '{behavior}' behavior_demo evidence {validation.validation_id} has no captured output",
+            kind="behavior_demo_missing_output",
+            behavior=behavior,
+            validation_id=validation.validation_id,
+            validation_type="behavior_demo",
+            command=validation.command,
+            artifact_evidence_required=artifact_required,
+            coder_correctable=True,
+            bounded_coder_return_key=f"behavior_demo_missing_output:{behavior}:{validation.validation_id}",
+        )
+    output_kind = _validation_output_kind(validation, captured_output_present=True)
+    if output_kind == "factual_observation_candidate":
+        return None
+    if output_kind == "self_verdict_only":
+        reason = (
+            f"behavior '{behavior}' behavior_demo evidence {validation.validation_id} is only a "
+            "self-verdict, not factual observed output/state"
+        )
+        kind = "behavior_demo_self_verdict_only"
+    elif output_kind == "test_runner_output":
+        reason = (
+            f"behavior '{behavior}' behavior_demo evidence {validation.validation_id} looks like "
+            "test-runner output, not a separate factual behavior observation"
+        )
+        kind = "behavior_demo_test_runner_output"
+    else:
+        reason = (
+            f"behavior '{behavior}' behavior_demo evidence {validation.validation_id} has output "
+            "that the controller cannot classify as factual observed output/state"
+        )
+        kind = "behavior_demo_unknown_output"
+    return EvidenceBindingIssue(
+        reason=reason,
+        kind=kind,
+        behavior=behavior,
+        validation_id=validation.validation_id,
+        validation_type="behavior_demo",
+        command=validation.command,
+        coder_correctable=True,
+        bounded_coder_return_key=f"{kind}:{behavior}:{validation.validation_id}",
+    )
 
 
 def _behavior_demo_output_issue(
@@ -2939,8 +3612,20 @@ def _looks_like_artifact_generator_evidence(*, behavior: str, command: str | Non
     return any(token in lowered for token in tokens)
 
 
-def _evidence_type_mismatch(evidence_items: list[Any], validations_by_id: dict[str, ValidationRun]) -> str | None:
+def _evidence_type_mismatch(
+    evidence_items: list[Any],
+    validations_by_id: dict[str, ValidationRun],
+    inspections_by_id: dict[str, InspectionRun],
+) -> str | None:
     for evidence in evidence_items:
+        if evidence.inspection_id:
+            inspection = inspections_by_id.get(evidence.inspection_id)
+            if inspection is None or evidence.validation_type == "inspection":
+                continue
+            return (
+                f"{evidence.inspection_id} declares {evidence.validation_type} "
+                "but inspection ledger requires inspection"
+            )
         if not evidence.validation_id:
             continue
         validation = validations_by_id.get(evidence.validation_id)
@@ -2980,13 +3665,22 @@ def _self_confirming_test_evidence_issue(
             if not _validation_is_fresh_pass(validation, latest_change):
                 continue
             if validation.type == "behavior_demo":
-                if _validation_has_captured_output(validation):
+                output_kind = _validation_output_kind(
+                    validation,
+                    captured_output_present=_validation_has_captured_output(validation),
+                )
+                if output_kind == "factual_observation_candidate":
                     independent_found = True
                     break
+                reason = {
+                    "missing": "behavior_demo_missing_captured_output",
+                    "self_verdict_only": "behavior_demo_self_verdict_only",
+                    "test_runner_output": "behavior_demo_looks_like_test_runner_output",
+                }.get(output_kind, "behavior_demo_output_not_factual")
                 self_confirming_validations.append(
                     _self_confirming_validation_detail(
                         validation,
-                        reason="behavior_demo_missing_captured_output",
+                        reason=reason,
                         test_files=[],
                         coder_authored_test_files=[],
                     )
@@ -3298,7 +3992,11 @@ def _completion_accept_rejection_decision(
     if check_name == "self_confirming_test_evidence" and details:
         validation_gaps.extend(_self_confirming_validation_gaps(details, fallback_reason=reason))
         message_to_coder = _self_confirming_message_to_coder(details, fallback_reason=reason)
-    elif check_name == "evidence_binding" and details and details.get("kind") == "behavior_demo_missing_output":
+    elif (
+        check_name == "evidence_binding"
+        and details
+        and str(details.get("kind") or "").startswith("behavior_demo_")
+    ):
         validation_gaps.extend(_evidence_binding_validation_gaps(details, fallback_reason=reason))
         message_to_coder = _evidence_binding_message_to_coder(details, fallback_reason=reason)
     else:
@@ -3373,11 +4071,26 @@ def _completion_gate_followup_summary(context: dict[str, Any]) -> str:
 def _evidence_binding_validation_gaps(details: dict[str, Any], *, fallback_reason: str) -> list[str]:
     behavior = str(details.get("behavior") or "<unnamed behavior>")
     validation_id = str(details.get("validation_id") or "<unknown validation>")
+    kind = str(details.get("kind") or "")
     if details.get("artifact_evidence_required"):
         return [
             (
                 f"behavior '{behavior}' is bound to {validation_id}, but that behavior_demo has no captured "
                 "produced-artifact output; provide full artifact diff or all objective changed hunks"
+            )
+        ]
+    if kind == "behavior_demo_self_verdict_only":
+        return [
+            (
+                f"behavior '{behavior}' is bound to {validation_id}, but that behavior_demo is only "
+                "PASS/OK/self-verdict output instead of factual observed output/state"
+            )
+        ]
+    if kind == "behavior_demo_test_runner_output":
+        return [
+            (
+                f"behavior '{behavior}' is bound to {validation_id}, but that behavior_demo looks like "
+                "test-runner output instead of a separate factual behavior observation"
             )
         ]
     return [
@@ -3395,7 +4108,7 @@ def _evidence_binding_message_to_coder(details: dict[str, Any], *, fallback_reas
     lines = [
         "Continue working. Completion accept was rejected by the deterministic accept gate evidence_binding.",
         f"Behavior missing usable evidence: {behavior}",
-        f"Invalid evidence: {validation_id} from command `{command}` had no captured output.",
+        f"Invalid evidence: {validation_id} from command `{command}` is not a usable behavior_demo.",
     ]
     if details.get("artifact_evidence_required"):
         lines.append(
@@ -3860,6 +4573,8 @@ def _file_kind(path: str) -> str:
 
 
 def _is_relevant_changed_path(path: str, *, task_contents: str) -> bool:
+    if _is_generated_or_cache_artifact_path(path, project_root=None):
+        return False
     kind = _file_kind(path)
     if kind in {"source", "test", "config"}:
         return True
@@ -3908,10 +4623,72 @@ def _read_task_text(task_path: Path) -> str:
         return ""
 
 
+def _ensure_internal_runtime_git_excluded(project_root: Path) -> None:
+    git_dir = project_root / ".git"
+    if not git_dir.is_dir():
+        return
+    info_dir = git_dir / "info"
+    exclude_path = info_dir / "exclude"
+    try:
+        info_dir.mkdir(parents=True, exist_ok=True)
+        current = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+        entries = {line.strip() for line in current.splitlines()}
+        additions = [entry for entry in (".supervisor/", ".supervisor") if entry not in entries]
+        if additions:
+            suffix = "" if current.endswith("\n") or not current else "\n"
+            exclude_path.write_text(current + suffix + "\n".join(additions) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
 def _diff_line_counts(changed_files: list[ChangedFile]) -> tuple[int, int]:
     additions = sum(changed.additions or 0 for changed in changed_files)
     deletions = sum(changed.deletions or 0 for changed in changed_files)
     return additions, deletions
+
+
+def _breadth_risk_summary(*, task_contents: str, changed_files: list[ChangedFile]) -> BreadthRiskSummary:
+    task_lines = [line for line in task_contents.splitlines() if line.strip()]
+    lowered = task_contents.lower()
+    requirement_hint_count = sum(
+        1
+        for line in task_lines
+        if re.search(
+            r"\b(must|should|support|implement|handle|include|including|ensure|preserve|compatib|require|allow|prevent)\b",
+            line,
+            re.IGNORECASE,
+        )
+        or re.match(r"\s*[-*]\s+", line)
+    )
+    feature_terms = [
+        term
+        for term in BREADTH_FEATURE_TERMS
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}s?(?![A-Za-z0-9_])", lowered)
+    ]
+    additions, deletions = _diff_line_counts(changed_files)
+    changed_source_files = [changed for changed in changed_files if _file_kind(changed.path) == "source"]
+    changed_lines = additions + deletions
+    flags: list[str] = []
+    if len(task_contents) >= 2500 or len(task_lines) >= 45 or requirement_hint_count >= 10 or len(feature_terms) >= 10:
+        flags.append("task_spec_appears_broad")
+    if len(changed_source_files) >= 4 or changed_lines >= LARGE_DIFF_CHANGED_LINES_THRESHOLD:
+        flags.append("implementation_diff_is_broad")
+    if len(feature_terms) >= 8:
+        flags.append("many_task_feature_terms")
+    suggested_min = 0
+    if flags:
+        suggested_min = 6
+        if len(task_contents) >= 6000 or requirement_hint_count >= 18 or len(feature_terms) >= 16:
+            suggested_min = 8
+    return BreadthRiskSummary(
+        flags=flags,
+        task_line_count=len(task_lines),
+        requirement_hint_count=requirement_hint_count,
+        task_feature_terms=feature_terms,
+        changed_source_files_count=len(changed_source_files),
+        changed_lines=changed_lines,
+        suggested_min_behavior_rows=suggested_min,
+    )
 
 
 def _has_large_diff(changed_files: list[ChangedFile]) -> bool:
@@ -3920,6 +4697,20 @@ def _has_large_diff(changed_files: list[ChangedFile]) -> bool:
         len(changed_files) >= LARGE_DIFF_CHANGED_FILES_THRESHOLD
         or additions + deletions >= LARGE_DIFF_CHANGED_LINES_THRESHOLD
     )
+
+
+def _large_diff_signature(changed_files: list[ChangedFile]) -> str:
+    payload = [
+        {
+            "path": changed.path,
+            "status": changed.status,
+            "additions": changed.additions,
+            "deletions": changed.deletions,
+        }
+        for changed in sorted(changed_files, key=lambda item: item.path)
+    ]
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
 
 
 def _action_timed_out(action: TriggeringAction) -> bool:
@@ -3982,6 +4773,25 @@ def _validation_output(validation: ValidationRun) -> ValidationOutput:
         executed_test_files=validation.executed_test_files,
         passed_count=validation.passed_count,
         failed_count=validation.failed_count,
+    )
+
+
+def _inspection_output(inspection: InspectionRun) -> InspectionOutput:
+    return InspectionOutput(
+        inspection_id=inspection.inspection_id,
+        command=inspection.command,
+        raw_command=inspection.raw_command,
+        normalized_command=inspection.normalized_command,
+        cwd=inspection.cwd,
+        exit_code=inspection.exit_code,
+        shell_exit_code=inspection.shell_exit_code,
+        outcome=inspection.outcome,
+        passed=inspection.passed,
+        sequence=inspection.sequence,
+        stdout_or_summary=inspection.summary,
+        captured_output=inspection.captured_output,
+        output_truncated=inspection.summary.endswith("...<truncated>") or inspection.captured_output_truncated,
+        inspected_paths=inspection.inspected_paths,
     )
 
 
@@ -4233,6 +5043,62 @@ def _target_files_or_test_files(command: str) -> list[str]:
     return list(dict.fromkeys(targets))
 
 
+def _inspected_paths_from_command(command: str, *, limit: int = 50) -> list[str]:
+    targets: list[str] = []
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    option_value_flags = {"-f", "--file", "--config", "-C"}
+    skip_next = False
+    commands = {
+        "cat",
+        "sed",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "head",
+        "tail",
+        "nl",
+        "ls",
+        "wc",
+        "pwd",
+        "stat",
+        "file",
+        "find",
+        "git",
+        "diff",
+        "status",
+        "log",
+        "show",
+        "branch",
+        "remote",
+        "rev-parse",
+        "for-each-ref",
+    }
+    common_target_dirs = {"src", "lib", "app", "tests", "test", "include", "public", "packages", "pkg"}
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in option_value_flags:
+            skip_next = True
+            continue
+        stripped = token.strip("'\"").lstrip("./")
+        if not stripped or stripped.startswith("-") or stripped in commands:
+            continue
+        if stripped == ".":
+            targets.append(".")
+        elif stripped in common_target_dirs:
+            targets.append(stripped)
+        elif "/" in stripped or re.search(r"\.[A-Za-z0-9_-]{1,12}$", stripped):
+            targets.append(stripped)
+        if len(targets) >= limit:
+            break
+    return list(dict.fromkeys(targets))
+
+
 def _paths_from_item(item: dict[str, Any]) -> list[str]:
     paths: list[str] = []
     raw_paths = item.get("paths")
@@ -4337,6 +5203,14 @@ def _approval_resolution_is_denial(decision: str | dict[str, Any]) -> bool:
     return isinstance(decision, str) and decision in {"decline", "cancel", "denied", "abort"}
 
 
+def _approval_resolution_metric_key(decision: str | dict[str, Any]) -> str:
+    if isinstance(decision, str):
+        return decision
+    if isinstance(decision, dict) and decision:
+        return str(next(iter(decision)))
+    return "unknown"
+
+
 def _observed_changed_files(controller: Any) -> list[ChangedFile]:
     observed = getattr(controller, "observed_changed_files", None)
     if not isinstance(observed, dict):
@@ -4346,7 +5220,7 @@ def _observed_changed_files(controller: Any) -> list[ChangedFile]:
     return [
         changed
         for changed in observed.values()
-        if not _is_internal_runtime_path(changed.path, project_root=project_root, task_path=task_path)
+        if not _is_ignored_changed_path(changed.path, project_root=project_root, task_path=task_path)
     ][:200]
 
 
@@ -4377,10 +5251,100 @@ def _is_internal_runtime_path(path: str, *, project_root: Path | None, task_path
     normalized = _normalize_internal_workspace_path(str(path).strip().strip("'\""))
     if not normalized:
         return False
+    if normalized == ".git-init.log":
+        return True
     if normalized == ".supervisor" or normalized.startswith(".supervisor/"):
         return True
     task_relative = _task_relative_workspace_path(project_root=project_root, task_path=task_path)
     return bool(task_relative and normalized == task_relative)
+
+
+def _is_ignored_changed_path(path: str, *, project_root: Path | None, task_path: Path | str | None) -> bool:
+    return _is_internal_runtime_path(
+        path,
+        project_root=project_root,
+        task_path=task_path,
+    ) or _is_generated_or_cache_artifact_path(path, project_root=project_root)
+
+
+def _is_generated_or_cache_artifact_path(path: str, *, project_root: Path | None) -> bool:
+    normalized = _normalize_internal_workspace_path(str(path).strip().strip("'\""))
+    if not normalized:
+        return False
+    parts = set(normalized.lower().split("/"))
+    if parts & {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".cache",
+        ".next",
+        ".parcel-cache",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+        "target",
+        "coverage",
+    }:
+        return True
+    name = normalized.rsplit("/", 1)[-1].lower()
+    if name.endswith(
+        (
+            ".o",
+            ".obj",
+            ".lo",
+            ".pyc",
+            ".pyo",
+            ".class",
+            ".so",
+            ".dylib",
+            ".dll",
+            ".exe",
+            ".a",
+            ".lib",
+            ".rlib",
+            ".wasm",
+            ".gcda",
+            ".gcno",
+        )
+    ):
+        return True
+    return _is_probably_compiled_binary_artifact(normalized, project_root=project_root)
+
+
+def _is_probably_compiled_binary_artifact(normalized_path: str, *, project_root: Path | None) -> bool:
+    if project_root is None:
+        return False
+    name = normalized_path.rsplit("/", 1)[-1]
+    if "." in name:
+        return False
+    workspace_path = Path(normalized_path)
+    candidate = workspace_path if workspace_path.is_absolute() else Path(project_root) / workspace_path
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(Path(project_root).resolve())
+        if not resolved.is_file():
+            return False
+        head = resolved.read_bytes()[:4096]
+    except (OSError, ValueError):
+        return False
+    if not head:
+        return False
+    binary_magic = (
+        b"\x7fELF",
+        b"MZ",
+        b"\x00asm",
+        b"\xca\xfe\xba\xbe",
+        b"\xfe\xed\xfa\xce",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xcf\xfa\xed\xfe",
+        b"\xbe\xba\xfe\xca",
+        b"BC\xc0\xde",
+    )
+    return head.startswith(binary_magic) or b"\0" in head
 
 
 def _task_relative_workspace_path(*, project_root: Path | None, task_path: Path | str | None) -> str | None:
@@ -4418,7 +5382,7 @@ def _filter_internal_git_output(
         lines = [
             line
             for line in output.splitlines()
-            if not _is_internal_runtime_path(
+            if not _is_ignored_changed_path(
                 _git_status_changed_path(line),
                 project_root=project_root,
                 task_path=task_path,
@@ -4429,7 +5393,7 @@ def _filter_internal_git_output(
         lines = [
             line
             for line in output.splitlines()
-            if not _is_internal_runtime_path(line.strip(), project_root=project_root, task_path=task_path)
+            if not _is_ignored_changed_path(line.strip(), project_root=project_root, task_path=task_path)
         ]
         return "\n".join(lines)
     if command[:2] == ["git", "diff"] and "--stat" in command:
@@ -4438,7 +5402,7 @@ def _filter_internal_git_output(
             if "|" not in line:
                 continue
             path = line.split("|", 1)[0].strip()
-            if not _is_internal_runtime_path(path, project_root=project_root, task_path=task_path):
+            if not _is_ignored_changed_path(path, project_root=project_root, task_path=task_path):
                 lines.append(line)
         return "\n".join(lines)
     return output
@@ -4534,7 +5498,7 @@ def _changed_files_from_diff_summary(
             if not stripped or stripped.startswith("$"):
                 continue
             path = _git_status_changed_path(stripped)
-            if path and not _is_internal_runtime_path(path, project_root=project_root, task_path=task_path) and path not in files:
+            if path and not _is_ignored_changed_path(path, project_root=project_root, task_path=task_path) and path not in files:
                 files.append(path)
     marker = "$ git diff --name-only"
     if marker in diff:
@@ -4544,7 +5508,7 @@ def _changed_files_from_diff_summary(
             if (
                 path
                 and not path.startswith("$")
-                and not _is_internal_runtime_path(path, project_root=project_root, task_path=task_path)
+                and not _is_ignored_changed_path(path, project_root=project_root, task_path=task_path)
                 and path not in files
             ):
                 files.append(path)

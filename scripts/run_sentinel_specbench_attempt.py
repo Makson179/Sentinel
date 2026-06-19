@@ -1054,6 +1054,7 @@ def write_run_report(
     heldout_score = read_json(paths.scoring / "heldout_score.json", {})
     scoring_finished = scoring_rc == 0 and bool(validation_score or heldout_score)
     valid_scored_run = sentinel_rc == 0 and scoring_finished and not hidden_check["heldout_tests_present"]
+    controller_acceptance = read_controller_acceptance(paths)
     report = f"""# Sentinel SpecBench Attempt Report
 
 ## Task
@@ -1092,7 +1093,16 @@ def write_run_report(
 - final diff: `{paths.artifacts / 'agent_diff_vs_initial.diff'}`
 - final workspace archive: `{paths.artifacts / 'final-workspace-no-git-no-supervisor.tar.gz'}`
 
-## Scoring
+## Controller Acceptance
+
+- controller status: `{controller_acceptance.get('status')}`
+- controller result: `{controller_acceptance.get('result')}`
+- completion review accepted: `{controller_acceptance.get('completion_review_accepted')}`
+- completion returns: `{controller_acceptance.get('completion_returns')}`
+- completion restarts: `{controller_acceptance.get('completion_restarts')}`
+- final report: `{paths.artifacts / '.supervisor' / 'FINAL_REPORT.md'}`
+
+## SpecBench Scoring
 
 - scoring exit code: `{scoring_rc}`
 - validation score: `{validation_score.get('score')}`
@@ -1115,6 +1125,37 @@ def write_run_report(
 - runner-detected environment problems: `none`
 """
     (paths.root / "run_report.md").write_text(report, encoding="utf-8")
+
+
+def read_controller_acceptance(paths: RunPaths) -> dict[str, Any]:
+    final_report = paths.artifacts / ".supervisor" / "FINAL_REPORT.md"
+    if not final_report.exists():
+        return {
+            "status": None,
+            "result": None,
+            "completion_review_accepted": None,
+            "completion_returns": None,
+            "completion_restarts": None,
+        }
+    fields: dict[str, Any] = {}
+    prefixes = {
+        "- Status: ": "status",
+        "- Result: ": "result",
+        "- Completion review accepted: ": "completion_review_accepted",
+        "- Completion returns: ": "completion_returns",
+        "- Completion restarts: ": "completion_restarts",
+    }
+    for line in final_report.read_text(encoding="utf-8", errors="replace").splitlines():
+        for prefix, key in prefixes.items():
+            if line.startswith(prefix):
+                fields[key] = line[len(prefix) :].strip()
+    return {
+        "status": fields.get("status"),
+        "result": fields.get("result"),
+        "completion_review_accepted": fields.get("completion_review_accepted"),
+        "completion_returns": fields.get("completion_returns"),
+        "completion_restarts": fields.get("completion_restarts"),
+    }
 
 
 def copytree_replace(src: Path, dst: Path) -> None:

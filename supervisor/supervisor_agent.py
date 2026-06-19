@@ -13,6 +13,7 @@ from supervisor.prompts import build_completion_review_prompt, build_stateless_s
 from supervisor.schemas import (
     ApprovalContext,
     ApprovalWakeContext,
+    BreadthRiskSummary,
     ChangedFile,
     ChangedFileContext,
     ChangedFileDiff,
@@ -22,6 +23,8 @@ from supervisor.schemas import (
     DiffPacketLimits,
     EvidenceProvenanceSummary,
     HumanMessage,
+    InspectionOutput,
+    InspectionRun,
     PriorIntervention,
     RestartHandoff,
     SupervisorDecision,
@@ -117,73 +120,95 @@ class StatelessSupervisorAgent:
                     raise SupervisorAgentError("supervisor thread/start did not return thread id")
                 if persistent_completion_thread:
                     self.completion_thread_id = thread_id
-            turn_response = await self._await_rpc(
-                "supervisor turn/start response",
-                self.client.turn_start(
-                    {
-                        "threadId": thread_id,
-                        "input": [text_input(prompt)],
-                        "approvalPolicy": "never",
-                        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-                        "outputSchema": schema,
-                        **({"model": self.model} if self.model else {}),
-                    },
-                    timeout=timeout_seconds,
-                ),
-                thread_id=thread_id,
-                timeout=timeout_seconds,
-            )
-            turn = turn_response.get("turn", {})
-            turn_id_value = turn.get("id")
-            if not isinstance(turn_id_value, str):
-                raise SupervisorAgentError("supervisor turn/start did not return turn id")
-            turn_id = turn_id_value
-            if turn.get("status") != "completed":
-                try:
-                    completed = await self.client.wait_for_notification(
-                        lambda message: message.method == "turn/completed"
-                        and message.params.get("threadId") == thread_id
-                        and isinstance(message.params.get("turn"), dict)
-                        and message.params["turn"].get("id") == turn_id,
-                        timeout=timeout_seconds,
-                    )
-                except (asyncio.TimeoutError, AppServerError) as exc:
-                    raise SupervisorAgentError(
-                        self._stage_error(
-                            "supervisor turn/completed notification",
-                            thread_id=thread_id,
-                            turn_id=turn_id,
-                            timeout=timeout_seconds,
-                        )
-                    ) from exc
-                turn = completed.params.get("turn", {})
-            text = last_agent_message_text(turn)
-            if text is None:
-                turns = await self._await_rpc(
-                    "supervisor thread/turns/list response",
-                    self.client.thread_turns_list(
-                        thread_id,
-                        limit=5,
-                        items_view="full",
+            turn_prompt = prompt
+            for attempt in range(2):
+                turn_response = await self._await_rpc(
+                    "supervisor turn/start response",
+                    self.client.turn_start(
+                        {
+                            "threadId": thread_id,
+                            "input": [text_input(turn_prompt)],
+                            "approvalPolicy": "never",
+                            "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                            "outputSchema": schema,
+                            **({"model": self.model} if self.model else {}),
+                        },
                         timeout=timeout_seconds,
                     ),
                     thread_id=thread_id,
-                    turn_id=turn_id,
                     timeout=timeout_seconds,
                 )
-                data = turns.get("data", [])
-                text = _agent_message_text_from_turns(data, turn_id=turn_id)
-            if text is None:
-                raise SupervisorAgentError("supervisor did not produce an agent message")
-            raw_text = text
-            decision = model_cls.model_validate(_parse_json_object(text))
-            if isinstance(decision, (SupervisorDecision, CompletionReviewDecision)):
-                decision.wake_sequence = packet.wake_sequence
-                decision.generation = packet.generation
-            return decision
-        except (ValidationError, json.JSONDecodeError) as exc:
-            audit_error = f"invalid supervisor decision: {exc}"
-            raise SupervisorAgentError(audit_error) from exc
+                turn = turn_response.get("turn", {})
+                turn_id_value = turn.get("id")
+                if not isinstance(turn_id_value, str):
+                    raise SupervisorAgentError("supervisor turn/start did not return turn id")
+                turn_id = turn_id_value
+                if turn.get("status") != "completed":
+                    try:
+                        completed = await self.client.wait_for_notification(
+                            lambda message: message.method == "turn/completed"
+                            and message.params.get("threadId") == thread_id
+                            and isinstance(message.params.get("turn"), dict)
+                            and message.params["turn"].get("id") == turn_id,
+                            timeout=timeout_seconds,
+                        )
+                    except (asyncio.TimeoutError, AppServerError) as exc:
+                        raise SupervisorAgentError(
+                            self._stage_error(
+                                "supervisor turn/completed notification",
+                                thread_id=thread_id,
+                                turn_id=turn_id,
+                                timeout=timeout_seconds,
+                            )
+                        ) from exc
+                    turn = completed.params.get("turn", {})
+                text = last_agent_message_text(turn)
+                if text is None:
+                    turns = await self._await_rpc(
+                        "supervisor thread/turns/list response",
+                        self.client.thread_turns_list(
+                            thread_id,
+                            limit=5,
+                            items_view="full",
+                            timeout=timeout_seconds,
+                        ),
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        timeout=timeout_seconds,
+                    )
+                    data = turns.get("data", [])
+                    text = _agent_message_text_from_turns(data, turn_id=turn_id)
+                if text is None:
+                    raise SupervisorAgentError("supervisor did not produce an agent message")
+                raw_text = text
+                try:
+                    decision = model_cls.model_validate(_parse_json_object(text))
+                except (ValidationError, json.JSONDecodeError) as exc:
+                    audit_error = f"invalid supervisor decision: {exc}"
+                    if attempt == 0:
+                        self._append_wake_audit(
+                            packet,
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            decision=None,
+                            raw_text=raw_text,
+                            error=audit_error,
+                            use_case=f"{use_case}_parse_retry",
+                        )
+                        turn_prompt = _repair_json_prompt(
+                            raw_text=raw_text,
+                            error=audit_error,
+                            packet=packet,
+                            model_cls=model_cls,
+                        )
+                        continue
+                    raise SupervisorAgentError(audit_error) from exc
+                if isinstance(decision, (SupervisorDecision, CompletionReviewDecision)):
+                    decision.wake_sequence = packet.wake_sequence
+                    decision.generation = packet.generation
+                audit_error = None
+                return decision
+            raise SupervisorAgentError("supervisor decision repair loop exhausted")
         except SupervisorAgentError as exc:
             audit_error = str(exc)
             raise
@@ -330,6 +355,7 @@ class StatelessSupervisorAgent:
         triggering_action: TriggeringAction | None = None,
         last_coder_message: CoderMessage | None = None,
         validations: list[ValidationRun] | None = None,
+        inspections: list[InspectionRun] | None = None,
         human_message: HumanMessage | None = None,
         prior_interventions: list[PriorIntervention] | None = None,
         changed_files: list[ChangedFile] | None = None,
@@ -345,8 +371,10 @@ class StatelessSupervisorAgent:
         changed_file_contexts: list[ChangedFileContext] | None = None,
         changed_tests_summary: list[ChangedTestsSummary] | None = None,
         validation_outputs: list[ValidationOutput] | None = None,
+        inspection_outputs: list[InspectionOutput] | None = None,
         evidence_provenance_summary: EvidenceProvenanceSummary | None = None,
         diff_packet_limits: DiffPacketLimits | None = None,
+        breadth_risk_summary: BreadthRiskSummary | None = None,
         completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
         completion_payload_since_sequence: int | None = None,
         completion_review_thread_id: str | None = None,
@@ -385,6 +413,7 @@ class StatelessSupervisorAgent:
             triggering_action=triggering_action,
             last_coder_message=last_coder_message,
             validations=validations or [],
+            inspections=inspections or [],
             human_message=human_message,
             prior_interventions=prior_interventions,
             changed_files=changed_files or [],
@@ -400,8 +429,10 @@ class StatelessSupervisorAgent:
             changed_file_contexts=changed_file_contexts or [],
             changed_tests_summary=changed_tests_summary or [],
             validation_outputs=validation_outputs or [],
+            inspection_outputs=inspection_outputs or [],
             evidence_provenance_summary=evidence_provenance_summary,
             diff_packet_limits=diff_packet_limits or DiffPacketLimits(),
+            breadth_risk_summary=breadth_risk_summary,
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=completion_review_thread_id,
@@ -465,7 +496,65 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
-    return json.loads(stripped)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        candidate = _extract_first_json_object(stripped)
+        if candidate and candidate != stripped:
+            return json.loads(candidate, strict=False)
+        return json.loads(stripped, strict=False)
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _repair_json_prompt(
+    *,
+    raw_text: str,
+    error: str,
+    packet: SupervisorWakePacket,
+    model_cls: type[SupervisorDecision] | type[CompletionReviewDecision],
+) -> str:
+    decision_name = "completion-review" if model_cls is CompletionReviewDecision else "runtime supervisor"
+    excerpt = raw_text
+    if len(excerpt) > 12000:
+        excerpt = excerpt[:12000] + "\n...<truncated>"
+    return (
+        f"Your previous {decision_name} response was not valid structured JSON: {error}\n\n"
+        "Return exactly one JSON object matching the required output schema. Do not include markdown, prose, "
+        "comments, or extra keys. Keep string fields concise so the JSON is not truncated. Preserve the same "
+        f"reviewed packet identity: wake_sequence={packet.wake_sequence}, generation={packet.generation}.\n\n"
+        "Previous invalid response excerpt:\n"
+        "```text\n"
+        f"{excerpt}\n"
+        "```"
+    )
 
 
 def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | None:

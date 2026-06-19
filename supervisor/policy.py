@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -297,6 +298,63 @@ def is_recursive_delete_outside(tokens: list[str], workspace: Path) -> bool:
     return False
 
 
+def recursive_delete_targets(tokens: list[str]) -> list[str]:
+    if not tokens or tokens[0] != "rm":
+        return []
+    recursive = any("r" in token for token in tokens[1:] if token.startswith("-"))
+    force = any("f" in token for token in tokens[1:] if token.startswith("-"))
+    if not recursive and not force:
+        return []
+    return [token for token in tokens[1:] if token and not token.startswith("-")]
+
+
+def tracked_delete_problem(tokens: list[str], workspace: Path) -> str | None:
+    targets = recursive_delete_targets(tokens)
+    if not targets:
+        return None
+    tracked: list[str] = []
+    root = workspace.resolve()
+    for raw in targets:
+        path = normalize_path(root, raw)
+        if path is None:
+            continue
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        rel_text = str(rel)
+        if _git_path_is_tracked_or_contains_tracked(root, rel_text, is_dir=path.is_dir()):
+            tracked.append(rel_text)
+    if not tracked:
+        return None
+    return "recursive delete touches git-tracked path(s): " + ", ".join(tracked[:8])
+
+
+def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, is_dir: bool) -> bool:
+    try:
+        if is_dir:
+            completed = subprocess.run(
+                ["git", "ls-files", "--", rel_path.rstrip("/") + "/"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            return bool(completed.stdout.strip())
+        completed = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", rel_path],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        return completed.returncode == 0
+    except Exception:
+        return False
+
+
 def command_mentions_supervisor(command: str) -> bool:
     return "supervisor" in command.lower()
 
@@ -361,6 +419,9 @@ class PolicyEngine:
             return PolicyDecision.deny("force push to protected branch denied")
         if is_broad_chmod(tokens, self.workspace):
             return PolicyDecision.deny("broad permission change denied")
+        tracked_problem = tracked_delete_problem(tokens, self.workspace)
+        if tracked_problem:
+            return PolicyDecision.deny(tracked_problem)
         if is_recursive_delete_outside(tokens, self.workspace):
             return PolicyDecision.deny("recursive deletion outside workspace denied")
         if problem:

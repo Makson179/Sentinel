@@ -219,9 +219,10 @@ class EvidenceItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     validation_id: str | None = None
+    inspection_id: str | None = None
     command: str
     sequence: int | None = None
-    validation_type: Literal["static", "behavioral", "behavior_demo", "unknown"]
+    validation_type: Literal["static", "behavioral", "behavior_demo", "inspection", "unknown"]
     outcome: Literal["pass", "fail", "unknown"]
     freshness: Literal["fresh", "stale", "unknown"]
     why_it_covers_behavior: str
@@ -385,6 +386,51 @@ class ValidationRun(BaseModel):
         return data
 
 
+class InspectionRun(BaseModel):
+    inspection_id: str
+    command: str
+    raw_command: str | None = None
+    normalized_command: str | None = None
+    cwd: str | None = None
+    exit_code: int | None = None
+    shell_exit_code: int | None = None
+    outcome: Literal["pass", "fail"] = "fail"
+    passed: bool
+    summary: str
+    captured_output: str = ""
+    captured_output_truncated: bool = False
+    sequence: int
+    inspected_paths: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_legacy_inspection_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "outcome" not in data:
+            if "passed" in data:
+                data["outcome"] = "pass" if data["passed"] else "fail"
+            elif data.get("exit_code") == 0:
+                data["outcome"] = "pass"
+            else:
+                data["outcome"] = "fail"
+        if "passed" not in data:
+            data["passed"] = data.get("outcome") == "pass"
+        command = data.get("command")
+        if "raw_command" not in data and isinstance(command, str):
+            data["raw_command"] = command
+        if "normalized_command" not in data and isinstance(command, str):
+            data["normalized_command"] = " ".join(command.strip().split())
+        if "shell_exit_code" not in data:
+            data["shell_exit_code"] = data.get("exit_code")
+        if "inspection_id" not in data:
+            sequence = data.get("sequence")
+            if isinstance(sequence, int) and isinstance(command, str):
+                data["inspection_id"] = f"inspection-{sequence}"
+        return data
+
+
 class HumanMessage(BaseModel):
     text: str
     sequence: int
@@ -468,6 +514,23 @@ class ValidationOutput(BaseModel):
     failed_count: int | None = None
 
 
+class InspectionOutput(BaseModel):
+    inspection_id: str
+    command: str
+    raw_command: str | None = None
+    normalized_command: str | None = None
+    cwd: str | None = None
+    exit_code: int | None = None
+    shell_exit_code: int | None = None
+    outcome: Literal["pass", "fail"]
+    passed: bool
+    sequence: int
+    stdout_or_summary: str
+    captured_output: str = ""
+    output_truncated: bool = False
+    inspected_paths: list[str] = Field(default_factory=list)
+
+
 class ValidationProvenance(BaseModel):
     validation_id: str
     command: str
@@ -518,6 +581,16 @@ class DiffPacketLimits(BaseModel):
     truncation_reason: str | None = None
 
 
+class BreadthRiskSummary(BaseModel):
+    flags: list[str] = Field(default_factory=list)
+    task_line_count: int = 0
+    requirement_hint_count: int = 0
+    task_feature_terms: list[str] = Field(default_factory=list)
+    changed_source_files_count: int = 0
+    changed_lines: int = 0
+    suggested_min_behavior_rows: int = 0
+
+
 class SupervisorWakePacket(BaseModel):
     wake_sequence: int
     latest_event_sequence: int
@@ -542,6 +615,7 @@ class SupervisorWakePacket(BaseModel):
     triggering_action: TriggeringAction | None = None
     last_coder_message: CoderMessage | None = None
     validations: list[ValidationRun] = Field(default_factory=list)
+    inspections: list[InspectionRun] = Field(default_factory=list)
     human_message: HumanMessage | None = None
     prior_interventions: list[PriorIntervention] = Field(default_factory=list)
     changed_files: list[ChangedFile] = Field(default_factory=list)
@@ -557,8 +631,10 @@ class SupervisorWakePacket(BaseModel):
     changed_file_contexts: list[ChangedFileContext] = Field(default_factory=list)
     changed_tests_summary: list[ChangedTestsSummary] = Field(default_factory=list)
     validation_outputs: list[ValidationOutput] = Field(default_factory=list)
+    inspection_outputs: list[InspectionOutput] = Field(default_factory=list)
     evidence_provenance_summary: EvidenceProvenanceSummary | None = None
     diff_packet_limits: DiffPacketLimits = Field(default_factory=DiffPacketLimits)
+    breadth_risk_summary: BreadthRiskSummary | None = None
     completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
     completion_payload_since_sequence: int | None = None
     completion_review_thread_id: str | None = None
