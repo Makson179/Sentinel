@@ -37,6 +37,35 @@ def test_fast_path_allows_read_only_inside_workspace(workspace: Path) -> None:
     assert decision.kind == PolicyDecisionKind.ALLOW
 
 
+def test_declared_grading_root_read_is_denied_but_workspace_source_is_allowed(workspace: Path, tmp_path: Path) -> None:
+    grading_root = tmp_path / "SpecBench" / "examples" / "c_compiler"
+    grading_root.mkdir(parents=True)
+    (grading_root / "private_test.py").write_text("hidden", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "compiler.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    engine = PolicyEngine(workspace, declared_grading_roots=[grading_root])
+
+    grading = engine.evaluate({"command": f"cat {grading_root / 'private_test.py'}", "cwd": str(workspace)})
+    source = engine.evaluate({"command": "cat src/compiler.c", "cwd": str(workspace)})
+
+    assert grading.kind == PolicyDecisionKind.DENY
+    assert "declared grading/hidden path access denied" in grading.reason
+    assert source.kind == PolicyDecisionKind.ALLOW
+
+
+def test_declared_grading_root_relative_cwd_read_is_denied(workspace: Path, tmp_path: Path) -> None:
+    grading_root = tmp_path / "declared-grading"
+    grading_root.mkdir()
+    (grading_root / "answer.txt").write_text("hidden", encoding="utf-8")
+
+    decision = PolicyEngine(workspace, declared_grading_roots=[grading_root]).evaluate(
+        {"command": "cat answer.txt", "cwd": str(grading_root)}
+    )
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert "declared grading/hidden path access denied" in decision.reason
+
+
 def test_fast_path_allows_codex_nested_task_read(workspace: Path) -> None:
     decision = PolicyEngine(workspace).evaluate(
         {"tool_name": "Bash", "tool_input": {"command": "sed -n '1,220p' TASK.md"}, "command": "sed -n '1,220p' TASK.md"}
@@ -122,6 +151,8 @@ def test_composed_read_only_commands_are_cheap_review_candidates(workspace: Path
         ("rg token .env", "secret_path"),
         ("cat .env", "secret_path"),
         ("cat ~/.ssh/id_rsa", "secret_path"),
+        ("cat private/answers.txt", "secret_path"),
+        ("rg expected hidden/results.json", "secret_path"),
         ("python -c \"print('x')\"", "interpreter_execution"),
         ("node -e \"console.log('x')\"", "interpreter_execution"),
         ("sh -c \"pwd\"", "interpreter_execution"),

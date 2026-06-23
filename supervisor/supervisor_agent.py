@@ -43,6 +43,8 @@ from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 
 DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 180.0
 DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 900.0
+COMPLETION_PROMPT_TARGET_CHARS = 900_000
+COMPLETION_PROMPT_ULTRA_TARGET_CHARS = 700_000
 
 
 class SupervisorAgentError(RuntimeError):
@@ -79,15 +81,66 @@ class StatelessSupervisorAgent:
         )
 
     async def decide_completion(self, packet: SupervisorWakePacket) -> CompletionReviewDecision:
-        return await self._decide(
+        prompt_packet, prompt = _completion_prompt_with_budget(packet)
+        try:
+            return await self._decide_completion_with_prompt(
+                prompt_packet,
+                prompt=prompt,
+                use_case="completion_review",
+            )
+        except SupervisorAgentError as exc:
+            if _is_input_too_large_error(exc):
+                prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
+                try:
+                    return await self._decide_completion_with_prompt(
+                        prompt_packet,
+                        prompt=prompt,
+                        use_case="completion_review_compact_retry",
+                    )
+                except SupervisorAgentError as compact_exc:
+                    if not _is_invalid_supervisor_decision_error(compact_exc):
+                        raise
+                    return await self._decide_completion_with_prompt(
+                        prompt_packet,
+                        prompt=_minimal_completion_review_retry_prompt(
+                            context_prompt=prompt,
+                            error=str(compact_exc),
+                            packet=prompt_packet,
+                        ),
+                        use_case="completion_review_minimal_retry",
+                    )
+            if not _is_invalid_supervisor_decision_error(exc):
+                raise
+            prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
+            return await self._decide_completion_with_prompt(
+                prompt_packet,
+                prompt=_minimal_completion_review_retry_prompt(
+                    context_prompt=prompt,
+                    error=str(exc),
+                    packet=prompt_packet,
+                ),
+                use_case="completion_review_minimal_retry",
+            )
+
+    async def _decide_completion_with_prompt(
+        self,
+        packet: SupervisorWakePacket,
+        *,
+        prompt: str,
+        use_case: str,
+    ) -> CompletionReviewDecision:
+        decision = await self._decide(
             packet,
-            prompt=build_completion_review_prompt(packet),
+            prompt=prompt,
             schema=openai_strict_json_schema_for_completion_review_decision(),
             model_cls=CompletionReviewDecision,
-            use_case="completion_review",
+            use_case=use_case,
             timeout_seconds=self.completion_timeout_seconds,
             persistent_completion_thread=True,
         )
+        if not isinstance(decision, CompletionReviewDecision):
+            raise SupervisorAgentError("completion review returned non-completion decision")
+        return decision
 
     async def _decide(
         self,
@@ -179,7 +232,19 @@ class StatelessSupervisorAgent:
                     data = turns.get("data", [])
                     text = _agent_message_text_from_turns(data, turn_id=turn_id)
                 if text is None:
-                    raise SupervisorAgentError("supervisor did not produce an agent message")
+                    audit_error = "supervisor did not produce an agent message"
+                    if attempt == 0:
+                        self._append_wake_audit(
+                            packet,
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            decision=None,
+                            raw_text=raw_text,
+                            error=audit_error,
+                            use_case=f"{use_case}_no_message_retry",
+                        )
+                        continue
+                    raise SupervisorAgentError(audit_error)
                 raw_text = text
                 try:
                     decision = model_cls.model_validate(_parse_json_object(text))
@@ -372,6 +437,7 @@ class StatelessSupervisorAgent:
         changed_tests_summary: list[ChangedTestsSummary] | None = None,
         validation_outputs: list[ValidationOutput] | None = None,
         inspection_outputs: list[InspectionOutput] | None = None,
+        completion_delta_evidence_summary: list[str] | None = None,
         evidence_provenance_summary: EvidenceProvenanceSummary | None = None,
         diff_packet_limits: DiffPacketLimits | None = None,
         breadth_risk_summary: BreadthRiskSummary | None = None,
@@ -384,11 +450,6 @@ class StatelessSupervisorAgent:
         health = self.store.get_health()
         prior_interventions = prior_interventions or []
         health_payload = health.model_dump(mode="json")
-        if prior_interventions:
-            health_payload["interventions"] = max(
-                int(health_payload.get("interventions") or 0),
-                len(prior_interventions),
-            )
         return SupervisorWakePacket(
             wake_sequence=wake_sequence,
             latest_event_sequence=cfg.last_event_sequence,
@@ -430,6 +491,7 @@ class StatelessSupervisorAgent:
             changed_tests_summary=changed_tests_summary or [],
             validation_outputs=validation_outputs or [],
             inspection_outputs=inspection_outputs or [],
+            completion_delta_evidence_summary=completion_delta_evidence_summary or [],
             evidence_provenance_summary=evidence_provenance_summary,
             diff_packet_limits=diff_packet_limits or DiffPacketLimits(),
             breadth_risk_summary=breadth_risk_summary,
@@ -542,6 +604,8 @@ def _repair_json_prompt(
     model_cls: type[SupervisorDecision] | type[CompletionReviewDecision],
 ) -> str:
     decision_name = "completion-review" if model_cls is CompletionReviewDecision else "runtime supervisor"
+    if model_cls is CompletionReviewDecision:
+        return _completion_review_repair_json_prompt(raw_text=raw_text, error=error, packet=packet)
     excerpt = raw_text
     if len(excerpt) > 12000:
         excerpt = excerpt[:12000] + "\n...<truncated>"
@@ -554,6 +618,55 @@ def _repair_json_prompt(
         "```text\n"
         f"{excerpt}\n"
         "```"
+    )
+
+
+def _completion_review_repair_json_prompt(
+    *,
+    raw_text: str,
+    error: str,
+    packet: SupervisorWakePacket,
+) -> str:
+    excerpt = raw_text
+    if len(excerpt) > 1500:
+        excerpt = excerpt[:1500] + "\n...<truncated>"
+    return (
+        f"Your previous completion-review response was not valid structured JSON: {error}\n\n"
+        "Return exactly one compact completion-review JSON object matching the required output schema. "
+        "Do not include markdown, prose, comments, or extra keys. Keep the whole JSON under 3000 characters. "
+        "Preserve wake_sequence and generation exactly: "
+        f"wake_sequence={packet.wake_sequence}, generation={packet.generation}.\n\n"
+        "For decision=\"return\" or decision=\"restart\", do not rebuild the full review artifact: set "
+        "files_reviewed=[] and behavior_evidence_matrix=[]. For return, include one concrete blocking issue in "
+        "uncovered_behaviors, validation_gaps, claim_evidence_mismatches, packet_or_access_limitations, "
+        "or changed_test_risks, plus the minimal message_to_coder needed to get that issue fixed. "
+        "For restart, include a valid handoff and set message_to_coder=null. "
+        "For decision=\"accept\", include only the evidence needed for the accept gates.\n\n"
+        "Previous invalid response excerpt, for context only:\n"
+        "```text\n"
+        f"{excerpt}\n"
+        "```"
+    )
+
+
+def _minimal_completion_review_retry_prompt(
+    *,
+    context_prompt: str,
+    error: str,
+    packet: SupervisorWakePacket,
+) -> str:
+    return (
+        f"{context_prompt}\n\n"
+        "# Emergency compact JSON retry\n"
+        f"The previous completion-review attempt failed before a usable decision was parsed: {error}\n"
+        "Run the same completion review, but output exactly one compact JSON object matching the required schema. "
+        "Do not include markdown, prose, comments, or extra keys. Keep the whole JSON under 3000 characters. "
+        "Include all top-level schema fields; use [] or null for empty fields. Preserve "
+        f"wake_sequence={packet.wake_sequence} and generation={packet.generation}.\n"
+        "If the decision is return or restart, avoid the full evidence matrix: use files_reviewed=[] and "
+        "behavior_evidence_matrix=[]. For return, include only the concrete blocker and the minimal message_to_coder "
+        "needed to resolve it. For restart, include a valid handoff and set message_to_coder=null. "
+        "If the decision is accept, include only evidence required by the accept gates."
     )
 
 
@@ -572,6 +685,258 @@ def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | N
         if text is not None:
             return text
     return None
+
+
+def _completion_prompt_with_budget(
+    packet: SupervisorWakePacket,
+    *,
+    ultra: bool = False,
+) -> tuple[SupervisorWakePacket, str]:
+    prompt = build_completion_review_prompt(packet)
+    target = COMPLETION_PROMPT_ULTRA_TARGET_CHARS if ultra else COMPLETION_PROMPT_TARGET_CHARS
+    if len(prompt) <= target and not ultra:
+        return packet, prompt
+
+    levels = (
+        _PromptCompactionLevel(
+            name="metadata_ledger",
+            ledger_summary_limit=1000,
+            output_summary_limit=None,
+            output_capture_limit=None,
+            diff_limit=None,
+            context_limit=None,
+            recent_events_limit=None,
+            output_item_limit=None,
+        ),
+        _PromptCompactionLevel(
+            name="bounded_outputs",
+            ledger_summary_limit=800,
+            output_summary_limit=2200,
+            output_capture_limit=8000,
+            diff_limit=None,
+            context_limit=None,
+            recent_events_limit=None,
+            output_item_limit=None,
+        ),
+        _PromptCompactionLevel(
+            name="compact_outputs",
+            ledger_summary_limit=600,
+            output_summary_limit=1400,
+            output_capture_limit=4000,
+            diff_limit=10000,
+            context_limit=6500,
+            recent_events_limit=30,
+            output_item_limit=100,
+        ),
+        _PromptCompactionLevel(
+            name="ultra_compact_outputs",
+            ledger_summary_limit=450,
+            output_summary_limit=900,
+            output_capture_limit=1800,
+            diff_limit=7000,
+            context_limit=4000,
+            recent_events_limit=20,
+            output_item_limit=60,
+        ),
+    )
+    selected = levels[-1] if ultra else levels[0]
+    compact_packet = _compact_completion_packet(packet, level=selected, original_prompt_chars=len(prompt))
+    compact_prompt = build_completion_review_prompt(compact_packet)
+    if ultra:
+        return compact_packet, compact_prompt
+    for level in levels[1:]:
+        if len(compact_prompt) <= target:
+            return compact_packet, compact_prompt
+        selected = level
+        compact_packet = _compact_completion_packet(packet, level=selected, original_prompt_chars=len(prompt))
+        compact_prompt = build_completion_review_prompt(compact_packet)
+    return compact_packet, compact_prompt
+
+
+class _PromptCompactionLevel:
+    def __init__(
+        self,
+        *,
+        name: str,
+        ledger_summary_limit: int,
+        output_summary_limit: int | None,
+        output_capture_limit: int | None,
+        diff_limit: int | None,
+        context_limit: int | None,
+        recent_events_limit: int | None,
+        output_item_limit: int | None,
+    ) -> None:
+        self.name = name
+        self.ledger_summary_limit = ledger_summary_limit
+        self.output_summary_limit = output_summary_limit
+        self.output_capture_limit = output_capture_limit
+        self.diff_limit = diff_limit
+        self.context_limit = context_limit
+        self.recent_events_limit = recent_events_limit
+        self.output_item_limit = output_item_limit
+
+
+def _compact_completion_packet(
+    packet: SupervisorWakePacket,
+    *,
+    level: _PromptCompactionLevel,
+    original_prompt_chars: int,
+) -> SupervisorWakePacket:
+    diff_limits = packet.diff_packet_limits
+    reasons = [
+        reason
+        for reason in (diff_limits.truncation_reason or "").split("; ")
+        if reason
+    ]
+    reasons.append(
+        f"completion prompt compacted for app-server budget: level={level.name}, "
+        f"original_prompt_chars={original_prompt_chars}, target_chars={COMPLETION_PROMPT_TARGET_CHARS}"
+    )
+    if level.output_item_limit is not None:
+        validation_outputs = _most_recent_by_sequence(packet.validation_outputs, limit=level.output_item_limit)
+        inspection_outputs = _most_recent_by_sequence(packet.inspection_outputs, limit=level.output_item_limit)
+    else:
+        validation_outputs = packet.validation_outputs
+        inspection_outputs = packet.inspection_outputs
+    return packet.model_copy(
+        update={
+            "validations": [_compact_validation_run(value, level=level) for value in packet.validations],
+            "inspections": [_compact_inspection_run(value, level=level) for value in packet.inspections],
+            "validation_outputs": [
+                _compact_validation_output(value, level=level) for value in validation_outputs
+            ],
+            "inspection_outputs": [
+                _compact_inspection_output(value, level=level) for value in inspection_outputs
+            ],
+            "changed_file_diffs": [
+                _compact_changed_file_diff(value, level=level) for value in packet.changed_file_diffs
+            ],
+            "changed_file_contexts": [
+                _compact_changed_file_context(value, level=level) for value in packet.changed_file_contexts
+            ],
+            "recent_events": (
+                packet.recent_events[-level.recent_events_limit :]
+                if level.recent_events_limit is not None
+                else packet.recent_events
+            ),
+            "diff_packet_limits": diff_limits.model_copy(
+                update={
+                    "materially_truncated": True,
+                    "truncation_reason": "; ".join(reasons),
+                }
+            ),
+        }
+    )
+
+
+def _most_recent_by_sequence(items: list[Any], *, limit: int) -> list[Any]:
+    if len(items) <= limit:
+        return items
+    return sorted(items, key=lambda item: getattr(item, "sequence", 0))[-limit:]
+
+
+def _compact_validation_run(validation: ValidationRun, *, level: _PromptCompactionLevel) -> ValidationRun:
+    had_output = bool(validation.captured_output.strip())
+    return validation.model_copy(
+        update={
+            "summary": _bounded_text(validation.summary, limit=level.ledger_summary_limit),
+            "captured_output": "",
+            "captured_output_truncated": validation.captured_output_truncated or had_output,
+        }
+    )
+
+
+def _compact_inspection_run(inspection: InspectionRun, *, level: _PromptCompactionLevel) -> InspectionRun:
+    had_output = bool(inspection.captured_output.strip())
+    return inspection.model_copy(
+        update={
+            "summary": _bounded_text(inspection.summary, limit=level.ledger_summary_limit),
+            "captured_output": "",
+            "captured_output_truncated": inspection.captured_output_truncated or had_output,
+        }
+    )
+
+
+def _compact_validation_output(output: ValidationOutput, *, level: _PromptCompactionLevel) -> ValidationOutput:
+    summary = output.stdout_or_summary
+    captured = output.captured_output
+    if level.output_summary_limit is not None:
+        summary = _bounded_text(summary, limit=level.output_summary_limit)
+    if level.output_capture_limit is not None:
+        captured = _bounded_text(captured, limit=level.output_capture_limit)
+    return output.model_copy(
+        update={
+            "stdout_or_summary": summary,
+            "captured_output": captured,
+            "output_truncated": output.output_truncated
+            or len(summary) < len(output.stdout_or_summary)
+            or len(captured) < len(output.captured_output),
+        }
+    )
+
+
+def _compact_inspection_output(output: InspectionOutput, *, level: _PromptCompactionLevel) -> InspectionOutput:
+    summary = output.stdout_or_summary
+    captured = output.captured_output
+    if level.output_summary_limit is not None:
+        summary = _bounded_text(summary, limit=level.output_summary_limit)
+    if level.output_capture_limit is not None:
+        captured = _bounded_text(captured, limit=level.output_capture_limit)
+    return output.model_copy(
+        update={
+            "stdout_or_summary": summary,
+            "captured_output": captured,
+            "output_truncated": output.output_truncated
+            or len(summary) < len(output.stdout_or_summary)
+            or len(captured) < len(output.captured_output),
+        }
+    )
+
+
+def _compact_changed_file_diff(changed: ChangedFileDiff, *, level: _PromptCompactionLevel) -> ChangedFileDiff:
+    if level.diff_limit is None:
+        return changed
+    bounded = _bounded_text(changed.diff, limit=level.diff_limit)
+    return changed.model_copy(
+        update={
+            "diff": bounded,
+            "diff_truncated": changed.diff_truncated or len(bounded) < len(changed.diff),
+        }
+    )
+
+
+def _compact_changed_file_context(
+    context: ChangedFileContext,
+    *,
+    level: _PromptCompactionLevel,
+) -> ChangedFileContext:
+    if level.context_limit is None:
+        return context
+    bounded = _bounded_text(context.final_snippets_around_changed_hunks, limit=level.context_limit)
+    return context.model_copy(
+        update={
+            "final_snippets_around_changed_hunks": bounded,
+            "context_truncated": context.context_truncated
+            or len(bounded) < len(context.final_snippets_around_changed_hunks),
+        }
+    )
+
+
+def _bounded_text(text: str, *, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 20:
+        return text[:limit]
+    return text[: limit - 15] + "\n...<truncated>"
+
+
+def _is_input_too_large_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return "input_too_large" in text or "Input exceeds the maximum length" in text
+
+
+def _is_invalid_supervisor_decision_error(exc: BaseException) -> bool:
+    return "invalid supervisor decision:" in str(exc)
 
 
 def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:

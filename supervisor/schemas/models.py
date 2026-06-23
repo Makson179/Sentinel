@@ -260,11 +260,26 @@ class BehaviorEvidence(BaseModel):
     gap: str | None = None
 
 
+class CompletionDecisionArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_state: str
+    resolved_concerns: list[str] = Field(default_factory=list)
+    stale_concerns: list[str] = Field(default_factory=list)
+    uncovered_edge_candidates: list[str] = Field(default_factory=list)
+    actionable_gap_or_none: str | None = None
+    decision: CompletionReviewDecisionKind
+
+
 class CompletionReviewDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: CompletionReviewDecisionKind
     reason: str
+    decision_artifact: CompletionDecisionArtifact | None = None
+    basis_event_seq: int | None = None
+    last_relevant_edit_seq: int | None = None
+    last_validation_seq: int | None = None
     files_reviewed: list[ReviewedFile] = Field(default_factory=list)
     behavior_evidence_matrix: list[BehaviorEvidence] = Field(default_factory=list)
     uncovered_behaviors: list[str] = Field(default_factory=list)
@@ -653,6 +668,7 @@ class SupervisorWakePacket(BaseModel):
     changed_tests_summary: list[ChangedTestsSummary] = Field(default_factory=list)
     validation_outputs: list[ValidationOutput] = Field(default_factory=list)
     inspection_outputs: list[InspectionOutput] = Field(default_factory=list)
+    completion_delta_evidence_summary: list[str] = Field(default_factory=list)
     evidence_provenance_summary: EvidenceProvenanceSummary | None = None
     diff_packet_limits: DiffPacketLimits = Field(default_factory=DiffPacketLimits)
     breadth_risk_summary: BreadthRiskSummary | None = None

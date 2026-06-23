@@ -48,6 +48,9 @@ SECRET_PATH_PARTS = {
     ".kube",
 }
 
+CHEATING_WORKSPACE_PATH_PARTS = {"hidden", "id_private", "private", "grading"}
+GRADING_PATH_RISK_TAG = "grading_path"
+
 SECRET_PATH_SUFFIXES = {
     (".config", "gh"),
     (".config", "gcloud"),
@@ -114,6 +117,7 @@ FORBIDDEN_CHEAP_RISK_TAGS = {
     "external_side_effect",
     "deploy_publish_release",
     "ambiguous_parse",
+    GRADING_PATH_RISK_TAG,
 }
 SHELL_PUNCTUATION = "|&;()<>"
 SHELL_OPERATORS = {"|", "&&", "||", ";", "&"}
@@ -174,6 +178,65 @@ def is_secret_path(path: Path) -> bool:
     return any(fnmatch.fnmatch(name, pattern.lower()) for pattern in SECRET_FILE_GLOBS)
 
 
+def is_workspace_cheating_path(workspace: Path, path: Path) -> bool:
+    try:
+        relative_parts = path.resolve().relative_to(workspace.resolve()).parts
+    except ValueError:
+        return False
+    return any(part.lower() in CHEATING_WORKSPACE_PATH_PARTS for part in relative_parts)
+
+
+def is_protected_path(workspace: Path, path: Path) -> bool:
+    return is_secret_path(path) or is_workspace_cheating_path(workspace, path)
+
+
+def _resolve_outside_candidate(raw: str | os.PathLike[str], *, cwd: Path) -> Path | None:
+    text = os.fspath(raw).strip().strip("'\"")
+    if not text or text.startswith(("http://", "https://")):
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = cwd / path
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _declared_grading_path_hit(raw: str | os.PathLike[str], *, cwd: Path, roots: tuple[Path, ...]) -> str | None:
+    if not roots:
+        return None
+    resolved = _resolve_outside_candidate(raw, cwd=cwd)
+    if resolved is None:
+        return None
+    for root in roots:
+        if resolved == root or _is_relative_to(resolved, root):
+            return str(resolved)
+    return None
+
+
+def _declared_roots_from_env() -> tuple[Path, ...]:
+    raw = os.environ.get("SENTINEL_DECLARED_GRADING_PATHS", "")
+    if not raw:
+        return ()
+    roots: list[Path] = []
+    for item in raw.split(os.pathsep):
+        if not item.strip():
+            continue
+        resolved = _resolve_outside_candidate(item, cwd=Path.cwd())
+        if resolved is not None:
+            roots.append(resolved)
+    return tuple(dict.fromkeys(roots))
+
+
 def normalize_path(workspace: Path, raw: str | os.PathLike[str]) -> Path | None:
     path = Path(raw)
     if not path.is_absolute():
@@ -227,7 +290,7 @@ def _command_working_directory(workspace: Path, cwd: str | None) -> tuple[Path, 
     resolved = normalize_path(workspace, cwd)
     if resolved is None:
         return workspace.resolve(), {"workspace_escape"}, "command working directory escapes workspace or is ambiguous"
-    if is_secret_path(resolved):
+    if is_protected_path(workspace, resolved):
         return resolved, {"secret_path"}, None
     return resolved, set(), None
 
@@ -306,7 +369,7 @@ def _resolve_segment_paths(
         if resolved is None:
             tags.add("workspace_escape")
             continue
-        if is_secret_path(resolved):
+        if is_protected_path(workspace, resolved):
             tags.add("secret_path")
         resolved_paths.append(_workspace_relative(workspace, resolved))
     return resolved_paths
@@ -809,20 +872,32 @@ def command_mentions_supervisor(command: str) -> bool:
 
 
 class PolicyEngine:
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, declared_grading_roots: Iterable[str | os.PathLike[str]] | None = None):
         self.workspace = workspace.resolve()
+        roots: list[Path] = []
+        for raw in declared_grading_roots or ():
+            resolved = _resolve_outside_candidate(raw, cwd=self.workspace)
+            if resolved is not None:
+                roots.append(resolved)
+        roots.extend(_declared_roots_from_env())
+        self.declared_grading_roots = tuple(dict.fromkeys(roots))
 
     def evaluate(self, payload: dict[str, Any]) -> PolicyDecision:
         command = payload.get("command")
         tool_name = payload.get("tool_name")
         operation = payload.get("operation")
+        cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
 
         raw_paths = extract_paths(payload)
+        grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
+        if grading_hit is not None:
+            return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
         paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
         if path_problem and raw_paths:
             return PolicyDecision.route_llm(path_problem)
 
-        if any(is_secret_path(path) for path in paths):
+        if any(is_protected_path(self.workspace, path) for path in paths):
             if operation == "write" or tool_name in WRITE_TOOLS:
                 return PolicyDecision.deny("writes to secret-pattern paths are denied")
             return PolicyDecision.route_llm("secret-pattern read requires LLM judgment")
@@ -834,11 +909,11 @@ class PolicyEngine:
             return self._evaluate_apply_patch(patch_text)
 
         if isinstance(command, str):
-            return self._evaluate_command(command, paths, cwd=payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
+            return self._evaluate_command(command, paths, cwd=cwd)
 
         if isinstance(tool_name, str):
             if tool_name in WRITE_TOOLS:
-                if any(is_secret_path(path) for path in paths):
+                if any(is_protected_path(self.workspace, path) for path in paths):
                     return PolicyDecision.deny("write to secret-pattern path")
                 if paths:
                     return PolicyDecision.allow("workspace write tool inside workspace")
@@ -849,9 +924,36 @@ class PolicyEngine:
 
         if operation == "read" and not path_problem:
             return PolicyDecision.allow("read operation inside workspace")
-        if operation == "write" and any(is_secret_path(path) for path in paths):
+        if operation == "write" and any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("write to secret-pattern path")
         return PolicyDecision.route_llm("unclassified event requires LLM judgment")
+
+    def _declared_grading_hit_for_raw_paths(self, raw_paths: Iterable[str], *, cwd: Path) -> str | None:
+        for raw in raw_paths:
+            hit = _declared_grading_path_hit(raw, cwd=cwd, roots=self.declared_grading_roots)
+            if hit is not None:
+                return hit
+        return None
+
+    def _command_declared_grading_hit(self, command: str, analysis: CommandAnalysis, *, cwd: str | None) -> str | None:
+        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        if cwd_path is None:
+            cwd_path = self.workspace
+        cwd_hit = _declared_grading_path_hit(str(cwd_path), cwd=self.workspace, roots=self.declared_grading_roots)
+        if cwd_hit is not None:
+            return cwd_hit
+        for token in analysis.tokens:
+            if token in SHELL_OPERATORS or token in SHELL_REDIRECT_OPERATORS or token in {"(", ")"}:
+                continue
+            if token.startswith("-") or "=" in token and "/" not in token:
+                continue
+            pathish = token.startswith(("~", "/", ".")) or "/" in token
+            if not pathish:
+                continue
+            hit = _declared_grading_path_hit(token, cwd=cwd_path, roots=self.declared_grading_roots)
+            if hit is not None:
+                return hit
+        return None
 
     def _evaluate_command(self, command: str, paths: list[Path], *, cwd: str | None = None) -> PolicyDecision:
         analysis = analyze_command(self.workspace, command, cwd)
@@ -863,6 +965,11 @@ class PolicyEngine:
             "resolved_paths": analysis_payload["resolved_paths"],
             "cheap_review_candidate": analysis.cheap_review_candidate,
         }
+        grading_hit = self._command_declared_grading_hit(command, analysis, cwd=cwd)
+        if grading_hit is not None:
+            analysis.risk_tags.add(GRADING_PATH_RISK_TAG)
+            payload["risk_tags"] = sorted(analysis.risk_tags)
+            return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}", **payload)
         if command_mentions_supervisor(command):
             return PolicyDecision.deny("commands containing supervisor are denied", **payload)
         patch_paths = extract_apply_patch_paths(command)
@@ -903,7 +1010,7 @@ class PolicyEngine:
                 return PolicyDecision.route_llm(path_problem, **payload)
             if not resolved:
                 return PolicyDecision.route_llm("read command path could not be determined", **payload)
-            if any(is_secret_path(path) for path in resolved):
+            if any(is_protected_path(self.workspace, path) for path in resolved):
                 return PolicyDecision.route_llm("secret-pattern read requires LLM judgment", **payload)
             return PolicyDecision.allow("read-only command inside workspace", **payload)
         if cmd in READ_ONLY_COMMANDS and cmd not in VERSION_REPORT_COMMANDS and paths:
@@ -922,6 +1029,6 @@ class PolicyEngine:
         paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
         if path_problem:
             return PolicyDecision.route_llm(path_problem)
-        if any(is_secret_path(path) for path in paths):
+        if any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to secret-pattern paths are denied")
         return PolicyDecision.allow("workspace patch inside workspace")

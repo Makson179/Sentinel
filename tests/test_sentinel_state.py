@@ -65,7 +65,7 @@ from supervisor.state import (
     SUPERVISOR_WAKES,
     StateStore,
 )
-from supervisor.supervisor_agent import StatelessSupervisorAgent
+from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 
 
 def test_sentinel_state_initializes_required_files(tmp_path: Path) -> None:
@@ -898,9 +898,10 @@ async def test_runtime_noop_action_skips_supervisor_and_records_trace(tmp_path: 
                     "itemId": "cmd-1",
                     "item": {
                         "type": "commandExecution",
-                        "command": "python3 -c 'print(1)'",
+                        "command": "pwd",
                         "exitCode": 0,
                         "status": "completed",
+                        "stdout": str(tmp_path) + "\n",
                     },
                 },
             }
@@ -1139,6 +1140,12 @@ async def test_completion_packet_details_can_send_delta_after_return(tmp_path: P
     assert [diff.path for diff in details["changed_file_diffs"]] == ["src/new.py"]
     assert [validation.validation_id for validation in details["validation_outputs"]] == [
         controller.validations[1].validation_id
+    ]
+    assert details["completion_delta_evidence_summary"] == [
+        (
+            f"validation {controller.validations[1].validation_id} seq=5 "
+            "type=behavioral outcome=passed command=pytest new.py"
+        )
     ]
 
 
@@ -1443,6 +1450,48 @@ def test_command_aggregated_output_is_attached_to_validation_ledger() -> None:
     assert validation.captured_output == "scenario=smoke state=requested\n"
 
 
+def test_command_output_aliases_are_attached_to_validation_ledger() -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=10,
+        item={"type": "commandExecution", "aggregated_output": "scenario=smoke state=requested\n"},
+        changed_paths=["bin/app"],
+    )
+
+    assert validation is not None
+    assert validation.type == "behavior_demo"
+    assert validation.trusted_validation_outcome == "passed"
+    assert validation.captured_output == "scenario=smoke state=requested\n"
+
+
+def test_behavior_demo_without_real_output_is_not_passed() -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=10,
+        item={"type": "commandExecution"},
+        changed_paths=["bin/app"],
+    )
+
+    assert validation is not None
+    assert validation.type == "behavior_demo"
+    assert validation.outcome == "fail"
+    assert validation.passed is False
+    assert validation.trusted_validation_outcome == "masked_or_unknown"
+    assert validation.masking_reason == "behavior_demo_missing_output"
+
+
 def test_non_python_behavior_demo_commands_are_classified() -> None:
     cases = [
         (
@@ -1484,6 +1533,27 @@ def test_non_python_behavior_demo_commands_are_classified() -> None:
         assert validation is not None, command
         assert validation.type == "behavior_demo", command
         assert validation.captured_output == output
+
+
+def test_supervisor_policy_has_no_specbench_split_triggers() -> None:
+    root = Path(__file__).resolve().parents[1]
+    texts = [
+        (root / "supervisor" / "controller.py").read_text(encoding="utf-8"),
+        (root / "supervisor" / "prompts" / "prompts.toml").read_text(encoding="utf-8"),
+    ]
+    forbidden = (
+        "id" + "_private",
+        "public + " + "id" + "_private",
+        "public " + "green",
+        "public " + "tests",
+        "hidden " + "tests",
+        "breadth_risk" + "_assessment",
+    )
+
+    for text in texts:
+        lowered = text.lower()
+        for token in forbidden:
+            assert token not in lowered
 
 
 def test_validation_output_prefers_test_runner_suite_files_over_stack_trace_paths() -> None:
@@ -1563,6 +1633,46 @@ def test_read_only_test_file_commands_are_inspections_not_validations() -> None:
     assert "def test_public" in inspection.captured_output
 
 
+def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validations() -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command="/bin/bash -lc \"sed -n '1,80p' tests/public/test_public.py\"",
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+    item = {"type": "commandExecution", "stdout": "def test_public():\n    assert app()\n"}
+
+    validation = _validation_from_action(action, sequence=8, item=item, changed_paths=["tests/public/test_public.py"])
+    inspection = _inspection_from_action(action, sequence=8, item=item)
+
+    assert validation is None
+    assert inspection is not None
+    assert inspection.passed is True
+    assert inspection.inspected_paths == ["tests/public/test_public.py"]
+    assert "def test_public" in inspection.captured_output
+
+
+def test_forbidden_pattern_scan_with_regex_alternation_records_inspection() -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command='rg -n "system\\(|exec\\(|popen\\(" src include',
+        exit_code=1,
+        status="completed",
+        summary="command completed",
+    )
+    item = {"type": "commandExecution", "stdout": ""}
+
+    validation = _validation_from_action(action, sequence=8, item=item, changed_paths=["src/compiler.c"])
+    inspection = _inspection_from_action(action, sequence=8, item=item)
+
+    assert validation is None
+    assert inspection is not None
+    assert inspection.passed is True
+    assert inspection.inspection_id.startswith("inspection-")
+    assert inspection.inspected_paths == ["src", "include"]
+
+
 async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
@@ -1591,6 +1701,40 @@ async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path
     assert fake.runtime_packets == []
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert trace["should_wake_runtime_supervisor"] is False
+
+
+async def test_declared_grading_path_completed_command_escalates_integrity_failure(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    grading_root = tmp_path / "SpecBench" / "examples" / "c_compiler"
+    grading_root.mkdir(parents=True)
+    (grading_root / "hidden.c").write_text("int secret;\n", encoding="utf-8")
+    controller.declared_grading_roots = (str(grading_root),)
+    controller.approvals = ApprovalManager(tmp_path, declared_grading_roots=controller.declared_grading_roots)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": f"sed -n '1,20p' {grading_root / 'hidden.c'}",
+                        "exitCode": 0,
+                        "status": "completed",
+                        "stdout": "int secret;\n",
+                    },
+                },
+            }
+        )
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    assert controller.running is False
+    assert fake.runtime_packets == []
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "coder accessed declared grading/hidden path" in progress
 
 
 def test_evidence_provenance_marks_validation_before_latest_edit_as_stale() -> None:
@@ -1875,6 +2019,10 @@ async def test_supervisor_agent_retries_invalid_structured_output_once(tmp_path:
     assert decision.decision == "return"
     assert len(client.turn_inputs) == 2
     assert "previous completion-review response was not valid structured JSON" in client.turn_inputs[1]
+    assert "compact completion-review JSON object" in client.turn_inputs[1]
+    assert "files_reviewed=[]" in client.turn_inputs[1]
+    assert "behavior_evidence_matrix=[]" in client.turn_inputs[1]
+    assert "under 3000 characters" in client.turn_inputs[1]
     audits = [json.loads(line) for line in store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()]
     assert audits[-2]["use_case"] == "completion_review_parse_retry"
     assert audits[-2]["status"] == "error"
@@ -1972,6 +2120,7 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     assert store.get_sentinel_config().generation == 0
     assert controller.coder.messages == ["Validate missing-key fallback before marking ready again."]
     assert len(controller.completion_returns) == 1
+    assert store.get_health().interventions == 0
     assert "Completion review returned missing fallback coverage" in store.path("PROGRESS.md").read_text(encoding="utf-8")
 
 
@@ -2843,7 +2992,7 @@ async def test_completion_accept_gate_allows_inspection_for_static_source_constr
     assert store.get_sentinel_config().accept_gate_accepts == 1
 
 
-async def test_completion_accept_gate_resolves_inspection_evidence_by_command_when_id_missing(tmp_path: Path) -> None:
+async def test_completion_accept_gate_repairs_missing_inspection_evidence_id_without_escalation(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="node -e \"console.log(render())\"",
@@ -2866,7 +3015,7 @@ async def test_completion_accept_gate_resolves_inspection_evidence_by_command_wh
             inspected_paths=["src"],
         )
     ]
-    controller, store, task, _coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     controller.inspections = inspections
     packet = _gate_packet(task, validations=validations)
     packet.inspections = inspections
@@ -2899,7 +3048,65 @@ async def test_completion_accept_gate_resolves_inspection_evidence_by_command_wh
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert coder.messages == []
     assert store.get_sentinel_config().accept_gate_accepts == 1
+    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
+    assert "Controller repaired completion evidence IDs" in store.path(PROGRESS).read_text(encoding="utf-8")
+    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
+    repair = next(entry for entry in log_entries if entry.get("type") == "completion_evidence_id_repair")
+    assert any("inspection-4" in item for item in repair["repairs"])
+
+
+async def test_completion_accept_gate_unrepairable_evidence_id_failure_is_infra_invalid_not_escalated(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="node -e \"console.log(render())\"",
+            exit_code=0,
+            passed=True,
+            type="behavior_demo",
+            summary="<h1>Requested</h1>",
+            captured_output="<h1>Requested</h1>\n",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations, reruns=1)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+    payload["behavior_evidence_matrix"].append(
+        {
+            "behavior": "implementation satisfies static source constraint",
+            "task_basis": "TASK.md requires source inspection",
+            "files_considered": ["src/app.py"],
+            "evidence": [
+                {
+                    "command": "rg -n \"forbidden\" src",
+                    "sequence": 99,
+                    "validation_type": "inspection",
+                    "outcome": "pass",
+                    "freshness": "fresh",
+                    "why_it_covers_behavior": "source inspection found no forbidden marker",
+                }
+            ],
+            "status": "covered",
+            "gap": None,
+        }
+    )
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    assert store.get_sentinel_config().accept_gate_audit_failures == 1
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "infra-invalid: controller-side proof-format repair failed" in report
+    assert "escalated" not in report
 
 
 async def test_completion_accept_gate_rejects_inspection_only_behavior_row(tmp_path: Path) -> None:
@@ -2955,7 +3162,7 @@ async def test_completion_accept_gate_rejects_inspection_only_behavior_row(tmp_p
     assert "inspection evidence only covers static/source constraints" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
-async def test_completion_accept_gate_rejects_unaddressed_breadth_risk(tmp_path: Path) -> None:
+async def test_completion_accept_gate_treats_breadth_risk_as_report_only(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="node -e \"console.log(render())\"",
@@ -2993,10 +3200,12 @@ async def test_completion_accept_gate_rejects_unaddressed_breadth_risk(tmp_path:
         packet=packet,
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
     assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-    assert "matrix narrow relative to spec" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert store.get_sentinel_config().accept_gate_accepts == 1
+    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
+    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_pass")
+    assert {"check_name": "breadth_risk_report_only", "passed": True} in log_entry["checks"]
 
 
 async def test_completion_accept_gate_returns_for_empty_behavior_demo_output(tmp_path: Path) -> None:
@@ -3060,6 +3269,128 @@ async def test_completion_accept_gate_returns_for_self_verdict_behavior_demo(tmp
     assert "self-verdict" in coder.messages[0]
     assert store.get_sentinel_config().accept_gate_coder_returns == 1
     assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
+
+
+async def test_completion_accept_gate_returns_for_failing_behavior_demo_evidence(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario requested",
+            exit_code=1,
+            passed=False,
+            type="behavior_demo",
+            summary="scenario failed",
+            captured_output="actual=old expected=requested\n",
+            sequence=3,
+        ),
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="tests/test_app.py::test_smoke PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_smoke PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=4,
+        ),
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["outcome"] = "fail"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["why_it_covers_behavior"] = (
+        "claims the failing demo covers the requested scenario"
+    )
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert "no linked fresh passing validation" in coder.messages[0]
+
+
+async def test_completion_accept_gate_returns_for_stale_behavior_demo_evidence(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario requested",
+            exit_code=0,
+            passed=True,
+            type="behavior_demo",
+            summary="actual=requested",
+            captured_output="actual=requested\n",
+            sequence=1,
+        ),
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="tests/test_app.py::test_smoke PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_smoke PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=4,
+        ),
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-1").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["sequence"] = 1
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["freshness"] = "stale"
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations, latest_change=2),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert "no linked fresh passing validation" in coder.messages[0]
+
+
+async def test_completion_accept_gate_returns_for_masked_behavior_demo_evidence(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario requested | cat",
+            exit_code=0,
+            passed=True,
+            type="behavior_demo",
+            summary="actual=requested",
+            captured_output="actual=requested\n",
+            trusted_validation_outcome="masked_or_unknown",
+            masking_reason="pipeline_without_pipefail",
+            sequence=3,
+        ),
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="tests/test_app.py::test_smoke PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_smoke PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=4,
+        ),
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision.model_validate(payload),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert "no linked fresh passing validation" in coder.messages[0]
 
 
 async def test_completion_accept_gate_does_not_repeat_bounded_empty_demo_return(tmp_path: Path) -> None:
@@ -3149,9 +3480,12 @@ async def test_completion_accept_gate_reruns_reviewer_when_behavior_lacks_ledger
         ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-missing").model_dump(mode="json")
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "pytest tests/other_flow.py"
+    payload["behavior_evidence_matrix"][0]["evidence"][0]["sequence"] = 99
 
     await controller.apply_completion_decision(
-        _covered_accept_decision(wake_sequence=1, validation_id="validation-missing"),
+        CompletionReviewDecision.model_validate(payload),
         packet_thread_id="thread",
         packet=_gate_packet(task, validations=validations),
     )
@@ -3253,6 +3587,80 @@ async def test_completion_accept_gate_double_reviewer_incomplete_escalates_audit
     assert coder.messages == []
     assert store.get_sentinel_config().accept_gate_audit_failures == 1
     assert "controller-side audit failure" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+
+
+async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            validation_id="validation-new",
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario fixed",
+            exit_code=0,
+            type="behavior_demo",
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="fixed=1",
+            captured_output="fixed=1\n",
+            sequence=12,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    packet = _gate_packet(task, validations=validations, wake_sequence=20, latest_change=11)
+    packet.latest_event_sequence = 20
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "return",
+            "reason": "old gap still open",
+            "decision_artifact": {
+                "current_state": "old state",
+                "resolved_concerns": [],
+                "stale_concerns": ["old gap"],
+                "uncovered_edge_candidates": [],
+                "actionable_gap_or_none": "old gap",
+                "decision": "return",
+            },
+            "basis_event_seq": 10,
+            "last_relevant_edit_seq": 8,
+            "last_validation_seq": 9,
+            "files_reviewed": [
+                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
+            ],
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "requested behavior",
+                    "task_basis": "TASK.md",
+                    "files_considered": ["src/app.py"],
+                    "evidence": [],
+                    "status": "partial",
+                    "gap": "old gap",
+                }
+            ],
+            "uncovered_behaviors": ["requested behavior"],
+            "validation_gaps": [],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": "fix old gap",
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 20,
+            "generation": 0,
+        }
+    )
+
+    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert controller.completion_returns == []
+    assert coder.messages == []
+    assert controller.completion_decision_staleness_rerun_count == 1
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "stale decision anchors" in progress
+    log = store.path(LOG).read_text(encoding="utf-8")
+    assert "completion_decision_staleness_failure" in log
+    assert "last_validation_seq=9 < latest_validation_sequence=12" in log
 
 
 async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_path: Path) -> None:
@@ -3590,6 +3998,71 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
     assert "stale_runtime_supervisor_timeout" in health.risk_signals
     assert "continuing with the latest queued review" in store.path(PROGRESS).read_text(encoding="utf-8")
     assert any("supervisor check failed" in message for _, message in controller.tui.messages)
+
+
+async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+
+    class NoMessageThenNoopSupervisor:
+        def __init__(self, store: StateStore, task: Path) -> None:
+            self.agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+            self.calls = 0
+
+        def build_packet(self, **kwargs):
+            return self.agent.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            self.calls += 1
+            if self.calls == 1:
+                raise SupervisorAgentError("supervisor did not produce an agent message")
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.NOOP,
+                reason="recovered",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    supervisor = NoMessageThenNoopSupervisor(store, controller.task_path)
+    controller.supervisor = supervisor
+
+    await controller._supervisor_check_loop("runtime check", None, None, None, None, False)
+
+    assert supervisor.calls == 2
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
+    assert controller.provider_failure_recovery_counts["no_message"] == 1
+    assert "supervisor produced no agent message" in store.path(PROGRESS).read_text(encoding="utf-8")
+
+
+async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failure(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+
+    class AlwaysNoMessageSupervisor:
+        def __init__(self, store: StateStore, task: Path) -> None:
+            self.agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+            self.calls = 0
+
+        def build_packet(self, **kwargs):
+            return self.agent.build_packet(**kwargs)
+
+        async def decide_completion(self, packet):
+            self.calls += 1
+            raise SupervisorAgentError("supervisor did not produce an agent message")
+
+        async def close_completion_review(self):
+            return None
+
+    supervisor = AlwaysNoMessageSupervisor(store, controller.task_path)
+    controller.supervisor = supervisor
+
+    await controller._supervisor_check_loop("completion check", None, None, None, None, True)
+
+    assert supervisor.calls == 2
+    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "infra-invalid: supervisor no_message provider failure after retry/resume" in report
+    assert "- Status: provider_failure" in report
+    assert "repeated supervisor no_message" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
 async def test_preflight_appserver_timeout_writes_provider_failure_final_report(tmp_path: Path, monkeypatch) -> None:
@@ -4450,7 +4923,9 @@ def _completion_gate_controller(
     controller.completion_returns = []
     controller.completion_restarts = 0
     controller.completion_reviewer_rerun_count = reruns
+    controller.completion_decision_staleness_rerun_count = 0
     controller.no_marker_idle_nudge_count = 0
+    controller.provider_failure_recovery_counts = {}
     controller._last_large_diff_signature = None
     return controller, store, task, coder
 
@@ -4461,6 +4936,7 @@ class _RuntimeFakeSupervisor:
         self.runtime_packets = []
         self.completion_packets = []
         self.completion_thread_id = None
+        self.closed_completion_reviews = 0
 
     def build_packet(self, **kwargs):
         return self.agent.build_packet(**kwargs)
@@ -4495,6 +4971,8 @@ class _RuntimeFakeSupervisor:
         )
 
     async def close_completion_review(self):
+        self.closed_completion_reviews += 1
+        self.completion_thread_id = None
         return None
 
 
@@ -4536,7 +5014,9 @@ def _runtime_controller(tmp_path: Path) -> tuple[SentinelController, StateStore,
     controller.completion_attempt_count = 0
     controller.completion_restarts = 0
     controller.completion_reviewer_rerun_count = 0
+    controller.completion_decision_staleness_rerun_count = 0
     controller.validation_runtime_state = {}
+    controller.provider_failure_recovery_counts = {}
     controller.completion_review_return_sequence = None
     controller.completion_review_return_validation_sequence = None
     controller._terminal_cleanup_started = False
@@ -4661,6 +5141,262 @@ def _gate_packet(
         validations=validations,
         latest_relevant_change_sequence=latest_change,
     )
+
+
+async def test_completion_return_ignoring_fresh_delta_evidence_reruns_reviewer(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            validation_id="validation-old",
+            command="pytest tests/public",
+            exit_code=0,
+            passed=True,
+            summary="old public pass",
+            sequence=5,
+        ),
+        ValidationRun(
+            validation_id="validation-demo",
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./c_compiler sample.c",
+            exit_code=0,
+            type="behavior_demo",
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="returns 42",
+            captured_output="program exit=42\n",
+            sequence=15,
+        ),
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    packet = _gate_packet(task, validations=validations, wake_sequence=20)
+    packet.completion_payload_mode = "delta"
+    packet.completion_payload_since_sequence = 10
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "return",
+            "reason": "old gap still lacks proof",
+            "files_reviewed": [
+                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
+            ],
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "requested behavior",
+                    "task_basis": "TASK.md",
+                    "files_considered": ["src/app.py"],
+                    "evidence": [
+                        {
+                            "validation_id": "validation-old",
+                            "command": "pytest tests/public",
+                            "sequence": 5,
+                            "validation_type": "behavioral",
+                            "outcome": "pass",
+                            "freshness": "stale",
+                            "why_it_covers_behavior": "old retained public validation",
+                        }
+                    ],
+                    "status": "partial",
+                    "gap": "needs direct behavior evidence",
+                }
+            ],
+            "uncovered_behaviors": [],
+            "validation_gaps": ["needs direct behavior evidence"],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": "provide direct behavior evidence",
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 20,
+            "generation": 0,
+        }
+    )
+
+    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+
+    assert coder.messages == []
+    assert controller.completion_returns == []
+    assert controller.completion_return_freshness_rerun_count == 1
+    assert "stale return ignored fresh delta evidence" in store.path(PROGRESS).read_text(encoding="utf-8")
+    log = store.path(LOG).read_text(encoding="utf-8")
+    assert "completion_return_freshness_failure" in log
+    assert "validation-demo" in log
+
+
+async def test_completion_return_freshness_rerun_prompt_binds_fresh_evidence_to_prior_gaps(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.coder = _GateFakeCoder()
+    controller.validations = [
+        ValidationRun(
+            validation_id="validation-old",
+            command="pytest tests/public",
+            exit_code=0,
+            passed=True,
+            summary="old public pass",
+            sequence=5,
+        ),
+        ValidationRun(
+            validation_id="validation-demo",
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario missing-key",
+            exit_code=0,
+            type="behavior_demo",
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="fallback=default",
+            captured_output="fallback=default\n",
+            sequence=15,
+        ),
+    ]
+    controller.completion_returns = [
+        CompletionReturnRecord(
+            reason="missing-key fallback lacks direct proof",
+            validation_gaps=["missing-key fallback behavior_demo required"],
+            message_to_coder="provide missing-key fallback demo",
+            sequence=10,
+            generation=0,
+        )
+    ]
+    packet = _gate_packet(tmp_path / "TASK.md", validations=controller.validations, wake_sequence=20)
+    packet.completion_payload_mode = "delta"
+    packet.completion_payload_since_sequence = 10
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "return",
+            "reason": "missing-key fallback still lacks direct proof",
+            "files_reviewed": [
+                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
+            ],
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "missing-key fallback",
+                    "task_basis": "TASK.md",
+                    "files_considered": ["src/app.py"],
+                    "evidence": [
+                        {
+                            "validation_id": "validation-old",
+                            "command": "pytest tests/public",
+                            "sequence": 5,
+                            "validation_type": "behavioral",
+                            "outcome": "pass",
+                            "freshness": "stale",
+                            "why_it_covers_behavior": "old public validation",
+                        }
+                    ],
+                    "status": "partial",
+                    "gap": "needs direct behavior evidence",
+                }
+            ],
+            "uncovered_behaviors": [],
+            "validation_gaps": ["needs direct behavior evidence"],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": "provide direct behavior evidence",
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 20,
+            "generation": 0,
+        }
+    )
+
+    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+    assert controller._supervisor_task is not None
+    await controller._supervisor_task
+
+    rerun_packet = fake.completion_packets[0]
+    assert "validation-demo" in rerun_packet.current_summary
+    assert "fallback=default" in rerun_packet.current_summary
+    assert "missing-key fallback behavior_demo required" in rerun_packet.current_summary
+    assert "Do not repeat a prior return finding" in rerun_packet.current_summary
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+
+
+async def test_repeated_stale_completion_return_starts_fresh_full_review(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.coder = _GateFakeCoder()
+    fake.completion_thread_id = "stale-completion-thread"
+    controller.completion_return_freshness_rerun_count = 1
+    controller.completion_review_return_sequence = 10
+    controller.validations = [
+        ValidationRun(
+            validation_id="validation-old",
+            command="pytest tests/public",
+            exit_code=0,
+            passed=True,
+            summary="old public pass",
+            sequence=5,
+        ),
+        ValidationRun(
+            validation_id="validation-demo",
+            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario fixed",
+            exit_code=0,
+            type="behavior_demo",
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="fixed=1",
+            captured_output="fixed=1\n",
+            sequence=15,
+        ),
+    ]
+    packet = _gate_packet(tmp_path / "TASK.md", validations=controller.validations, wake_sequence=20)
+    packet.completion_payload_mode = "delta"
+    packet.completion_payload_since_sequence = 10
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "return",
+            "reason": "old fixed gap still lacks proof",
+            "files_reviewed": [
+                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
+            ],
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "fixed behavior",
+                    "task_basis": "TASK.md",
+                    "files_considered": ["src/app.py"],
+                    "evidence": [
+                        {
+                            "validation_id": "validation-old",
+                            "command": "pytest tests/public",
+                            "sequence": 5,
+                            "validation_type": "behavioral",
+                            "outcome": "pass",
+                            "freshness": "stale",
+                            "why_it_covers_behavior": "old public validation",
+                        }
+                    ],
+                    "status": "partial",
+                    "gap": "needs direct behavior evidence",
+                }
+            ],
+            "uncovered_behaviors": [],
+            "validation_gaps": ["needs direct behavior evidence"],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": "provide direct behavior evidence",
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 20,
+            "generation": 0,
+        }
+    )
+
+    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+    assert controller._supervisor_task is not None
+    await controller._supervisor_task
+
+    assert fake.closed_completion_reviews == 1
+    assert fake.completion_packets[0].completion_payload_mode == "full"
+    assert fake.completion_packets[0].completion_payload_since_sequence is None
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "starting fresh completion_review" in progress
 
 
 class _FakeTUI:

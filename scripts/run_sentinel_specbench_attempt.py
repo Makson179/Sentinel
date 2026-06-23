@@ -64,7 +64,7 @@ def main() -> int:
     (workspace / "TASK.md").write_text(task_text, encoding="utf-8")
     write_visible_test_runner(workspace, visible_test_python)
 
-    info = {
+    workspace_info = {
         "task_id": task_id,
         "display_name": getattr(task_def, "display_name", task_id),
         "language": getattr(task_def, "language", None),
@@ -81,11 +81,13 @@ def main() -> int:
             "visible public-test fixtures copied without reference/private/id_private directories",
         ],
     }
+    runner_info = dict(workspace_info)
+    runner_info["declared_grading_paths"] = declared_grading_paths(task_def)
     (workspace / "specbench_task_info.json").write_text(
-        json.dumps(info, indent=2, sort_keys=True) + "\n",
+        json.dumps(workspace_info, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    print(json.dumps(info, indent=2, sort_keys=True))
+    print(json.dumps(runner_info, indent=2, sort_keys=True))
     return 0
 
 
@@ -139,6 +141,34 @@ def copy_visible_resources(task_def: Any, workspace: Path) -> list[str]:
             shutil.copy2(source, dest)
             copied.append(str(dest.relative_to(workspace)))
     return copied
+
+
+def declared_grading_paths(task_def: Any) -> list[str]:
+    paths: list[Path] = []
+    public_test_dir = getattr(task_def, "public_test_dir", None)
+    if public_test_dir:
+        public_path = Path(public_test_dir)
+        if len(public_path.parents) >= 2:
+            paths.append(public_path.parents[1])
+    for attr in (
+        "private_test_dir",
+        "id_private_test_dir",
+        "hidden_test_dir",
+        "grading_dir",
+        "reference_dir",
+        "reference_solution_dir",
+        "solution_dir",
+    ):
+        value = getattr(task_def, attr, None)
+        if value:
+            paths.append(Path(value))
+    resolved: list[str] = []
+    for path in paths:
+        try:
+            resolved.append(str(path.resolve(strict=False)))
+        except OSError:
+            continue
+    return sorted(dict.fromkeys(resolved))
 
 
 def relative_files(root: Path, base: Path) -> list[str]:
@@ -489,7 +519,7 @@ def main() -> int:
     capture_attempt_artifacts(paths)
     hidden_check = check_heldout_absent(paths.workspace)
 
-    scoring_rc = score_workspace(args, specbench_dir, paths)
+    scoring_rc = score_workspace_if_sentinel_succeeded(args, specbench_dir, paths, sentinel_rc=sentinel_rc)
     rollouts = collect_rollouts(paths, workspace_cwd=str(paths.workspace), start_utc=started, end_utc=ended)
     write_json(paths.rollouts / "rollout_collection_summary.json", rollouts)
 
@@ -768,6 +798,7 @@ def initialize_workspace_git(workspace: Path) -> None:
 
 def run_sentinel(args: argparse.Namespace, paths: RunPaths, sentinel_src: Path) -> int:
     sentinel_bin = resolve_sentinel_bin(args, sentinel_src)
+    task_info = read_json(paths.root / "task-info-public.json", {})
     task_arg = paths.workspace / "TASK.md"
     cmd = [
         str(sentinel_bin),
@@ -775,6 +806,9 @@ def run_sentinel(args: argparse.Namespace, paths: RunPaths, sentinel_src: Path) 
         str(task_arg),
         "--start-over",
     ]
+    for protected_path in task_info.get("declared_grading_paths") or []:
+        if isinstance(protected_path, str) and protected_path.strip():
+            cmd.extend(["--protected-path", protected_path])
     if args.model:
         cmd.extend(["--model", args.model])
     cmd.extend(args.supervisor_args)
@@ -858,6 +892,25 @@ def score_workspace(args: argparse.Namespace, specbench_dir: Path, paths: RunPat
     ]
     write_json(paths.scoring / "score-command.json", cmd)
     return run_streaming(cmd, log_path=paths.scoring / "score-run.log")
+
+
+def score_workspace_if_sentinel_succeeded(
+    args: argparse.Namespace,
+    specbench_dir: Path,
+    paths: RunPaths,
+    *,
+    sentinel_rc: int,
+) -> int:
+    if sentinel_rc == 0:
+        return score_workspace(args, specbench_dir, paths)
+    write_json(
+        paths.scoring / "score-skipped.json",
+        {
+            "reason": "sentinel exited nonzero; run is infra-invalid/not-scored",
+            "sentinel_exit_code": sentinel_rc,
+        },
+    )
+    return 0
 
 
 def collect_rollouts(paths: RunPaths, *, workspace_cwd: str, start_utc: datetime, end_utc: datetime) -> dict[str, Any]:
@@ -1117,6 +1170,7 @@ def write_run_report(
 
 - held-out tests present in agent workspace: `{hidden_check['heldout_tests_present']}`
 - held-out workspace check paths: `{', '.join(hidden_check['checked_paths'])}`
+- declared harness protected roots: `{len(task_info.get('declared_grading_paths') or [])}`
 - visible files only before agent run: starter code, TASK.md, tests/public, public-test helpers/resources excluding reference/private/id_private directories.
 - valid scored run: `{valid_scored_run}`
 

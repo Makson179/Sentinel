@@ -83,6 +83,9 @@ LARGE_DIFF_CHANGED_LINES_THRESHOLD = 500
 LARGE_DIFF_CHANGED_FILES_THRESHOLD = 10
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
+# Observation-only breadth-risk hints for reviewer context. These terms must
+# never drive an accept gate, mandatory demo, or forced code change; required
+# behavior is derived from task_contents and repository contract instead.
 BREADTH_FEATURE_TERMS = (
     "api",
     "abi",
@@ -179,6 +182,7 @@ class SentinelController:
         overwrite_state: bool = False,
         clean_workspace: bool = False,
         use_git_diff: bool = True,
+        declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
@@ -188,6 +192,7 @@ class SentinelController:
         self.model = model
         self.overwrite_state = overwrite_state
         self.use_git_diff = use_git_diff
+        self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
             cwd=self.project_root,
@@ -221,6 +226,9 @@ class SentinelController:
         self.completion_attempt_count = 0
         self.completion_restarts = 0
         self.completion_reviewer_rerun_count = 0
+        self.completion_decision_staleness_rerun_count = 0
+        self.completion_return_freshness_rerun_count = 0
+        self.provider_failure_recovery_counts: dict[str, int] = {}
         self.no_marker_idle_nudge_count = 0
         self.validation_runtime_state: dict[str, dict[str, Any]] = {}
         self.completion_review_return_sequence: int | None = None
@@ -252,6 +260,7 @@ class SentinelController:
                 self.project_root,
                 supervisor=self,
                 cheap_reviewer=self.approval_triage_reviewer,
+                declared_grading_roots=self.declared_grading_roots,
                 cheap_review_timeout_seconds=self.approval_triage_config.timeout_seconds,
             )
             self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
@@ -466,7 +475,10 @@ class SentinelController:
     async def handle_server_request(self, message: AppServerMessage) -> None:
         context = normalize_approval_request(message)
         if getattr(self, "_terminal_cleanup_started", False):
-            manager = getattr(self, "approvals", None) or ApprovalManager(self.project_root)
+            manager = getattr(self, "approvals", None) or ApprovalManager(
+                self.project_root,
+                declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+            )
             resolution = manager._deny(context, "terminal state reached")
             await self.client.respond(context.server_request_id, manager.response_payload(context, resolution))
             self.tui.render("DENIED", f"{resolution.decision}: {resolution.reason}")
@@ -484,8 +496,12 @@ class SentinelController:
             reason=context.command or context.grant_root or context.request_type.value,
         )
         if self.approvals is None:
-            resolution = ApprovalManager(self.project_root)._deny(context, "approval manager not ready")
-            response = ApprovalManager(self.project_root).response_payload(context, resolution)
+            fallback_manager = ApprovalManager(
+                self.project_root,
+                declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+            )
+            resolution = fallback_manager._deny(context, "approval manager not ready")
+            response = fallback_manager.response_payload(context, resolution)
         else:
             resolution = await self.approvals.decide(context)
             response = self.approvals.response_payload(context, resolution)
@@ -585,6 +601,20 @@ class SentinelController:
                 self.store.append_recent_action(summary)
                 triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=summary)
                 self._record_changed_files(triggering_action)
+                declared_grading_issue = self._declared_grading_access_issue(triggering_action)
+                if declared_grading_issue is not None:
+                    self.tui.render("INTEGRITY", declared_grading_issue)
+                    self.store.append_text_locked(PROGRESS, f"- Integrity failure: {declared_grading_issue}\n")
+                    self._append_event(
+                        AppEventSource.SUPERVISOR,
+                        "integrity/declared_grading_path_access",
+                        reason=declared_grading_issue,
+                    )
+                    await self.finalize(
+                        f"escalated: {declared_grading_issue}",
+                        status=SentinelStatus.ESCALATED,
+                    )
+                    return
                 validation_item = _item_with_recorded_output(item, self._pop_command_output(item_id))
                 validation = _validation_from_action(
                     triggering_action,
@@ -664,6 +694,7 @@ class SentinelController:
                 self._last_completion_marker_sequence = message.sequence
                 self.no_marker_idle_nudge_count = 0
                 self.completion_reviewer_rerun_count = 0
+                self.completion_return_freshness_rerun_count = 0
                 done_gap = await self._done_without_fresh_behavioral_validation()
                 if done_gap is not None:
                     self._record_runtime_trigger_trace(
@@ -975,7 +1006,7 @@ class SentinelController:
         prior = getattr(self, "prior_interventions", None)
         if not prior:
             return
-        target = len(prior)
+        target = sum(1 for record in prior if _prior_record_counts_as_health_intervention(record))
 
         def patch(current):
             if current.interventions >= target:
@@ -1164,6 +1195,28 @@ class SentinelController:
         self.store.append_runtime_trace(trace)
         self._update_runtime_metrics(trace)
 
+    def _declared_grading_access_issue(self, action: TriggeringAction) -> str | None:
+        roots = getattr(self, "declared_grading_roots", ())
+        if not roots:
+            return None
+        payload: dict[str, Any] = {}
+        if action.command:
+            payload["command"] = action.command
+        if action.cwd:
+            payload["cwd"] = action.cwd
+        if action.paths:
+            payload["paths"] = action.paths
+        if not payload:
+            return None
+        manager = getattr(self, "approvals", None)
+        if manager is None:
+            manager = ApprovalManager(self.project_root, declared_grading_roots=roots)
+        decision = manager.policy.evaluate(payload)
+        if decision.kind.value != "deny" or "declared grading/hidden path access denied" not in decision.reason:
+            return None
+        command = f" command `{action.command}`" if action.command else ""
+        return f"coder accessed declared grading/hidden path via{command}: {decision.reason}"
+
     def _update_runtime_metrics(self, trace: dict[str, Any]) -> None:
         reasons = trace.get("trigger_reasons")
         if not isinstance(reasons, list):
@@ -1321,8 +1374,17 @@ class SentinelController:
             else:
                 decision = await self.supervisor.decide(packet)
         except SupervisorAgentError as exc:
-            message = f"supervisor check failed: {exc}"
+            failure_kind = _classify_supervisor_agent_error(exc)
+            message = f"supervisor check failed ({failure_kind}): {exc}"
             self.tui.render("SUPERVISOR", message)
+            if failure_kind == "no_message":
+                recovered = await self._handle_supervisor_no_message_failure(
+                    message=message,
+                    summary=summary,
+                    completion_review=completion_review,
+                )
+                if recovered:
+                    return
             if not completion_review and getattr(self, "_supervisor_dirty", False):
                 patch_health(
                     self.store,
@@ -1343,6 +1405,66 @@ class SentinelController:
             await self.apply_completion_decision(decision, packet_thread_id=packet.coder_thread_id, packet=packet)
         else:
             await self.apply_supervisor_decision(decision, packet_thread_id=packet.coder_thread_id)
+
+    async def _handle_supervisor_no_message_failure(
+        self,
+        *,
+        message: str,
+        summary: str,
+        completion_review: bool,
+    ) -> bool:
+        counts = getattr(self, "provider_failure_recovery_counts", None)
+        if counts is None:
+            counts = {}
+            self.provider_failure_recovery_counts = counts
+        attempts = int(counts.get("no_message") or 0)
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "provider_failure_recovery",
+                "kind": "no_message",
+                "attempts_before": attempts,
+                "completion_review": completion_review,
+                "message": message,
+            }
+        )
+        if attempts < 1:
+            counts["no_message"] = attempts + 1
+            if completion_review and self.supervisor is not None and hasattr(self.supervisor, "close_completion_review"):
+                await self.supervisor.close_completion_review()
+            self.store.append_text_locked(
+                PROGRESS,
+                "- Provider recovery: supervisor produced no agent message; retrying review from latest stable state.\n",
+            )
+            self._append_event(
+                AppEventSource.SUPERVISOR,
+                "provider/no_message_retry",
+                decision="retry",
+                reason=message,
+            )
+            self._supervisor_dirty = True
+            self._supervisor_next_summary = (
+                "Retry supervisor review from the latest stable controller state after provider no_message. "
+                f"Previous review summary: {summary}"
+            )
+            self._supervisor_next_completion_review = completion_review
+            return True
+        counts["no_message"] = attempts + 1
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Provider recovery failed: repeated supervisor no_message; marking run infra-invalid before scoring.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "provider/no_message_infra_invalid",
+            decision="infra-invalid",
+            reason=message,
+        )
+        await self.finalize(
+            f"infra-invalid: supervisor no_message provider failure after retry/resume: {message}",
+            status=SentinelStatus.PROVIDER_FAILURE,
+        )
+        return True
 
     def _completion_payload_window(
         self,
@@ -1428,6 +1550,12 @@ class SentinelController:
             return
         if decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
             return
+        stale_issue = self._completion_decision_staleness_issue(decision, packet=packet)
+        if stale_issue is not None:
+            await self._handle_completion_decision_staleness_failure(stale_issue)
+            return
+        if decision.decision == CompletionReviewDecisionKind.ACCEPT:
+            decision = self._repair_completion_accept_evidence_ids(decision, packet=packet)
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence})
         )
@@ -1456,6 +1584,8 @@ class SentinelController:
         )
         if decision.decision == CompletionReviewDecisionKind.ACCEPT:
             self.completion_reviewer_rerun_count = 0
+            self.completion_decision_staleness_rerun_count = 0
+            self.completion_return_freshness_rerun_count = 0
             self._pending_completion_gate_rejection = None
             self._accepted_completion_decision = decision
             await self.finalize(
@@ -1466,6 +1596,10 @@ class SentinelController:
             return
         if decision.decision == CompletionReviewDecisionKind.RETURN:
             self._pending_completion_gate_rejection = None
+            freshness_issue = self._completion_return_freshness_issue(decision, packet=packet)
+            if freshness_issue is not None:
+                await self._handle_completion_return_freshness_failure(freshness_issue)
+                return
             await self._return_completion_to_coder(decision)
             return
         if decision.decision == CompletionReviewDecisionKind.RESTART:
@@ -1473,6 +1607,123 @@ class SentinelController:
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)
             return
+
+    def _completion_decision_staleness_issue(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+    ) -> dict[str, Any] | None:
+        if packet is None:
+            return None
+        stale_fields: list[str] = []
+        if decision.basis_event_seq is not None and packet.latest_event_sequence > decision.basis_event_seq:
+            stale_fields.append(
+                f"basis_event_seq={decision.basis_event_seq} < latest_event_sequence={packet.latest_event_sequence}"
+            )
+        if (
+            decision.last_relevant_edit_seq is not None
+            and packet.latest_relevant_change_sequence is not None
+            and packet.latest_relevant_change_sequence > decision.last_relevant_edit_seq
+        ):
+            stale_fields.append(
+                "last_relevant_edit_seq="
+                f"{decision.last_relevant_edit_seq} < latest_relevant_change_sequence={packet.latest_relevant_change_sequence}"
+            )
+        latest_validation_seq = max((validation.sequence for validation in packet.validations), default=None)
+        if (
+            decision.last_validation_seq is not None
+            and latest_validation_seq is not None
+            and latest_validation_seq > decision.last_validation_seq
+        ):
+            stale_fields.append(
+                f"last_validation_seq={decision.last_validation_seq} < latest_validation_sequence={latest_validation_seq}"
+            )
+        if not stale_fields:
+            return None
+        return {
+            "decision": decision.decision.value,
+            "wake_sequence": decision.wake_sequence,
+            "generation": decision.generation,
+            "stale_fields": stale_fields,
+            "packet_latest_event_sequence": packet.latest_event_sequence,
+            "packet_latest_relevant_change_sequence": packet.latest_relevant_change_sequence,
+            "packet_latest_validation_sequence": latest_validation_seq,
+        }
+
+    async def _handle_completion_decision_staleness_failure(self, issue: dict[str, Any]) -> None:
+        reruns = getattr(self, "completion_decision_staleness_rerun_count", 0)
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "completion_decision_staleness_failure",
+                **issue,
+                "reruns_before": reruns,
+            }
+        )
+        stale_fields = _format_issue_list(issue.get("stale_fields"))
+        if reruns < 1:
+            self.completion_decision_staleness_rerun_count = reruns + 1
+            self.store.append_text_locked(
+                PROGRESS,
+                f"- Controller rerunning completion_review: stale decision anchors ({stale_fields})\n",
+            )
+            self._schedule_supervisor_check(
+                (
+                    "Completion-review decision was rejected by the deterministic freshness gate because "
+                    f"its anchor sequences are stale: {stale_fields}. Rerun completion_review against the "
+                    "current packet and set basis_event_seq, last_relevant_edit_seq, and last_validation_seq "
+                    "from the latest current ledgers."
+                ),
+                completion_review=True,
+            )
+            return
+        self.completion_decision_staleness_rerun_count = reruns + 1
+        if self.supervisor is not None:
+            await self.supervisor.close_completion_review()
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Controller starting fresh completion_review: repeated stale decision anchors ({stale_fields})\n",
+        )
+        self._schedule_supervisor_check(
+            (
+                "Completion-review repeated stale anchor sequences after a freshness retry. "
+                "Start a fresh full completion_review on the current workspace state."
+            ),
+            completion_review=True,
+        )
+
+    def _repair_completion_accept_evidence_ids(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+    ) -> CompletionReviewDecision:
+        validations = packet.validations if packet is not None else list(self.validations)
+        inspections = packet.inspections if packet is not None else list(getattr(self, "inspections", []))
+        repaired, repairs = _repair_completion_evidence_ids(
+            decision,
+            validations=validations,
+            inspections=inspections,
+        )
+        if not repairs:
+            return decision
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "completion_evidence_id_repair",
+                "wake_sequence": decision.wake_sequence,
+                "generation": decision.generation,
+                "repairs": repairs,
+            }
+        )
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Controller repaired completion evidence IDs from the validation/inspection ledger: "
+            + "; ".join(repairs[:6])
+            + "\n",
+        )
+        return repaired
 
     def _append_completion_anchor_log(
         self,
@@ -1526,11 +1777,17 @@ class SentinelController:
 
         structural_issue = _accept_structural_issue(decision, code_changing=bool(code_review_files))
         if structural_issue is not None:
+            check_name = (
+                "evidence_id_repair"
+                if _is_evidence_id_structural_issue(structural_issue)
+                else "structural_consistency"
+            )
             return AcceptGateResult(
                 passed=False,
                 failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
-                check_name="structural_consistency",
+                check_name=check_name,
                 reason=structural_issue,
+                details={"kind": "proof_format_evidence_id"} if check_name == "evidence_id_repair" else None,
             )
         passed_checks.append("structural_consistency")
 
@@ -1570,15 +1827,7 @@ class SentinelController:
                 )
             passed_checks.append("parallel_persistence_assessment")
 
-            breadth_issue = _accept_breadth_issue(packet, decision)
-            if breadth_issue is not None:
-                return AcceptGateResult(
-                    passed=False,
-                    failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
-                    check_name="breadth_risk_assessment",
-                    reason=breadth_issue,
-                )
-            passed_checks.append("breadth_risk_assessment")
+            passed_checks.append("breadth_risk_report_only")
 
         latest_change = (
             packet.latest_relevant_change_sequence
@@ -1684,6 +1933,22 @@ class SentinelController:
                 )
                 return
 
+            if _accept_gate_failure_is_proof_format(gate_result):
+                infra_reason = f"repeated proof-format accept gate failure ({check_name}): {reason}"
+                self.store.append_text_locked(PROGRESS, f"- Controller-side proof-format failure: {infra_reason}\n")
+                self._append_event(
+                    AppEventSource.SUPERVISOR,
+                    "completion/accept_gate_proof_format_failure",
+                    decision=ACCEPT_GATE_AUDIT_FAILURE,
+                    reason=infra_reason,
+                )
+                self._increment_accept_gate_counter("accept_gate_audit_failures")
+                await self.finalize(
+                    f"infra-invalid: controller-side proof-format repair failed: {infra_reason}",
+                    status=SentinelStatus.PROVIDER_FAILURE,
+                )
+                return
+
             audit_reason = f"repeated reviewer-incomplete accept gate failure ({check_name}): {reason}"
             self.store.append_text_locked(PROGRESS, f"- Controller-side audit failure: {audit_reason}\n")
             self._append_event(
@@ -1750,6 +2015,106 @@ class SentinelController:
             }
         )
 
+    def _completion_return_freshness_issue(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+    ) -> dict[str, Any] | None:
+        if packet is None:
+            return None
+        since_sequence = packet.completion_payload_since_sequence
+        if packet.completion_payload_mode != "delta" or since_sequence is None:
+            return None
+        fresh_validation_ids = [
+            validation.validation_id
+            for validation in packet.validations
+            if validation.sequence > since_sequence
+            and _is_behavior_proving_validation(validation)
+            and validation.outcome == "pass"
+            and validation.passed
+            and validation.trusted_validation_outcome == "passed"
+        ]
+        fresh_inspection_ids = [
+            inspection.inspection_id
+            for inspection in packet.inspections
+            if inspection.sequence > since_sequence and inspection.outcome == "pass" and inspection.passed
+        ]
+        if not fresh_validation_ids and not fresh_inspection_ids:
+            return None
+        if not _completion_return_has_evidence_related_gap(decision):
+            return None
+        if _completion_decision_cites_evidence_after(decision, since_sequence=since_sequence):
+            return None
+        return {
+            "since_sequence": since_sequence,
+            "fresh_validation_ids": fresh_validation_ids[:12],
+            "fresh_inspection_ids": fresh_inspection_ids[:12],
+            "fresh_evidence_summary": _fresh_delta_evidence_detail(
+                packet,
+                since_sequence=since_sequence,
+                validation_ids=set(fresh_validation_ids),
+                inspection_ids=set(fresh_inspection_ids),
+            ),
+            "previous_return_summary": _previous_completion_return_summary(
+                getattr(self, "completion_returns", []),
+                generation=packet.generation,
+            ),
+            "reason": (
+                "completion_review returned an evidence/validation gap without citing any fresh "
+                f"validation_id or inspection_id after return baseline sequence {since_sequence}"
+            ),
+        }
+
+    async def _handle_completion_return_freshness_failure(self, issue: dict[str, Any]) -> None:
+        reason = str(issue.get("reason") or "completion_review ignored fresh delta evidence")
+        reruns = getattr(self, "completion_return_freshness_rerun_count", 0)
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "completion_return_freshness_failure",
+                **issue,
+                "reruns_before": reruns,
+            }
+        )
+        if reruns < 1:
+            self.completion_return_freshness_rerun_count = reruns + 1
+            self.store.append_text_locked(
+                PROGRESS,
+                f"- Controller rerunning completion_review: stale return ignored fresh delta evidence ({reason})\n",
+            )
+            self._schedule_supervisor_check(
+                (
+                    "Completion-review return was rejected by the deterministic freshness gate: "
+                    f"{reason}. Rerun completion_review, update the retained behavior_evidence_matrix "
+                    "with all fresh validation_outputs/inspection_outputs after the return baseline, "
+                    "and explicitly bind any fresh validation_id/inspection_id that closes a prior returned gap. "
+                    "Do not repeat a prior return finding that is now closed by fresh passing independent evidence; "
+                    "if no current material task-derived gap remains after reconciliation, accept. "
+                    f"Fresh evidence to reconcile: {_format_issue_list(issue.get('fresh_evidence_summary'))}. "
+                    f"Prior returned gaps: {_format_issue_list(issue.get('previous_return_summary'))}."
+                ),
+                completion_review=True,
+            )
+            return
+        self.completion_return_freshness_rerun_count = reruns + 1
+        self.completion_review_return_sequence = None
+        if self.supervisor is not None:
+            await self.supervisor.close_completion_review()
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Controller starting fresh completion_review: repeated stale delta return ({reason})\n",
+        )
+        self._schedule_supervisor_check(
+            (
+                "Completion-review delta recovery repeated a stale return after fresh evidence. "
+                "Start a fresh full completion_review on the current workspace state, rebuild the "
+                "behavior_evidence_matrix from task_contents and current ledgers, and do not rely on "
+                "the stale retained return unless current evidence still proves that material gap."
+            ),
+            completion_review=True,
+        )
+
     def _increment_accept_gate_counter(self, field: str) -> None:
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={field: getattr(current, field, 0) + 1})
@@ -1805,7 +2170,7 @@ class SentinelController:
         )
         self.prior_interventions = self.prior_interventions[-20:]
         returns_this_generation = _completion_returns_this_generation(self, cfg.generation)
-        health_delta = HealthDelta(generation=cfg.generation, interventions=1)
+        health_delta = HealthDelta(generation=cfg.generation)
         if returns_this_generation >= cfg.max_completion_returns_per_generation:
             health_delta.add_risk_signals.append("completion_non_convergence")
         patch_health(self.store, health_delta)
@@ -1830,7 +2195,10 @@ class SentinelController:
     async def _resolve_pending_approvals(self, reason: str) -> None:
         approvals = getattr(self, "approvals", None)
         if approvals is None:
-            manager = ApprovalManager(self.project_root)
+            manager = ApprovalManager(
+                self.project_root,
+                declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+            )
         else:
             manager = approvals
         for request_id, context in list(self.pending_approvals.items()):
@@ -2041,6 +2409,11 @@ class SentinelController:
             "changed_tests_summary": changed_tests_summary,
             "validation_outputs": [_validation_output(validation) for validation in detail_validations],
             "inspection_outputs": [_inspection_output(inspection) for inspection in detail_inspections],
+            "completion_delta_evidence_summary": _completion_delta_evidence_summary(
+                detail_validations,
+                detail_inspections,
+                since_sequence=since_sequence,
+            ),
             "breadth_risk_summary": _breadth_risk_summary(
                 task_contents=_read_task_text(self.task_path),
                 changed_files=changed_files,
@@ -2226,7 +2599,10 @@ class SentinelController:
             cwd=str(self.project_root),
             available_decisions=["accept", "decline", "cancel"],
         )
-        evaluation = ApprovalManager(self.project_root).policy.evaluate({"command": command, "cwd": str(self.project_root)})
+        evaluation = ApprovalManager(
+            self.project_root,
+            declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+        ).policy.evaluate({"command": command, "cwd": str(self.project_root)})
         decision = await asyncio.wait_for(reviewer.review(context, evaluation), timeout=reviewer.timeout_seconds)
         if decision.decision not in {"approve_low_impact", "escalate"}:
             raise RuntimeError("cheap approval structured-output self-test returned an unexpected decision")
@@ -2343,7 +2719,10 @@ def _validation_from_action(
         changed_paths=changed_paths or [],
     )
     if masking_reason is None and validation_type == "behavior_demo" and outcome == "pass":
-        masking_reason = _behavior_demo_output_masking_reason(output)
+        if not output.strip():
+            masking_reason = "behavior_demo_missing_output"
+        else:
+            masking_reason = _behavior_demo_output_masking_reason(output)
     trusted_outcome = "passed" if outcome == "pass" else "failed"
     passed = outcome == "pass"
     if masking_reason is not None:
@@ -2459,27 +2838,109 @@ def _is_static_validation_command(command: str) -> bool:
 
 
 def _is_git_inspection_command(command: str) -> bool:
+    inner = _shell_command_payload(command)
+    if inner is not None and inner != command:
+        return _is_git_inspection_command(inner)
     lowered = command.lower()
     pattern = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*git\s+(diff|status|log|show|branch|remote|rev-parse|for-each-ref)\b"
     return bool(re.search(pattern, lowered))
 
 
 def _is_git_diff_check_command(command: str) -> bool:
+    inner = _shell_command_payload(command)
+    if inner is not None and inner != command:
+        return _is_git_diff_check_command(inner)
     lowered = command.lower()
     pattern = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*git\s+diff(?:\s+[^;&|()'\"]+)*\s+--check(\s|$)"
     return bool(re.search(pattern, lowered))
 
 
 def _is_read_only_inspection_command(command: str) -> bool:
+    inner = _shell_command_payload(command)
+    if inner is not None and inner != command:
+        return _is_read_only_inspection_command(inner)
     lowered = command.lower()
     if any(marker in lowered for marker in ("<<", "$(", "`")):
         return False
     if re.search(r"(?<![12])>(?!&)", command) or re.search(r"(^|[^<])<(?!<)", command):
         return False
-    segments = [segment.strip() for segment in re.split(r"\s*(?:&&|;|\|)\s*", command) if segment.strip()]
+    segments = _inspection_command_segments(command)
+    if segments is None:
+        return False
     if not segments:
         return False
-    return all(_is_read_only_inspection_segment(segment) for segment in segments)
+    return all(_is_read_only_inspection_tokens(segment) for segment in segments)
+
+
+def _inspection_command_segments(command: str) -> list[list[str]] | None:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = [token for token in lexer if token]
+    except ValueError:
+        return None
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in {"&&", ";", "|"}:
+            if not current:
+                return None
+            segments.append(current)
+            current = []
+            continue
+        if token in {"&"} or any(char in token for char in "<>"):
+            return None
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _shell_command_payload(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    tokens = _strip_env_command_prefix(tokens)
+    if len(tokens) < 3:
+        return None
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable not in {"bash", "sh", "zsh"}:
+        return None
+    for index, token in enumerate(tokens[1:], start=1):
+        if not token.startswith("-"):
+            continue
+        if "c" not in token[1:]:
+            continue
+        if index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def _strip_env_command_prefix(tokens: list[str]) -> list[str]:
+    remaining = list(tokens)
+    while remaining and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0]):
+        remaining = remaining[1:]
+    if not remaining:
+        return remaining
+    executable = remaining[0].rsplit("/", 1)[-1].lower()
+    if executable != "env":
+        return remaining
+    remaining = remaining[1:]
+    while remaining:
+        token = remaining[0]
+        if token == "--":
+            remaining = remaining[1:]
+            break
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            remaining = remaining[1:]
+            continue
+        if token.startswith("-"):
+            remaining = remaining[1:]
+            continue
+        break
+    return remaining
 
 
 def _is_read_only_inspection_segment(segment: str) -> bool:
@@ -2487,7 +2948,10 @@ def _is_read_only_inspection_segment(segment: str) -> bool:
         tokens = shlex.split(segment)
     except ValueError:
         return False
-    tokens = [token for token in tokens if token]
+    return _is_read_only_inspection_tokens([token for token in tokens if token])
+
+
+def _is_read_only_inspection_tokens(tokens: list[str]) -> bool:
     while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
         tokens = tokens[1:]
     if not tokens:
@@ -2720,7 +3184,26 @@ def _collect_output_delta_strings(value: Any, parts: list[str], *, depth: int) -
         return
     for key, nested in value.items():
         key_text = str(key).lower()
-        if key_text in {"delta", "output", "aggregatedoutput", "stdout", "stderr", "text", "content", "message", "chunk", "data"}:
+        if key_text in {
+            "delta",
+            "output",
+            "outputtext",
+            "aggregatedoutput",
+            "aggregated_output",
+            "combinedoutput",
+            "combined_output",
+            "stdout",
+            "stdouttext",
+            "stdout_text",
+            "stderr",
+            "stderrtext",
+            "stderr_text",
+            "text",
+            "content",
+            "message",
+            "chunk",
+            "data",
+        }:
             _collect_output_delta_strings(nested, parts, depth=depth + 1)
         elif key_text in {"outputs", "chunks", "lines", "items"}:
             _collect_output_delta_strings(nested, parts, depth=depth + 1)
@@ -2995,7 +3478,24 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
         return
     for key, nested in value.items():
         key_text = str(key).lower()
-        if key_text in {"output", "aggregatedoutput", "stdout", "stderr", "text", "content", "message", "summary"}:
+        if key_text in {
+            "output",
+            "outputtext",
+            "aggregatedoutput",
+            "aggregated_output",
+            "combinedoutput",
+            "combined_output",
+            "stdout",
+            "stdouttext",
+            "stdout_text",
+            "stderr",
+            "stderrtext",
+            "stderr_text",
+            "text",
+            "content",
+            "message",
+            "summary",
+        }:
             _collect_output_strings(nested, parts, depth=depth + 1)
         elif key_text in {"outputs", "chunks", "lines", "items", "result", "results"}:
             _collect_output_strings(nested, parts, depth=depth + 1)
@@ -3116,6 +3616,11 @@ def _completion_returns_this_generation(controller: Any, generation: int) -> int
     )
 
 
+def _prior_record_counts_as_health_intervention(record: Any) -> bool:
+    reason = str(getattr(record, "reason", "") or "")
+    return not reason.startswith("Completion review returned:")
+
+
 def _latest_relevant_change_sequence(changed_files: list[ChangedFile]) -> int | None:
     sequences = [
         file.sequence
@@ -3221,7 +3726,7 @@ def _accept_structural_issue(decision: CompletionReviewDecision, *, code_changin
         for evidence in row.evidence
         if (
             evidence.validation_type == "inspection"
-            and not (evidence.inspection_id or evidence.command.strip())
+            and (not evidence.inspection_id or evidence.validation_id)
         )
         or (
             evidence.validation_type != "inspection"
@@ -3253,6 +3758,19 @@ def _accept_structural_issue(decision: CompletionReviewDecision, *, code_changin
     return None
 
 
+def _is_evidence_id_structural_issue(reason: str | None) -> bool:
+    return bool(reason and "missing or ambiguous validation_id/inspection_id" in reason)
+
+
+def _accept_gate_failure_is_proof_format(gate_result: AcceptGateResult) -> bool:
+    details = gate_result.details or {}
+    return (
+        gate_result.check_name == "evidence_id_repair"
+        or details.get("kind") == "proof_format_evidence_id"
+        or _is_evidence_id_structural_issue(gate_result.reason)
+    )
+
+
 def _accept_file_review_issue(decision: CompletionReviewDecision, files: list[ChangedFile]) -> str | None:
     reviewed_by_path = {_normalize_review_path(file.path): file for file in decision.files_reviewed}
     missing: list[str] = []
@@ -3269,101 +3787,6 @@ def _accept_file_review_issue(decision: CompletionReviewDecision, files: list[Ch
     return None
 
 
-def _accept_breadth_issue(packet: SupervisorWakePacket, decision: CompletionReviewDecision) -> str | None:
-    summary = packet.breadth_risk_summary
-    if summary is None or not summary.flags:
-        return None
-    min_rows = max(summary.suggested_min_behavior_rows, 1)
-    matrix_rows = decision.behavior_evidence_matrix
-    if len(matrix_rows) >= min_rows:
-        return None
-    decision_text = _completion_decision_text(decision)
-    generic_rows = [
-        row.behavior
-        for row in matrix_rows
-        if _behavior_row_looks_generic_for_broad_spec(row)
-    ]
-    missing_terms = [
-        term
-        for term in summary.task_feature_terms
-        if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}s?(?![A-Za-z0-9_])", decision_text)
-    ]
-    if not generic_rows and _decision_addresses_breadth_scope(decision_text, missing_terms=missing_terms):
-        return None
-    reason_parts = [
-        "matrix narrow relative to spec",
-        f"flags={', '.join(summary.flags)}",
-        f"rows={len(matrix_rows)} < suggested_min={min_rows}",
-    ]
-    if generic_rows:
-        reason_parts.append("generic rows=" + ", ".join(generic_rows[:3]))
-    if missing_terms:
-        reason_parts.append("unaddressed task terms=" + ", ".join(missing_terms[:8]))
-    return "; ".join(reason_parts)
-
-
-def _completion_decision_text(decision: CompletionReviewDecision) -> str:
-    parts = [
-        decision.reason,
-        decision.persistent_decision or "",
-        decision.progress_update or "",
-        " ".join(decision.uncovered_behaviors),
-        " ".join(decision.validation_gaps),
-        " ".join(decision.claim_evidence_mismatches),
-        " ".join(decision.packet_or_access_limitations),
-        " ".join(decision.changed_test_risks),
-    ]
-    for file in decision.files_reviewed:
-        parts.extend([file.path, file.reason, file.limitation or ""])
-    for row in decision.behavior_evidence_matrix:
-        parts.extend([row.behavior, row.task_basis, row.gap or "", " ".join(row.files_considered)])
-        for evidence in row.evidence:
-            parts.extend([evidence.command, evidence.why_it_covers_behavior])
-    return " ".join(parts).lower()
-
-
-def _behavior_row_looks_generic_for_broad_spec(row: Any) -> bool:
-    text = " ".join(
-        [
-            getattr(row, "behavior", "") or "",
-            getattr(row, "task_basis", "") or "",
-            getattr(row, "gap", "") or "",
-        ]
-    ).lower()
-    return any(
-        marker in text
-        for marker in (
-            "test coverage",
-            "tests cover",
-            "visible coverage",
-            "available coverage",
-            "public coverage",
-            "covered by tests",
-            "coverage set",
-        )
-    )
-
-
-def _decision_addresses_breadth_scope(decision_text: str, *, missing_terms: list[str]) -> bool:
-    if not missing_terms:
-        return True
-    scope_markers = (
-        "out of scope",
-        "outside scope",
-        "not in scope",
-        "not required",
-        "not requested",
-        "task does not require",
-        "outside task",
-        "not material",
-        "immaterial",
-    )
-    if not any(marker in decision_text for marker in scope_markers):
-        return False
-    mentioned_missing = sum(1 for term in missing_terms if term in decision_text)
-    return mentioned_missing >= min(3, len(missing_terms))
-
-
 def _review_marks_non_material(file: Any) -> bool:
     text = " ".join(
         str(value or "")
@@ -3373,6 +3796,213 @@ def _review_marks_non_material(file: Any) -> bool:
         )
     ).lower()
     return any(marker in text for marker in ("non-material", "not material", "immaterial"))
+
+
+def _completion_return_has_evidence_related_gap(decision: CompletionReviewDecision) -> bool:
+    if decision.validation_gaps or decision.uncovered_behaviors or decision.claim_evidence_mismatches:
+        return True
+    return any(row.status != "covered" or row.gap for row in decision.behavior_evidence_matrix)
+
+
+def _completion_decision_cites_evidence_after(
+    decision: CompletionReviewDecision,
+    *,
+    since_sequence: int,
+) -> bool:
+    for row in decision.behavior_evidence_matrix:
+        for evidence in row.evidence:
+            if evidence.sequence is not None and evidence.sequence > since_sequence:
+                return True
+            for value in (evidence.validation_id, evidence.inspection_id):
+                sequence = _ledger_id_sequence(value)
+                if sequence is not None and sequence > since_sequence:
+                    return True
+    return False
+
+
+def _fresh_delta_evidence_detail(
+    packet: SupervisorWakePacket,
+    *,
+    since_sequence: int,
+    validation_ids: set[str],
+    inspection_ids: set[str],
+) -> list[str]:
+    details: list[str] = []
+    for validation in packet.validations:
+        if validation.sequence <= since_sequence or validation.validation_id not in validation_ids:
+            continue
+        output = _bounded_text(" ".join((validation.captured_output or validation.summary).split()), limit=220)
+        details.append(
+            (
+                f"{validation.validation_id} seq={validation.sequence} type={validation.type} "
+                f"command={_bounded_text(validation.command, limit=180)}"
+                + (f" output={output}" if output else "")
+            )
+        )
+    for inspection in packet.inspections:
+        if inspection.sequence <= since_sequence or inspection.inspection_id not in inspection_ids:
+            continue
+        output = _bounded_text(" ".join((inspection.captured_output or inspection.summary).split()), limit=220)
+        details.append(
+            (
+                f"{inspection.inspection_id} seq={inspection.sequence} type=inspection "
+                f"command={_bounded_text(inspection.command, limit=180)}"
+                + (f" output={output}" if output else "")
+            )
+        )
+    return details[:20]
+
+
+def _previous_completion_return_summary(records: list[Any], *, generation: int) -> list[str]:
+    summaries: list[str] = []
+    for record in records:
+        if getattr(record, "generation", None) != generation:
+            continue
+        parts = [str(getattr(record, "reason", "") or "").strip()]
+        for attr in ("uncovered_behaviors", "validation_gaps", "claim_evidence_mismatches"):
+            values = getattr(record, attr, None) or []
+            if values:
+                parts.append(f"{attr}=" + "; ".join(str(value) for value in values[:5]))
+        text = " | ".join(part for part in parts if part)
+        if text:
+            summaries.append(_bounded_text(text, limit=360))
+    return summaries[-5:]
+
+
+def _format_issue_list(value: Any) -> str:
+    if not isinstance(value, list) or not value:
+        return "none"
+    return " || ".join(str(item) for item in value[:10])
+
+
+def _classify_supervisor_agent_error(error: BaseException) -> str:
+    text = str(error).lower()
+    if "did not produce an agent message" in text or "no agent message" in text:
+        return "no_message"
+    if "rate limit" in text or "rate_limit" in text or "429" in text:
+        return "rate"
+    if "auth" in text or "unauthorized" in text or "forbidden" in text or "api key" in text:
+        return "auth"
+    if "timed out" in text or "timeout" in text:
+        return "tool_timeout"
+    return "unknown"
+
+
+def _repair_completion_evidence_ids(
+    decision: CompletionReviewDecision,
+    *,
+    validations: list[ValidationRun],
+    inspections: list[InspectionRun],
+) -> tuple[CompletionReviewDecision, list[str]]:
+    data = decision.model_dump(mode="json")
+    repairs: list[str] = []
+    validation_ids = {validation.validation_id for validation in validations}
+    inspection_ids = {inspection.inspection_id for inspection in inspections}
+    for row in data.get("behavior_evidence_matrix") or []:
+        behavior = str(row.get("behavior") or "<unnamed behavior>")
+        for evidence in row.get("evidence") or []:
+            validation_type = evidence.get("validation_type")
+            if validation_type == "inspection":
+                repaired = _repair_inspection_evidence_id(
+                    evidence,
+                    behavior=behavior,
+                    inspections=inspections,
+                    inspection_ids=inspection_ids,
+                )
+            else:
+                repaired = _repair_validation_evidence_id(
+                    evidence,
+                    behavior=behavior,
+                    validations=validations,
+                    validation_ids=validation_ids,
+                )
+            if repaired:
+                repairs.append(repaired)
+    if not repairs:
+        return decision, []
+    return CompletionReviewDecision.model_validate(data), repairs
+
+
+def _repair_inspection_evidence_id(
+    evidence: dict[str, Any],
+    *,
+    behavior: str,
+    inspections: list[InspectionRun],
+    inspection_ids: set[str],
+) -> str | None:
+    validation_id = evidence.get("validation_id")
+    inspection_id = evidence.get("inspection_id")
+    if isinstance(inspection_id, str) and inspection_id in inspection_ids:
+        if validation_id:
+            evidence["validation_id"] = None
+            return f"{behavior}: removed ambiguous validation_id from inspection evidence {inspection_id}"
+        return None
+    match = _unique_matching_inspection(evidence, inspections)
+    if match is None:
+        return None
+    evidence["inspection_id"] = match.inspection_id
+    evidence["validation_id"] = None
+    return f"{behavior}: inspection_id={match.inspection_id}"
+
+
+def _repair_validation_evidence_id(
+    evidence: dict[str, Any],
+    *,
+    behavior: str,
+    validations: list[ValidationRun],
+    validation_ids: set[str],
+) -> str | None:
+    validation_id = evidence.get("validation_id")
+    inspection_id = evidence.get("inspection_id")
+    if isinstance(validation_id, str) and validation_id in validation_ids:
+        if inspection_id:
+            evidence["inspection_id"] = None
+            return f"{behavior}: removed ambiguous inspection_id from validation evidence {validation_id}"
+        return None
+    match = _unique_matching_validation(evidence, validations)
+    if match is None:
+        return None
+    evidence["validation_id"] = match.validation_id
+    evidence["inspection_id"] = None
+    return f"{behavior}: validation_id={match.validation_id}"
+
+
+def _unique_matching_validation(evidence: dict[str, Any], validations: list[ValidationRun]) -> ValidationRun | None:
+    command = str(evidence.get("command") or "")
+    sequence = evidence.get("sequence")
+    validation_type = evidence.get("validation_type")
+    candidates: list[ValidationRun] = []
+    for validation in validations:
+        if isinstance(sequence, int) and validation.sequence != sequence:
+            continue
+        if validation_type in {"static", "behavioral", "behavior_demo"} and validation.type != validation_type:
+            continue
+        if command and _normalize_command(validation.command) != _normalize_command(command):
+            continue
+        candidates.append(validation)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _unique_matching_inspection(evidence: dict[str, Any], inspections: list[InspectionRun]) -> InspectionRun | None:
+    command = str(evidence.get("command") or "")
+    sequence = evidence.get("sequence")
+    candidates: list[InspectionRun] = []
+    for inspection in inspections:
+        if isinstance(sequence, int) and inspection.sequence != sequence:
+            continue
+        if command and _normalize_command(inspection.command) != _normalize_command(command):
+            continue
+        candidates.append(inspection)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _ledger_id_sequence(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"(?:validation|inspection)-(\d+)", value)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _validation_is_fresh_behavioral_pass(validation: ValidationRun, latest_change: int) -> bool:
@@ -3470,18 +4100,11 @@ def _inspection_for_evidence(
     evidence: Any,
     *,
     inspections_by_id: dict[str, InspectionRun],
-    inspections_by_command: dict[str, list[InspectionRun]],
 ) -> InspectionRun | None:
     inspection_id = getattr(evidence, "inspection_id", None)
     if inspection_id:
         return inspections_by_id.get(inspection_id)
-    command = getattr(evidence, "command", None)
-    if not isinstance(command, str) or not command.strip():
-        return None
-    matches = inspections_by_command.get(_normalize_command(command), [])
-    if len(matches) != 1:
-        return None
-    return matches[0]
+    return None
 
 
 def _accept_evidence_binding_issue(
@@ -3493,14 +4116,12 @@ def _accept_evidence_binding_issue(
 ) -> EvidenceBindingIssue | None:
     by_id = {validation.validation_id: validation for validation in validations}
     inspections_by_id = {inspection.inspection_id: inspection for inspection in inspections}
-    inspections_by_command: dict[str, list[InspectionRun]] = {}
-    for inspection in inspections:
-        inspections_by_command.setdefault(_normalize_command(inspection.command), []).append(inspection)
     for row in decision.behavior_evidence_matrix:
         if row.status != "covered":
             continue
         fresh_pass_found = False
         linked_evidence_found = False
+        ledger_record_found = False
         demo_quality_issue: EvidenceBindingIssue | None = None
         for evidence in row.evidence:
             if evidence.inspection_id or evidence.validation_type == "inspection":
@@ -3508,10 +4129,10 @@ def _accept_evidence_binding_issue(
                 inspection = _inspection_for_evidence(
                     evidence,
                     inspections_by_id=inspections_by_id,
-                    inspections_by_command=inspections_by_command,
                 )
                 if inspection is None:
                     continue
+                ledger_record_found = True
                 inspection_id = evidence.inspection_id or inspection.inspection_id
                 if evidence.validation_type != "inspection":
                     continue
@@ -3535,6 +4156,7 @@ def _accept_evidence_binding_issue(
             validation = by_id.get(evidence.validation_id or "")
             if validation is None:
                 continue
+            ledger_record_found = True
             if evidence.validation_type != validation.type:
                 continue
             if validation.type == "behavior_demo":
@@ -3581,6 +4203,7 @@ def _accept_evidence_binding_issue(
                 ),
                 kind="no_fresh_linked_validation",
                 behavior=row.behavior,
+                coder_correctable=ledger_record_found,
             )
     return None
 
@@ -4888,6 +5511,36 @@ def _validation_output(validation: ValidationRun) -> ValidationOutput:
     )
 
 
+def _completion_delta_evidence_summary(
+    validations: list[ValidationRun],
+    inspections: list[InspectionRun],
+    *,
+    since_sequence: int | None,
+) -> list[str]:
+    if since_sequence is None:
+        return []
+    items: list[str] = []
+    for validation in validations:
+        items.append(
+            (
+                f"validation {validation.validation_id} seq={validation.sequence} "
+                f"type={validation.type} outcome={validation.trusted_validation_outcome} "
+                f"command={_bounded_text(validation.command, limit=160)}"
+            )
+        )
+    for inspection in inspections:
+        outcome = "passed" if inspection.passed and inspection.outcome == "pass" else "failed"
+        items.append(
+            (
+                f"inspection {inspection.inspection_id} seq={inspection.sequence} "
+                f"outcome={outcome} command={_bounded_text(inspection.command, limit=160)}"
+            )
+        )
+    if not items:
+        return [f"No validation or inspection records after return baseline sequence {since_sequence}."]
+    return items[:30]
+
+
 def _inspection_output(inspection: InspectionRun) -> InspectionOutput:
     return InspectionOutput(
         inspection_id=inspection.inspection_id,
@@ -5156,6 +5809,9 @@ def _target_files_or_test_files(command: str) -> list[str]:
 
 
 def _inspected_paths_from_command(command: str, *, limit: int = 50) -> list[str]:
+    inner = _shell_command_payload(command)
+    if inner is not None and inner != command:
+        return _inspected_paths_from_command(inner, limit=limit)
     targets: list[str] = []
     try:
         tokens = shlex.split(command)

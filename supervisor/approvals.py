@@ -115,11 +115,12 @@ class ApprovalManager:
         *,
         supervisor: SupervisorApprovalReviewer | None = None,
         cheap_reviewer: CheapApprovalReviewerProtocol | None = None,
+        declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         timeout_seconds: float = 180.0,
         cheap_review_timeout_seconds: float = 20.0,
     ):
         self.workspace = workspace.resolve()
-        self.policy = PolicyEngine(self.workspace)
+        self.policy = PolicyEngine(self.workspace, declared_grading_roots=declared_grading_roots)
         self.supervisor = supervisor
         self.cheap_reviewer = cheap_reviewer
         self.timeout_seconds = timeout_seconds

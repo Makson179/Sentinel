@@ -18,6 +18,7 @@ from supervisor.prompts import (
 from supervisor.schemas.models import (
     HumanMessage,
     CheapApprovalDecision,
+    CompletionDecisionArtifact,
     CompletionReviewDecision,
     RestartHandoff,
     SupervisorDecision,
@@ -61,6 +62,11 @@ def test_completion_review_decision_schema_is_strict() -> None:
     assert "ReviewedFile" in schema["$defs"]
     assert "BehaviorEvidence" in schema["$defs"]
     assert "EvidenceItem" in schema["$defs"]
+    assert "CompletionDecisionArtifact" in schema["$defs"]
+    assert "decision_artifact" in schema["properties"]
+    assert "basis_event_seq" in schema["properties"]
+    assert "last_relevant_edit_seq" in schema["properties"]
+    assert "last_validation_seq" in schema["properties"]
     assert "validation_id" in schema["$defs"]["EvidenceItem"]["properties"]
 
 
@@ -95,6 +101,17 @@ def test_completion_review_decision_accepts_expected_shapes() -> None:
         {
             "decision": "accept",
             "reason": "validated",
+            "decision_artifact": {
+                "current_state": "validated current workspace",
+                "resolved_concerns": ["basic flow covered"],
+                "stale_concerns": [],
+                "uncovered_edge_candidates": [],
+                "actionable_gap_or_none": None,
+                "decision": "accept",
+            },
+            "basis_event_seq": 10,
+            "last_relevant_edit_seq": 8,
+            "last_validation_seq": 9,
             "files_reviewed": [
                 {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
             ],
@@ -135,6 +152,53 @@ def test_completion_review_decision_accepts_expected_shapes() -> None:
     )
 
     assert accept.decision == "accept"
+    assert accept.decision_artifact == CompletionDecisionArtifact(
+        current_state="validated current workspace",
+        resolved_concerns=["basic flow covered"],
+        stale_concerns=[],
+        uncovered_edge_candidates=[],
+        actionable_gap_or_none=None,
+        decision="accept",
+    )
+
+
+def test_completion_review_decision_accepts_minimal_return_without_full_review_artifact() -> None:
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "return",
+            "reason": "one real gap blocks acceptance",
+            "decision_artifact": {
+                "current_state": "implementation needs one targeted regression",
+                "resolved_concerns": [],
+                "stale_concerns": [],
+                "uncovered_edge_candidates": ["stack-passed call arguments"],
+                "actionable_gap_or_none": "validate more than six call arguments",
+                "decision": "return",
+            },
+            "basis_event_seq": 12,
+            "last_relevant_edit_seq": 10,
+            "last_validation_seq": 11,
+            "uncovered_behaviors": ["stack-passed call arguments"],
+            "validation_gaps": ["no regression covers more than six call arguments"],
+            "claim_evidence_mismatches": [],
+            "packet_or_access_limitations": [],
+            "changed_test_risks": [],
+            "message_to_coder": "Add and pass a regression for calls with more than six integer arguments.",
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 12,
+            "generation": 0,
+        }
+    )
+
+    assert decision.decision == "return"
+    assert decision.files_reviewed == []
+    assert decision.behavior_evidence_matrix == []
+    assert decision.decision_artifact is not None
+    assert decision.decision_artifact.actionable_gap_or_none == "validate more than six call arguments"
 
 
 def test_supervisor_decision_accepts_expected_shape() -> None:

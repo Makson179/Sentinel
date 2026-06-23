@@ -167,15 +167,13 @@ def main() -> int:
     write_json(paths.rollouts / "rollout_collection_summary.json", summary)
     (paths.attempt / "sentinel-exit-code.txt").write_text(f"{sentinel_rc}\n", encoding="utf-8")
 
-    scoring_rc = 0
-    if not args.skip_score:
-        scoring_rc = run_scoring(
-            paths=paths,
-            instance=instance,
-            swe_bench_pro_dir=args.swe_bench_pro_dir.resolve() if args.swe_bench_pro_dir else None,
-            dockerhub_username=args.dockerhub_username,
-            platform=args.platform,
-        )
+    scoring_rc = score_attempt_if_sentinel_succeeded(
+        args=args,
+        paths=paths,
+        instance=instance,
+        sentinel_rc=sentinel_rc,
+    )
+    if sentinel_rc == 0 and not args.skip_score:
         summarize_scoring(paths, instance)
 
     write_run_report(paths, instance, base_image, attempt_image, codex_version, sentinel_rc, scoring_rc, summary, test_evidence)
@@ -1250,6 +1248,33 @@ def run_scoring(
     ]
     (paths.scoring / "eval_command.json").write_text(json.dumps(cmd, indent=2) + "\n", encoding="utf-8")
     return run_streaming(cmd, log_path=paths.scoring / "eval-run.log", cwd=swe_bench_pro_dir)
+
+
+def score_attempt_if_sentinel_succeeded(
+    *,
+    args: argparse.Namespace,
+    paths: RunPaths,
+    instance: dict[str, Any],
+    sentinel_rc: int,
+) -> int:
+    if sentinel_rc != 0:
+        write_json(
+            paths.scoring / "score-skipped.json",
+            {
+                "reason": "sentinel exited nonzero; run is infra-invalid/not-scored",
+                "sentinel_exit_code": sentinel_rc,
+            },
+        )
+        return 0
+    if args.skip_score:
+        return 0
+    return run_scoring(
+        paths=paths,
+        instance=instance,
+        swe_bench_pro_dir=args.swe_bench_pro_dir.resolve() if args.swe_bench_pro_dir else None,
+        dockerhub_username=args.dockerhub_username,
+        platform=args.platform,
+    )
 
 
 def summarize_scoring(paths: RunPaths, instance: dict[str, Any]) -> None:
