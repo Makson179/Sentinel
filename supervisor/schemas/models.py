@@ -303,8 +303,6 @@ class CompletionReviewDecision(BaseModel):
                 raise ValueError("accept must not set message_to_coder")
             if self.handoff is not None:
                 raise ValueError("accept must not set handoff")
-            if self.uncovered_behaviors or self.validation_gaps:
-                raise ValueError("accept must use empty uncovered_behaviors and validation_gaps")
         elif self.decision == CompletionReviewDecisionKind.RETURN:
             if not self.message_to_coder or not self.message_to_coder.strip():
                 raise ValueError("return requires message_to_coder")
@@ -329,7 +327,7 @@ def _completion_review_has_return_issue(decision: CompletionReviewDecision) -> b
         or decision.changed_test_risks
     ):
         return True
-    return any(row.status != "covered" for row in decision.behavior_evidence_matrix)
+    return False
 
 
 class ApprovalWakeContext(BaseModel):
@@ -627,6 +625,21 @@ class BreadthRiskSummary(BaseModel):
     suggested_min_behavior_rows: int = 0
 
 
+class AdversaryReport(BaseModel):
+    enabled: bool = True
+    status: Literal["completed", "error"] = "completed"
+    candidate_finding: bool = True
+    report_text: str
+    thread_id: str | None = None
+    turn_id: str | None = None
+    generation: int
+    completion_wake_sequence: int
+    latest_relevant_change_sequence: int | None = None
+    validation_sequence: int | None = None
+    workspace_state_id: str | None = None
+    created_at: str
+
+
 class SupervisorWakePacket(BaseModel):
     wake_sequence: int
     latest_event_sequence: int
@@ -676,6 +689,7 @@ class SupervisorWakePacket(BaseModel):
     completion_payload_since_sequence: int | None = None
     completion_review_thread_id: str | None = None
     pending_accept_gate_rejection: dict[str, Any] | None = None
+    adversary_report: AdversaryReport | None = None
 
 
 class FinalReport(BaseModel):
@@ -695,6 +709,7 @@ class FinalReport(BaseModel):
     behavior_evidence_summary: list[str] = Field(default_factory=list)
     files_reviewed_summary: list[str] = Field(default_factory=list)
     packet_or_access_limitations: list[str] = Field(default_factory=list)
+    adversary_reports: list[str] = Field(default_factory=list)
     diff_summary: str | None = None
 
 

@@ -38,6 +38,39 @@ def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def build_adversary_prompt(
+    packet: SupervisorWakePacket,
+    *,
+    previous_adversary_report: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "instructions": [
+            _adversary_prompt_text(),
+            (
+                "Operational constraints for this run: start from this prompt only. If previous_adversary_report is "
+                "present, use it only as regression context before searching for new issues. Web/network use is "
+                "disabled. Do not read hidden/private/id_private "
+                "grading material or runtime history. You are running in a disposable snapshot of the submitted "
+                "workspace, not the canonical workspace. You may create or edit disposable probe files inside this "
+                "snapshot and /tmp, but do not request writes outside the snapshot. Return only the report requested "
+                "by the report_format."
+            ),
+        ],
+        "task_path": packet.task_path,
+        "task_contents": packet.task_contents,
+        "current_workspace_summary": packet.current_summary,
+        "diff_summary": packet.diff_summary,
+        "changed_files": [changed.model_dump(mode="json") for changed in packet.changed_files],
+        "validation_freshness_summary": packet.validation_freshness_summary,
+        # The adversary's job is to read the submitted solution and find bugs independently.
+        # The validation ledger is intentionally NOT inlined: it is bloat the adversary's
+        # instructions never use, and it would anchor its search to what was already tested.
+        # It reads the code and runs its own probes in the snapshot.
+        "previous_adversary_report": previous_adversary_report,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def build_cheap_approval_prompt(packet: dict[str, Any]) -> str:
     payload = dict(packet)
     payload["instructions"] = [_cheap_approval_prompt_text()]
@@ -74,6 +107,13 @@ def _cheap_approval_prompt_text() -> str:
     value = _section("cheap_approval").get("text")
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("[cheap_approval] must define non-empty text")
+    return value.strip()
+
+
+def _adversary_prompt_text() -> str:
+    value = _section("adversary").get("text")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("[adversary] must define non-empty text")
     return value.strip()
 
 

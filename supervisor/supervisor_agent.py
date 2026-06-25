@@ -4,13 +4,14 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import ValidationError
 
 from supervisor.appserver import AppServerClient, AppServerError, last_agent_message_text, text_input
 from supervisor.prompts import build_completion_review_prompt, build_stateless_supervisor_prompt
 from supervisor.schemas import (
+    AdversaryReport,
     ApprovalContext,
     ApprovalWakeContext,
     BreadthRiskSummary,
@@ -43,8 +44,14 @@ from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 
 DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 180.0
 DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 900.0
-COMPLETION_PROMPT_TARGET_CHARS = 900_000
-COMPLETION_PROMPT_ULTRA_TARGET_CHARS = 700_000
+# Prompt-size budgets (characters). Compaction triggers above the target so the
+# assembled wake packet never approaches the model context window (~4 chars/token).
+# Both runtime and completion wakes go through a budget; runtime is kept small so it
+# never bloats over a long run, completion keeps real headroom below the context cap.
+COMPLETION_PROMPT_TARGET_CHARS = 500_000
+COMPLETION_PROMPT_ULTRA_TARGET_CHARS = 380_000
+RUNTIME_PROMPT_TARGET_CHARS = 120_000
+RUNTIME_PROMPT_ULTRA_TARGET_CHARS = 80_000
 
 
 class SupervisorAgentError(RuntimeError):
@@ -71,9 +78,10 @@ class StatelessSupervisorAgent:
         self.completion_thread_id: str | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
+        prompt_packet, prompt = _stateless_prompt_with_budget(packet)
         return await self._decide(
-            packet,
-            prompt=build_stateless_supervisor_prompt(packet),
+            prompt_packet,
+            prompt=prompt,
             schema=openai_strict_json_schema_for_supervisor_decision(),
             model_cls=SupervisorDecision,
             use_case="runtime_monitor",
@@ -81,6 +89,7 @@ class StatelessSupervisorAgent:
         )
 
     async def decide_completion(self, packet: SupervisorWakePacket) -> CompletionReviewDecision:
+        packet = _slim_completion_packet(packet)
         prompt_packet, prompt = _completion_prompt_with_budget(packet)
         try:
             return await self._decide_completion_with_prompt(
@@ -109,6 +118,17 @@ class StatelessSupervisorAgent:
                         ),
                         use_case="completion_review_minimal_retry",
                     )
+            if _is_no_message_error(exc):
+                prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
+                return await self._decide_completion_with_prompt(
+                    prompt_packet,
+                    prompt=_minimal_completion_review_retry_prompt(
+                        context_prompt=prompt,
+                        error=str(exc),
+                        packet=prompt_packet,
+                    ),
+                    use_case="completion_review_no_message_minimal_retry",
+                )
             if not _is_invalid_supervisor_decision_error(exc):
                 raise
             prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
@@ -445,6 +465,7 @@ class StatelessSupervisorAgent:
         completion_payload_since_sequence: int | None = None,
         completion_review_thread_id: str | None = None,
         pending_accept_gate_rejection: dict[str, Any] | None = None,
+        adversary_report: AdversaryReport | None = None,
     ) -> SupervisorWakePacket:
         cfg = self.store.get_sentinel_config()
         health = self.store.get_health()
@@ -499,6 +520,7 @@ class StatelessSupervisorAgent:
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=completion_review_thread_id,
             pending_accept_gate_rejection=pending_accept_gate_rejection,
+            adversary_report=adversary_report,
         )
 
     def _thread_params(self) -> dict[str, Any]:
@@ -687,70 +709,140 @@ def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | N
     return None
 
 
+def _prompt_with_budget(
+    packet: SupervisorWakePacket,
+    *,
+    builder: Callable[[SupervisorWakePacket], str],
+    target: int,
+    ultra_target: int,
+    ultra: bool = False,
+) -> tuple[SupervisorWakePacket, str]:
+    prompt = builder(packet)
+    effective_target = ultra_target if ultra else target
+    if len(prompt) <= effective_target and not ultra:
+        return packet, prompt
+
+    levels = _PROMPT_COMPACTION_LEVELS
+    selected = levels[-1] if ultra else levels[0]
+    compact_packet = _compact_completion_packet(packet, level=selected, original_prompt_chars=len(prompt))
+    compact_prompt = builder(compact_packet)
+    if ultra:
+        return compact_packet, _hard_cap_prompt(compact_prompt)
+    for level in levels[1:]:
+        if len(compact_prompt) <= effective_target:
+            return compact_packet, compact_prompt
+        selected = level
+        compact_packet = _compact_completion_packet(packet, level=selected, original_prompt_chars=len(prompt))
+        compact_prompt = builder(compact_packet)
+    return compact_packet, _hard_cap_prompt(compact_prompt)
+
+
 def _completion_prompt_with_budget(
     packet: SupervisorWakePacket,
     *,
     ultra: bool = False,
 ) -> tuple[SupervisorWakePacket, str]:
-    prompt = build_completion_review_prompt(packet)
-    target = COMPLETION_PROMPT_ULTRA_TARGET_CHARS if ultra else COMPLETION_PROMPT_TARGET_CHARS
-    if len(prompt) <= target and not ultra:
-        return packet, prompt
-
-    levels = (
-        _PromptCompactionLevel(
-            name="metadata_ledger",
-            ledger_summary_limit=1000,
-            output_summary_limit=None,
-            output_capture_limit=None,
-            diff_limit=None,
-            context_limit=None,
-            recent_events_limit=None,
-            output_item_limit=None,
-        ),
-        _PromptCompactionLevel(
-            name="bounded_outputs",
-            ledger_summary_limit=800,
-            output_summary_limit=2200,
-            output_capture_limit=8000,
-            diff_limit=None,
-            context_limit=None,
-            recent_events_limit=None,
-            output_item_limit=None,
-        ),
-        _PromptCompactionLevel(
-            name="compact_outputs",
-            ledger_summary_limit=600,
-            output_summary_limit=1400,
-            output_capture_limit=4000,
-            diff_limit=10000,
-            context_limit=6500,
-            recent_events_limit=30,
-            output_item_limit=100,
-        ),
-        _PromptCompactionLevel(
-            name="ultra_compact_outputs",
-            ledger_summary_limit=450,
-            output_summary_limit=900,
-            output_capture_limit=1800,
-            diff_limit=7000,
-            context_limit=4000,
-            recent_events_limit=20,
-            output_item_limit=60,
-        ),
+    return _prompt_with_budget(
+        packet,
+        builder=build_completion_review_prompt,
+        target=COMPLETION_PROMPT_TARGET_CHARS,
+        ultra_target=COMPLETION_PROMPT_ULTRA_TARGET_CHARS,
+        ultra=ultra,
     )
-    selected = levels[-1] if ultra else levels[0]
-    compact_packet = _compact_completion_packet(packet, level=selected, original_prompt_chars=len(prompt))
-    compact_prompt = build_completion_review_prompt(compact_packet)
-    if ultra:
-        return compact_packet, compact_prompt
-    for level in levels[1:]:
-        if len(compact_prompt) <= target:
-            return compact_packet, compact_prompt
-        selected = level
-        compact_packet = _compact_completion_packet(packet, level=selected, original_prompt_chars=len(prompt))
-        compact_prompt = build_completion_review_prompt(compact_packet)
-    return compact_packet, compact_prompt
+
+
+def _stateless_prompt_with_budget(
+    packet: SupervisorWakePacket,
+    *,
+    ultra: bool = False,
+) -> tuple[SupervisorWakePacket, str]:
+    return _prompt_with_budget(
+        packet,
+        builder=build_stateless_supervisor_prompt,
+        target=RUNTIME_PROMPT_TARGET_CHARS,
+        ultra_target=RUNTIME_PROMPT_ULTRA_TARGET_CHARS,
+        ultra=ultra,
+    )
+
+
+# Hard ceiling for any supervisor prompt: the Codex app-server rejects a single
+# turn input above 1,048,576 chars (input_too_large). Stay strictly below it.
+PROMPT_HARD_CAP_CHARS = 1_000_000
+
+
+def _hard_cap_prompt(prompt: str) -> str:
+    if len(prompt) <= PROMPT_HARD_CAP_CHARS:
+        return prompt
+    keep = PROMPT_HARD_CAP_CHARS - 200
+    return (
+        prompt[:keep]
+        + "\n…<PROMPT HARD-TRUNCATED to fit the app-server input cap; "
+        "read source files and re-run commands yourself to recover any missing detail>"
+    )
+
+
+def _slim_command(text: str | None, *, limit: int = 200) -> str:
+    if not text:
+        return text or ""
+    return text if len(text) <= limit else text[:limit] + " …<truncated; run it yourself>"
+
+
+def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacket:
+    """Strip everything the completion supervisor can re-derive by reading the repo.
+
+    The completion-review supervisor reads source and re-runs checks itself (it
+    already issues rg/sed/git exec_command calls during review), so we drop from the
+    prompt everything redundant or recoverable and keep only the evidence skeleton
+    the accept gate / behavior_evidence_matrix bind to:
+
+    - drop inlined file diffs/contexts (changed_file_diffs/changed_file_contexts) — it runs `git diff`;
+    - drop validation_outputs/inspection_outputs entirely — after captured_output is
+      emptied they are near-duplicates of the validations/inspections ledgers, and the
+      accept gate does not consume them (it binds validation_ids from `validations`);
+    - in each ledger item: empty captured_output, drop the duplicate raw/normalized
+      command, blank the constant cwd, and bound command + summary;
+    - in evidence_provenance_summary keep the risk flags but drop the third copy of the
+      full command it re-embeds per validation;
+    - drop patch_summary/diff_summary — the model reads the diff itself.
+    """
+    def slim_run(value: Any) -> Any:
+        had_output = bool((getattr(value, "captured_output", "") or "").strip())
+        return value.model_copy(
+            update={
+                "command": _slim_command(value.command, limit=120),
+                "raw_command": "",
+                "normalized_command": "",
+                "cwd": "",
+                "captured_output": "",
+                "captured_output_truncated": value.captured_output_truncated or had_output,
+                "summary": _bounded_text(value.summary, limit=200),
+            }
+        )
+
+    provenance = packet.evidence_provenance_summary
+    if provenance is not None:
+        provenance = provenance.model_copy(
+            update={
+                "validations": [
+                    entry.model_copy(update={"command": _slim_command(entry.command, limit=120)})
+                    for entry in provenance.validations
+                ]
+            }
+        )
+
+    return packet.model_copy(
+        update={
+            "validations": [slim_run(v) for v in packet.validations],
+            "inspections": [slim_run(v) for v in packet.inspections],
+            "validation_outputs": [],
+            "inspection_outputs": [],
+            "changed_file_diffs": [],
+            "changed_file_contexts": [],
+            "evidence_provenance_summary": provenance,
+            "patch_summary": None,
+            "diff_summary": None,
+        }
+    )
 
 
 class _PromptCompactionLevel:
@@ -774,6 +866,53 @@ class _PromptCompactionLevel:
         self.context_limit = context_limit
         self.recent_events_limit = recent_events_limit
         self.output_item_limit = output_item_limit
+
+
+# Progressive compaction levels, shared by runtime and completion prompt budgets.
+# Each level strips more aggressively: first the raw captured_output of the ledger
+# runs, then bounds output/diff/context text, then caps item counts and event count.
+_PROMPT_COMPACTION_LEVELS = (
+    _PromptCompactionLevel(
+        name="metadata_ledger",
+        ledger_summary_limit=1000,
+        output_summary_limit=None,
+        output_capture_limit=None,
+        diff_limit=None,
+        context_limit=None,
+        recent_events_limit=None,
+        output_item_limit=None,
+    ),
+    _PromptCompactionLevel(
+        name="bounded_outputs",
+        ledger_summary_limit=800,
+        output_summary_limit=2200,
+        output_capture_limit=8000,
+        diff_limit=None,
+        context_limit=None,
+        recent_events_limit=None,
+        output_item_limit=None,
+    ),
+    _PromptCompactionLevel(
+        name="compact_outputs",
+        ledger_summary_limit=600,
+        output_summary_limit=1400,
+        output_capture_limit=4000,
+        diff_limit=10000,
+        context_limit=6500,
+        recent_events_limit=30,
+        output_item_limit=100,
+    ),
+    _PromptCompactionLevel(
+        name="ultra_compact_outputs",
+        ledger_summary_limit=450,
+        output_summary_limit=900,
+        output_capture_limit=1800,
+        diff_limit=7000,
+        context_limit=4000,
+        recent_events_limit=20,
+        output_item_limit=60,
+    ),
+)
 
 
 def _compact_completion_packet(
@@ -839,6 +978,10 @@ def _compact_validation_run(validation: ValidationRun, *, level: _PromptCompacti
     had_output = bool(validation.captured_output.strip())
     return validation.model_copy(
         update={
+            "command": _slim_command(validation.command, limit=200),
+            "raw_command": "",
+            "normalized_command": "",
+            "cwd": "",
             "summary": _bounded_text(validation.summary, limit=level.ledger_summary_limit),
             "captured_output": "",
             "captured_output_truncated": validation.captured_output_truncated or had_output,
@@ -850,6 +993,10 @@ def _compact_inspection_run(inspection: InspectionRun, *, level: _PromptCompacti
     had_output = bool(inspection.captured_output.strip())
     return inspection.model_copy(
         update={
+            "command": _slim_command(inspection.command, limit=200),
+            "raw_command": "",
+            "normalized_command": "",
+            "cwd": "",
             "summary": _bounded_text(inspection.summary, limit=level.ledger_summary_limit),
             "captured_output": "",
             "captured_output_truncated": inspection.captured_output_truncated or had_output,
@@ -937,6 +1084,10 @@ def _is_input_too_large_error(exc: BaseException) -> bool:
 
 def _is_invalid_supervisor_decision_error(exc: BaseException) -> bool:
     return "invalid supervisor decision:" in str(exc)
+
+
+def _is_no_message_error(exc: BaseException) -> bool:
+    return "did not produce an agent message" in str(exc)
 
 
 def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:

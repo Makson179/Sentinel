@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -20,6 +21,7 @@ from supervisor.approval_triage import (
     CheapApprovalTriageConfig,
     cheap_approval_triage_config_from_env,
 )
+from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import CODER_SANDBOX_DANGER_FULL_ACCESS, CoderSession, coder_sandbox_mode, coder_thread_params
@@ -29,6 +31,7 @@ from supervisor.schemas import (
     AppEventSource,
     ApprovalContext,
     ApprovalRequestType,
+    AdversaryReport,
     ApprovalWakeContext,
     BreadthRiskSummary,
     CheapApprovalDecision,
@@ -182,6 +185,7 @@ class SentinelController:
         overwrite_state: bool = False,
         clean_workspace: bool = False,
         use_git_diff: bool = True,
+        adversary_enabled: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
     ):
         self.project_root = project_root.resolve()
@@ -192,6 +196,7 @@ class SentinelController:
         self.model = model
         self.overwrite_state = overwrite_state
         self.use_git_diff = use_git_diff
+        self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
@@ -240,6 +245,9 @@ class SentinelController:
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
         self._last_large_diff_signature: str | None = None
+        self._pending_adversary_report: AdversaryReport | None = None
+        self._active_adversary_thread_id: str | None = None
+        self._active_adversary_workspace_root: Path | None = None
 
     async def run(self) -> None:
         self.initialize_state()
@@ -495,7 +503,19 @@ class SentinelController:
             item_id=context.item_id,
             reason=context.command or context.grant_root or context.request_type.value,
         )
-        if self.approvals is None:
+        is_adversary_request = self._is_adversary_approval_context(context)
+        if is_adversary_request:
+            adversary_workspace_root = getattr(self, "_active_adversary_workspace_root", None)
+            fallback_manager = ApprovalManager(
+                adversary_workspace_root or self.project_root,
+                declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+            )
+            if adversary_workspace_root is None:
+                resolution = fallback_manager._deny(context, "adversary snapshot workspace is not active")
+            else:
+                resolution = await fallback_manager.decide(context)
+            response = fallback_manager.response_payload(context, resolution)
+        elif self.approvals is None:
             fallback_manager = ApprovalManager(
                 self.project_root,
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
@@ -514,19 +534,38 @@ class SentinelController:
         if resolution.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {resolution.persistent_decision}\n")
         if is_denial:
-            if self.coder is not None:
+            if is_adversary_request:
+                self.store.append_text_locked(
+                    PROGRESS,
+                    f"- Adversary approval denied without steering coder: {resolution.reason}\n",
+                )
+            elif self.coder is not None:
                 try:
                     await self.coder.steer_or_start(resolution.reason)
                 except AppServerError as exc:
                     if not _is_no_active_turn_to_steer_error(exc):
                         raise
-                    self.tui.render("SUPERVISOR", f"denial delivered as approval response; coder steer skipped: {exc}")
+                    self.tui.render("SUPERVISOR", f"denial delivered as approval response; starting a new coder turn: {exc}")
+                    if hasattr(self.coder, "active_turn_id"):
+                        self.coder.active_turn_id = None
+                    self.store.update_sentinel_config(
+                        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None})
+                    )
+                    turn_id = await self.coder.start_turn(resolution.reason)
+                    if isinstance(turn_id, str):
+                        self.store.update_sentinel_config(
+                            lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id})
+                        )
                     self.store.append_text_locked(
                         PROGRESS,
-                        "- Approval denial was returned to app-server, but direct coder steering was skipped "
-                        f"because no active turn was available: {resolution.reason}\n",
+                        "- Approval denial was returned to app-server after the original turn ended; "
+                        "started a new coder turn with the denial reason.\n",
                     )
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
+
+    def _is_adversary_approval_context(self, context: ApprovalContext) -> bool:
+        thread_id = getattr(self, "_active_adversary_thread_id", None)
+        return bool(thread_id and context.thread_id == thread_id)
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
         if self.supervisor is None:
@@ -866,6 +905,9 @@ class SentinelController:
         self._last_completion_marker_sequence = None
         self.completion_review_return_sequence = None
         self.completion_review_return_validation_sequence = None
+        self._pending_adversary_report = None
+        self._active_adversary_thread_id = None
+        self._active_adversary_workspace_root = None
         self.validation_runtime_state = {}
         patch_health(
             self.store,
@@ -923,6 +965,10 @@ class SentinelController:
             packet_or_access_limitations=list(accepted_completion.packet_or_access_limitations)
             if isinstance(accepted_completion, CompletionReviewDecision)
             else [],
+            adversary_reports=_final_adversary_report_summary(
+                getattr(self, "_accepted_adversary_report", None)
+                or getattr(self, "_pending_adversary_report", None)
+            ),
             remaining_risks=list(accepted_completion.changed_test_risks)
             if isinstance(accepted_completion, CompletionReviewDecision)
             else [],
@@ -1365,6 +1411,14 @@ class SentinelController:
             pending_accept_gate_rejection=(
                 getattr(self, "_pending_completion_gate_rejection", None) if completion_review else None
             ),
+            adversary_report=(
+                self._fresh_adversary_report(
+                    generation=cfg.generation,
+                    latest_relevant_change_sequence=latest_change_sequence,
+                )
+                if completion_review
+                else None
+            ),
             **completion_details,
         )
         try:
@@ -1417,19 +1471,23 @@ class SentinelController:
         if counts is None:
             counts = {}
             self.provider_failure_recovery_counts = counts
-        attempts = int(counts.get("no_message") or 0)
+        scope = "completion_review" if completion_review else "runtime_monitor"
+        count_key = f"{scope}_no_message"
+        attempts = int(counts.get(count_key) or 0)
+        counts["no_message"] = int(counts.get("no_message") or 0) + 1
         self.store.append_raw_log(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "type": "provider_failure_recovery",
                 "kind": "no_message",
+                "scope": scope,
                 "attempts_before": attempts,
                 "completion_review": completion_review,
                 "message": message,
             }
         )
         if attempts < 1:
-            counts["no_message"] = attempts + 1
+            counts[count_key] = attempts + 1
             if completion_review and self.supervisor is not None and hasattr(self.supervisor, "close_completion_review"):
                 await self.supervisor.close_completion_review()
             self.store.append_text_locked(
@@ -1447,9 +1505,25 @@ class SentinelController:
                 "Retry supervisor review from the latest stable controller state after provider no_message. "
                 f"Previous review summary: {summary}"
             )
-            self._supervisor_next_completion_review = completion_review
+            self._supervisor_next_completion_review = completion_review or getattr(
+                self,
+                "_supervisor_next_completion_review",
+                False,
+            )
             return True
-        counts["no_message"] = attempts + 1
+        counts[count_key] = attempts + 1
+        if not completion_review:
+            self.store.append_text_locked(
+                PROGRESS,
+                "- Provider recovery: runtime supervisor produced no agent message after retry; skipping this runtime-only review.\n",
+            )
+            self._append_event(
+                AppEventSource.SUPERVISOR,
+                "provider/runtime_no_message_skipped",
+                decision="continue",
+                reason=message,
+            )
+            return True
         self.store.append_text_locked(
             PROGRESS,
             "- Provider recovery failed: repeated supervisor no_message; marking run infra-invalid before scoring.\n",
@@ -1554,8 +1628,6 @@ class SentinelController:
         if stale_issue is not None:
             await self._handle_completion_decision_staleness_failure(stale_issue)
             return
-        if decision.decision == CompletionReviewDecisionKind.ACCEPT:
-            decision = self._repair_completion_accept_evidence_ids(decision, packet=packet)
         self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence})
         )
@@ -1567,6 +1639,9 @@ class SentinelController:
                 await self._handle_completion_accept_gate_failure(decision, gate_result)
                 return
             self._record_accept_gate_success(gate_result)
+            if getattr(self, "adversary_enabled", False) and not self._packet_has_fresh_adversary_report(packet):
+                await self._run_adversary_before_complete(decision, packet=packet)
+                return
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
         if decision.progress_update:
@@ -1588,6 +1663,7 @@ class SentinelController:
             self.completion_return_freshness_rerun_count = 0
             self._pending_completion_gate_rejection = None
             self._accepted_completion_decision = decision
+            self._accepted_adversary_report = packet.adversary_report if packet is not None else None
             await self.finalize(
                 f"accepted by completion_review: {decision.reason or 'task complete'}",
                 status=SentinelStatus.COMPLETE,
@@ -1596,10 +1672,7 @@ class SentinelController:
             return
         if decision.decision == CompletionReviewDecisionKind.RETURN:
             self._pending_completion_gate_rejection = None
-            freshness_issue = self._completion_return_freshness_issue(decision, packet=packet)
-            if freshness_issue is not None:
-                await self._handle_completion_return_freshness_failure(freshness_issue)
-                return
+            decision = self._attach_adversary_report_to_return(decision, packet=packet)
             await self._return_completion_to_coder(decision)
             return
         if decision.decision == CompletionReviewDecisionKind.RESTART:
@@ -1607,6 +1680,200 @@ class SentinelController:
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)
             return
+
+    async def _run_adversary_before_complete(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+    ) -> None:
+        cfg = self.store.get_sentinel_config()
+        if packet is None:
+            await self.finalize(
+                "infra-invalid: adversary requires a completion packet before final complete",
+                status=SentinelStatus.PROVIDER_FAILURE,
+            )
+            return
+        self.tui.render("ADVERSARY", "running pre-complete adversarial tester")
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Adversarial tester starting before final complete.\n",
+        )
+        workspace_state_id = _workspace_state_id(self.project_root)
+        snapshot_root: Path | None = None
+        previous_report = getattr(self, "_pending_adversary_report", None)
+        previous_report_payload = previous_report.model_dump(mode="json") if previous_report is not None else None
+        try:
+            snapshot_root = _create_adversary_snapshot(self.project_root)
+        except Exception as exc:
+            await self.finalize(
+                f"infra-invalid: adversary snapshot setup failed before complete: {exc.__class__.__name__}: {exc}",
+                status=SentinelStatus.PROVIDER_FAILURE,
+            )
+            return
+        self._active_adversary_workspace_root = snapshot_root
+        agent = AdversaryAgent(
+            self.client,
+            snapshot_root,
+            model=self.model,
+            on_thread_start=self._mark_adversary_thread_started,
+            on_thread_done=self._mark_adversary_thread_done,
+        )
+        try:
+            result = await agent.run(packet, previous_adversary_report=previous_report_payload)
+        except AdversaryAgentError as exc:
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "adversary_error",
+                    "generation": packet.generation,
+                    "completion_wake_sequence": decision.wake_sequence,
+                    "error": str(exc),
+                }
+            )
+            await self.finalize(
+                f"infra-invalid: adversary provider/tool failure before complete: {exc}",
+                status=SentinelStatus.PROVIDER_FAILURE,
+            )
+            return
+        finally:
+            self._active_adversary_workspace_root = None
+            if snapshot_root is not None:
+                shutil.rmtree(snapshot_root.parent, ignore_errors=True)
+
+        report = AdversaryReport(
+            candidate_finding=result.candidate_finding,
+            report_text=result.report_text,
+            thread_id=result.thread_id,
+            turn_id=result.turn_id,
+            generation=packet.generation,
+            completion_wake_sequence=decision.wake_sequence,
+            latest_relevant_change_sequence=packet.latest_relevant_change_sequence,
+            validation_sequence=_latest_validation_sequence(packet.validations),
+            workspace_state_id=workspace_state_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._pending_adversary_report = report
+        self.store.append_raw_log(
+            {
+                "timestamp": report.created_at,
+                "type": "adversary_report",
+                "generation": report.generation,
+                "completion_wake_sequence": report.completion_wake_sequence,
+                "latest_relevant_change_sequence": report.latest_relevant_change_sequence,
+                "validation_sequence": report.validation_sequence,
+                "workspace_state_id": report.workspace_state_id,
+                "candidate_finding": report.candidate_finding,
+                "thread_id": report.thread_id,
+                "turn_id": report.turn_id,
+                "report_text": report.report_text,
+            }
+        )
+        if not report.candidate_finding:
+            self.store.append_text_locked(
+                PROGRESS,
+                "- Adversarial tester completed without a candidate finding; finalizing prior completion accept.\n",
+            )
+            if decision.persistent_decision:
+                self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
+            if decision.progress_update:
+                self.store.append_text_locked(PROGRESS, f"- {decision.progress_update}\n")
+                patch_health(
+                    self.store,
+                    HealthDelta(generation=cfg.generation, last_progress_sequence=cfg.last_event_sequence),
+                )
+            if decision.clear_handoff:
+                self.store.write_text_locked(HANDOFF, "")
+            if decision.display_message:
+                self.tui.render("SUPERVISOR", decision.display_message)
+            self._append_event(
+                AppEventSource.SUPERVISOR,
+                "completion/accept",
+                decision="accept",
+                reason=decision.reason,
+            )
+            self.completion_reviewer_rerun_count = 0
+            self.completion_decision_staleness_rerun_count = 0
+            self.completion_return_freshness_rerun_count = 0
+            self._pending_completion_gate_rejection = None
+            self._accepted_completion_decision = decision
+            self._accepted_adversary_report = report
+            await self.finalize(
+                f"accepted by completion_review after clean adversary report: {decision.reason or 'task complete'}",
+                status=SentinelStatus.COMPLETE,
+                completion_review_accepted=True,
+            )
+            return
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Adversarial tester completed with a candidate finding; rerunning completion_review with its report before complete.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "adversary/report_ready",
+            decision="review",
+            reason="pre-complete adversarial report available",
+        )
+        self._schedule_supervisor_check(
+            "Adversarial tester report is available. Rerun completion_review; weigh the report as input, "
+            "return only for a real reproduced required-behavior defect, otherwise accept.",
+            completion_review=True,
+        )
+
+    def _fresh_adversary_report(
+        self,
+        *,
+        generation: int,
+        latest_relevant_change_sequence: int | None,
+    ) -> AdversaryReport | None:
+        report = getattr(self, "_pending_adversary_report", None)
+        if report is None:
+            return None
+        if report.status != "completed" or report.generation != generation:
+            return None
+        if report.latest_relevant_change_sequence != latest_relevant_change_sequence:
+            return None
+        if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self.project_root):
+            return None
+        return report
+
+    def _packet_has_fresh_adversary_report(self, packet: SupervisorWakePacket | None) -> bool:
+        if packet is None:
+            return False
+        report = packet.adversary_report
+        if report is None:
+            return False
+        if report.status != "completed" or report.generation != packet.generation:
+            return False
+        if report.latest_relevant_change_sequence != packet.latest_relevant_change_sequence:
+            return False
+        if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self.project_root):
+            return False
+        return True
+
+    def _attach_adversary_report_to_return(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+    ) -> CompletionReviewDecision:
+        report = packet.adversary_report if packet is not None else None
+        if report is None or not report.report_text.strip():
+            return decision
+        marker = "Adversarial tester report:"
+        if decision.message_to_coder and marker in decision.message_to_coder:
+            return decision
+        report_text = _bounded_adversary_report_text(report.report_text)
+        message = (decision.message_to_coder or "").rstrip()
+        message = f"{message}\n\n{marker}\n{report_text}".strip()
+        return decision.model_copy(update={"message_to_coder": message})
+
+    def _mark_adversary_thread_started(self, thread_id: str) -> None:
+        self._active_adversary_thread_id = thread_id
+
+    def _mark_adversary_thread_done(self, thread_id: str) -> None:
+        if getattr(self, "_active_adversary_thread_id", None) == thread_id:
+            self._active_adversary_thread_id = None
 
     def _completion_decision_staleness_issue(
         self,
@@ -1754,7 +2021,6 @@ class SentinelController:
     ) -> AcceptGateResult:
         changed_files = packet.changed_files if packet is not None else await self.changed_files()
         validations = packet.validations if packet is not None else list(self.validations)
-        inspections = packet.inspections if packet is not None else list(getattr(self, "inspections", []))
         code_review_files = _material_code_review_files(changed_files)
         passed_checks: list[str] = []
 
@@ -1774,60 +2040,6 @@ class SentinelController:
                     reason="completion decision generation does not match the reviewed packet",
                 )
             passed_checks.append("packet_consistency")
-
-        structural_issue = _accept_structural_issue(decision, code_changing=bool(code_review_files))
-        if structural_issue is not None:
-            check_name = (
-                "evidence_id_repair"
-                if _is_evidence_id_structural_issue(structural_issue)
-                else "structural_consistency"
-            )
-            return AcceptGateResult(
-                passed=False,
-                failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
-                check_name=check_name,
-                reason=structural_issue,
-                details={"kind": "proof_format_evidence_id"} if check_name == "evidence_id_repair" else None,
-            )
-        passed_checks.append("structural_consistency")
-
-        file_issue = _accept_file_review_issue(decision, code_review_files)
-        if file_issue is not None:
-            return AcceptGateResult(
-                passed=False,
-                failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
-                check_name="file_review_coverage",
-                reason=file_issue,
-            )
-        passed_checks.append("file_review_coverage")
-
-        if packet is not None:
-            unassessed_test_risks = _changed_test_contract_shift_risks(packet, decision)
-            if unassessed_test_risks:
-                return AcceptGateResult(
-                    passed=False,
-                    failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
-                    check_name="structural_consistency",
-                    reason=(
-                        "changed tests rewrite existing behavior without changed_test_risks assessment: "
-                        + ", ".join(unassessed_test_risks[:5])
-                    ),
-                )
-            passed_checks.append("changed_test_risks_assessment")
-            parallel_state_risks = _unassessed_parallel_persistence_risks(packet, decision)
-            if parallel_state_risks:
-                return AcceptGateResult(
-                    passed=False,
-                    failure_type=ACCEPT_GATE_REVIEWER_INCOMPLETE,
-                    check_name="structural_consistency",
-                    reason=(
-                        "parallel persistence/source-of-truth risk was not explicitly assessed: "
-                        + ", ".join(parallel_state_risks[:5])
-                    ),
-                )
-            passed_checks.append("parallel_persistence_assessment")
-
-            passed_checks.append("breadth_risk_report_only")
 
         latest_change = (
             packet.latest_relevant_change_sequence
@@ -1852,49 +2064,18 @@ class SentinelController:
                 )
             passed_checks.append("behavioral_floor")
 
-        binding_issue = _accept_evidence_binding_issue(
-            decision,
-            validations,
-            inspections,
-            latest_change=latest_change,
-        )
-        if binding_issue is not None:
-            details = _evidence_binding_issue_details(binding_issue)
-            failure_type = (
-                ACCEPT_GATE_CODER_CORRECTABLE
-                if binding_issue.coder_correctable
-                else ACCEPT_GATE_REVIEWER_INCOMPLETE
-            )
-            if (
-                failure_type == ACCEPT_GATE_CODER_CORRECTABLE
-                and self._bounded_accept_gate_coder_return_used("evidence_binding", details)
-            ):
-                failure_type = ACCEPT_GATE_REVIEWER_INCOMPLETE
-                details["bounded_coder_return_already_used"] = True
-            return AcceptGateResult(
-                passed=False,
-                failure_type=failure_type,
-                check_name="evidence_binding",
-                reason=binding_issue.reason,
-                details=details,
-            )
-        passed_checks.append("evidence_binding")
-
-        self_confirming_issue = _self_confirming_test_evidence_issue(
-            decision,
-            validations,
-            packet=packet,
-            latest_change=latest_change,
-        )
-        if self_confirming_issue is not None:
-            return AcceptGateResult(
-                passed=False,
-                failure_type=ACCEPT_GATE_CODER_CORRECTABLE,
-                check_name="self_confirming_test_evidence",
-                reason=self_confirming_issue["reason"],
-                details=self_confirming_issue,
-            )
-        passed_checks.append("independent_evidence_binding")
+        if packet is not None:
+            masking_issues = _changed_test_masking_issues(packet)
+            if masking_issues:
+                return AcceptGateResult(
+                    passed=False,
+                    failure_type=ACCEPT_GATE_CODER_CORRECTABLE,
+                    check_name="changed_test_masking",
+                    reason="changed test diff appears to mask validation rather than check behavior: "
+                    + "; ".join(masking_issues[:5]),
+                    details={"issues": masking_issues[:10]},
+                )
+            passed_checks.append("changed_test_masking")
 
         return AcceptGateResult(passed=True, passed_checks=tuple(passed_checks))
 
@@ -4734,6 +4915,24 @@ def _completion_accept_rejection_decision(
     ):
         validation_gaps.extend(_evidence_binding_validation_gaps(details, fallback_reason=reason))
         message_to_coder = _evidence_binding_message_to_coder(details, fallback_reason=reason)
+    elif check_name == "changed_test_masking":
+        validation_gaps.append(f"Controller accept-gate rejection (changed_test_masking): {reason}")
+        issues = []
+        if isinstance(details, dict):
+            issues = [str(issue) for issue in details.get("issues", []) if issue]
+        lines = [
+            "Continue working. Completion accept was rejected because a changed test appears to mask validation.",
+        ]
+        if issues:
+            lines.append("Masked changed-test diff signals:")
+            lines.extend(f"- {issue}" for issue in issues[:6])
+        else:
+            lines.append(f"Gate reason: {reason}")
+        lines.append(
+            "Restore a meaningful test check or remove the skip/trivial/no-op change, rerun trusted validation, "
+            "then use the exact readiness marker on its own line."
+        )
+        message_to_coder = _bounded_text("\n".join(lines), limit=3000)
     else:
         validation_gaps.append(f"Controller accept-gate rejection ({check_name}): {reason}")
         message_to_coder = (
@@ -4966,6 +5165,112 @@ def _changed_test_contract_shift_risks(packet: SupervisorWakePacket, decision: C
         if len(risks) >= 10:
             break
     return risks
+
+
+def _changed_test_masking_issues(packet: SupervisorWakePacket) -> list[str]:
+    issues: list[str] = []
+    for changed in packet.changed_file_diffs:
+        if changed.file_kind != "test" or changed.change_kind not in {"added", "modified", "renamed"}:
+            continue
+        for line, reason in _added_test_masking_lines(changed.diff):
+            issues.append(f"{changed.path}: {reason}: {line}")
+            if len(issues) >= 10:
+                return issues
+        removed_assertions = _removed_test_assertion_lines(changed.diff)
+        added_assertions = [
+            line
+            for line in _substantive_added_test_assertion_lines(changed.diff)
+            if not _is_trivially_true_test_assertion(line)
+        ]
+        if removed_assertions and not added_assertions:
+            issues.append(f"{changed.path}: removed assertion without meaningful replacement: {removed_assertions[0]}")
+            if len(issues) >= 10:
+                return issues
+    return issues
+
+
+def _added_test_masking_lines(diff: str) -> list[tuple[str, str]]:
+    lines: list[tuple[str, str]] = []
+    for raw_line in diff.splitlines():
+        if not raw_line.startswith("+") or raw_line.startswith("+++"):
+            continue
+        line = raw_line[1:].strip()
+        if not line:
+            continue
+        if _is_test_skip_line(line):
+            lines.append((_bounded_text(line, limit=180), "added skipped/todo test marker"))
+        elif _is_trivially_true_test_assertion(line):
+            lines.append((_bounded_text(line, limit=180), "added trivially true assertion"))
+        elif _is_noop_test_body_line(line):
+            lines.append((_bounded_text(line, limit=180), "added no-op test body"))
+    return lines
+
+
+def _removed_test_assertion_lines(diff: str, *, limit: int = 5) -> list[str]:
+    lines: list[str] = []
+    for raw_line in diff.splitlines():
+        if not raw_line.startswith("-") or raw_line.startswith("---"):
+            continue
+        line = raw_line[1:].strip()
+        if not _is_test_assertion_like(line):
+            continue
+        lines.append(_bounded_text(line, limit=180))
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _is_test_assertion_like(line: str) -> bool:
+    lowered = line.lower()
+    return any(
+        token in lowered
+        for token in (
+            "assert",
+            "expect(",
+            ".should",
+            ".tobe",
+            ".toequal",
+            ".tocontain",
+            ".tomatch",
+            "equal(",
+            "strictequal",
+            "throws",
+            "rejects",
+        )
+    )
+
+
+def _is_test_skip_line(line: str) -> bool:
+    lowered = line.lower()
+    return bool(
+        re.search(r"\b(?:it|test|describe|context)\.skip\s*\(", lowered)
+        or re.search(r"\bx(?:it|test|describe|context)\s*\(", lowered)
+        or re.search(r"\btest\.todo\s*\(", lowered)
+        or "pytest.mark.skip" in lowered
+        or lowered.startswith("@unittest.skip")
+    )
+
+
+def _is_trivially_true_test_assertion(line: str) -> bool:
+    compact = re.sub(r"[\s;]+", "", line.lower())
+    trivial_patterns = (
+        r"^asserttrue$",
+        r"^assert\(true\)$",
+        r"^assert1==1$",
+        r"^assert\(1==1\)$",
+        r"^assert\.equal\(1,1\)$",
+        r"^assert\.strictequal\(1,1\)$",
+        r"^expect\(true\)\.tobe\(true\)$",
+        r"^expect\(true\)\.toequal\(true\)$",
+        r"^expect\(1\)\.tobe\(1\)$",
+        r"^expect\(1\)\.toequal\(1\)$",
+    )
+    return any(re.search(pattern, compact) for pattern in trivial_patterns)
+
+
+def _is_noop_test_body_line(line: str) -> bool:
+    compact = re.sub(r"\s+", "", line.lower().rstrip(";"))
+    return compact in {"pass", "return", "returntrue"}
 
 
 def _changed_test_reviewed_with_assessment(decision: CompletionReviewDecision, path: str) -> bool:
@@ -6220,6 +6525,106 @@ def _item_summary(item: Any) -> str:
 
 def _is_completed_action(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+
+
+def _adversary_enabled_from_env() -> bool:
+    raw = os.environ.get("SENTINEL_ADVERSARY_ENABLED", "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
+def _create_adversary_snapshot(project_root: Path) -> Path:
+    temp_root = Path(tempfile.mkdtemp(prefix="sentinel-adversary-")).resolve()
+    snapshot_root = temp_root / "workspace"
+    try:
+        shutil.copytree(
+            project_root,
+            snapshot_root,
+            symlinks=True,
+            ignore=_adversary_snapshot_ignore,
+        )
+    except Exception:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    return snapshot_root
+
+
+def _adversary_snapshot_ignore(directory: str, names: list[str]) -> set[str]:
+    ignored = {
+        ".git",
+        ".supervisor",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+    return {name for name in names if name in ignored}
+
+
+def _workspace_state_id(project_root: Path) -> str:
+    root = project_root.resolve()
+    digest = hashlib.sha256()
+    skip_dirs = {
+        ".git",
+        ".supervisor",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+    }
+    for current, dirs, files in os.walk(root):
+        dirs[:] = sorted(name for name in dirs if name not in skip_dirs)
+        rel_dir = Path(current).resolve().relative_to(root)
+        for name in sorted(files):
+            path = Path(current) / name
+            rel = (rel_dir / name).as_posix()
+            try:
+                digest.update(rel.encode("utf-8", errors="surrogateescape"))
+                digest.update(b"\0")
+                if path.is_symlink():
+                    digest.update(b"symlink\0")
+                    digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+                else:
+                    digest.update(b"file\0")
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                digest.update(b"\0")
+            except OSError:
+                digest.update(b"unreadable\0")
+                digest.update(rel.encode("utf-8", errors="surrogateescape"))
+                digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _latest_validation_sequence(validations: list[ValidationRun]) -> int | None:
+    return max((validation.sequence for validation in validations), default=None)
+
+
+def _bounded_adversary_report_text(text: str, *, limit: int = 20_000) -> str:
+    stripped = text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[:limit].rstrip() + "\n\n[adversary report truncated by controller for coder message]"
+
+
+def _final_adversary_report_summary(report: AdversaryReport | None) -> list[str]:
+    if report is None:
+        return []
+    first_line = next((line.strip() for line in report.report_text.splitlines() if line.strip()), "")
+    if len(first_line) > 240:
+        first_line = first_line[:237].rstrip() + "..."
+    details = [
+        f"status={report.status}",
+        f"candidate_finding={str(report.candidate_finding).lower()}",
+        f"completion_wake_sequence={report.completion_wake_sequence}",
+        f"latest_relevant_change_sequence={report.latest_relevant_change_sequence}",
+    ]
+    if first_line:
+        details.append(f"summary={first_line}")
+    return ["; ".join(details)]
 
 
 def _is_stream_delta_method(method: str) -> bool:

@@ -1,5 +1,6 @@
 from supervisor.prompts.supervisor import (
     PROMPTS_ENV_VAR,
+    build_adversary_prompt,
     build_cheap_approval_prompt,
     build_completion_review_prompt,
     build_coder_prompt,
@@ -9,6 +10,7 @@ from supervisor.prompts.supervisor import (
 
 __all__ = [
     "PROMPTS_ENV_VAR",
+    "build_adversary_prompt",
     "build_cheap_approval_prompt",
     "build_completion_review_prompt",
     "build_coder_prompt",

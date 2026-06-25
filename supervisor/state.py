@@ -242,6 +242,8 @@ class StateStore:
                 lines.extend(["", "## Completion Files Reviewed", *[f"- {item}" for item in report.files_reviewed_summary]])
             if report.packet_or_access_limitations:
                 lines.extend(["", "## Packet Or Access Limitations", *[f"- {item}" for item in report.packet_or_access_limitations]])
+            if report.adversary_reports:
+                lines.extend(["", "## Adversary Reports", *[f"- {item}" for item in report.adversary_reports]])
             if report.denied_actions:
                 lines.extend(["", "## Denied Actions", *[f"- {item}" for item in report.denied_actions]])
             if report.remaining_risks:

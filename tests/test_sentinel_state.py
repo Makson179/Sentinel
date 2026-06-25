@@ -7,7 +7,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -34,6 +34,7 @@ from supervisor.main import _run_async_cleanly
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
+    AdversaryReport,
     ApprovalDecisionKind,
     BreadthRiskSummary,
     ChangedFile,
@@ -1957,6 +1958,112 @@ async def test_completion_review_reads_assistant_message_content_from_turns_list
     assert audit["raw_text"] == decision_text
 
 
+async def test_completion_review_no_message_retries_with_ultra_compact_minimal_prompt(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\nImplement the compiler.\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    valid_decision = {
+        "decision": "return",
+        "reason": "needs independent demo",
+        "decision_artifact": {
+            "current_state": "provider recovered on compact retry",
+            "resolved_concerns": [],
+            "stale_concerns": [],
+            "uncovered_edge_candidates": ["independent demo missing"],
+            "actionable_gap_or_none": "run an independent demo",
+            "decision": "return",
+        },
+        "basis_event_seq": 7,
+        "last_relevant_edit_seq": 5,
+        "last_validation_seq": 6,
+        "files_reviewed": [],
+        "behavior_evidence_matrix": [],
+        "uncovered_behaviors": ["independent demo"],
+        "validation_gaps": [],
+        "claim_evidence_mismatches": [],
+        "packet_or_access_limitations": [],
+        "changed_test_risks": [],
+        "message_to_coder": "Run an independent demo for the claimed compiler behavior.",
+        "persistent_decision": None,
+        "progress_update": None,
+        "clear_handoff": False,
+        "display_message": None,
+        "handoff": None,
+        "wake_sequence": 7,
+        "generation": 0,
+    }
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_count = 0
+            self.turn_inputs: list[str] = []
+            self.archived: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_count += 1
+            return {"thread": {"id": f"completion-thread-{self.thread_count}"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.turn_inputs.append(params["input"][0]["text"])
+            turn_number = len(self.turn_inputs)
+            if turn_number <= 2:
+                return {
+                    "turn": {
+                        "id": f"turn-{turn_number}",
+                        "status": "completed",
+                        "items": [],
+                    }
+                }
+            return {
+                "turn": {
+                    "id": "turn-3",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": json.dumps(valid_decision)}],
+                }
+            }
+
+        async def thread_turns_list(self, thread_id, *, limit, items_view, timeout):
+            return {"data": []}
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(client, store, task)  # type: ignore[arg-type]
+    packet = agent.build_packet(
+        wake_sequence=7,
+        current_summary="completion review",
+        validations=[
+            ValidationRun(
+                command="pytest tests/public",
+                exit_code=0,
+                passed=True,
+                summary="46 passed\n" + ("x" * 5000),
+                captured_output="46 passed\n" + ("y" * 5000),
+                sequence=6,
+            )
+        ],
+    )
+
+    decision = await agent.decide_completion(packet)
+
+    assert decision.decision == "return"
+    assert len(client.turn_inputs) == 3
+    assert "Emergency compact JSON retry" in client.turn_inputs[2]
+    assert "ultra_compact_outputs" in client.turn_inputs[2]
+    assert "supervisor did not produce an agent message" in client.turn_inputs[2]
+    assert client.archived == ["completion-thread-1"]
+    audit_rows = [
+        json.loads(line)
+        for line in store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert audit_rows[-1]["use_case"] == "completion_review_no_message_minimal_retry"
+    assert audit_rows[-1]["status"] == "decision"
+
+
 async def test_supervisor_agent_retries_invalid_structured_output_once(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -2124,1380 +2231,452 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     assert "Completion review returned missing fallback coverage" in store.path("PROGRESS.md").read_text(encoding="utf-8")
 
 
-async def test_completion_accept_gate_rejects_empty_behavior_matrix_for_code_change(tmp_path: Path) -> None:
-    task = tmp_path / "TASK.md"
-    task.write_text("# Task", encoding="utf-8")
-    store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
-        overwrite=True,
-    )
-
-    class FakeCoder:
-        def __init__(self) -> None:
-            self.messages = []
-
-        async def steer_or_start(self, message):
-            self.messages.append(message)
-            return "turn"
-
-    controller = SentinelController.__new__(SentinelController)
-    controller.project_root = tmp_path
-    controller.task_path = task
-    controller.store = store
-    controller.coder = FakeCoder()
-    controller.pending_approvals = {}
-    controller.validations = []
-    controller.prior_interventions = []
-    controller.observed_changed_files = {}
-    controller.use_git_diff = False
-    controller.tui = _FakeTUI()
-    controller.running = True
-    controller.event_queue = asyncio.Queue()
-    controller._sequence = 0
-    controller.completion_returns = []
-    controller.completion_restarts = 0
-    controller.completion_reviewer_rerun_count = 0
-    controller.no_marker_idle_nudge_count = 0
-
-    packet = SupervisorWakePacket(
-        wake_sequence=1,
-        latest_event_sequence=1,
-        generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents="# Task",
-        coder_thread_id="thread",
-        changed_files=[ChangedFile(path="src/app.py", status="M", sequence=2)],
-        validations=[ValidationRun(command="pytest", exit_code=0, passed=True, summary="passed", sequence=3)],
-        latest_relevant_change_sequence=2,
-    )
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision(
-            decision="accept",
-            reason="looks done",
-            message_to_coder=None,
-            persistent_decision=None,
-            progress_update="Accepted.",
-            clear_handoff=False,
-            display_message=None,
-            handoff=None,
-            wake_sequence=1,
-            generation=0,
-        ),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert controller.coder.messages == []
-    assert "behavior_evidence_matrix is empty" in store.path("PROGRESS.md").read_text(encoding="utf-8")
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-
-
-async def test_completion_accept_gate_allows_assessed_changed_test_contract_shift(tmp_path: Path) -> None:
-    task = tmp_path / "TASK.md"
-    task.write_text("User-facing flow depends on helper resend semantics.", encoding="utf-8")
-    store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
-        overwrite=True,
-    )
-
-    class FakeCoder:
-        def __init__(self) -> None:
-            self.messages = []
-
-        async def steer_or_start(self, message):
-            self.messages.append(message)
-            return "turn"
-
-    controller = SentinelController.__new__(SentinelController)
-    controller.project_root = tmp_path
-    controller.task_path = task
-    controller.store = store
-    controller.coder = FakeCoder()
-    controller.pending_approvals = {}
-    controller.validations = [
-        ValidationRun(command="pytest tests/test_flow.py", exit_code=0, passed=True, summary="passed", sequence=5),
-        ValidationRun(
-            command="python - <<'PY'\nprint(flow_visible_state())\nPY",
-            exit_code=0,
-            type="behavior_demo",
-            passed=True,
-            summary="resend_allowed=True",
-            captured_output="resend_allowed=True\n",
-            sequence=6,
-        ),
-    ]
-    controller.prior_interventions = []
-    controller.observed_changed_files = {}
-    controller.use_git_diff = False
-    controller.tui = _FakeTUI()
-    controller.running = True
-    controller.event_queue = asyncio.Queue()
-    controller._sequence = 0
-    controller.completion_returns = []
-    controller.completion_restarts = 0
-    controller.no_marker_idle_nudge_count = 0
-
-    packet = SupervisorWakePacket(
-        wake_sequence=1,
-        latest_event_sequence=1,
-        generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents=task.read_text(encoding="utf-8"),
-        coder_thread_id="thread",
-        changed_files=[
-            ChangedFile(path="src/helper.py", status="M", sequence=2),
-            ChangedFile(path="tests/test_flow.py", status="M", sequence=3),
-        ],
-        changed_file_diffs=[
-            ChangedFileDiff(
-                path="tests/test_flow.py",
-                file_kind="test",
-                change_kind="modified",
-                diff=(
-                    "diff --git a/tests/test_flow.py b/tests/test_flow.py\n"
-                    "@@\n"
-                    "-    await db.expire('confirm:user', 1)\n"
-                    "+    await db.set('helper:last_sent', old_enough)\n"
-                    "     assert ok\n"
-                ),
-            )
-        ],
-        validations=controller.validations,
-        latest_relevant_change_sequence=3,
-    )
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(
-            {
-                "decision": "accept",
-                "reason": "flow test passed",
-                "files_reviewed": [
-                    {"path": "src/helper.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-                    {
-                        "path": "tests/test_flow.py",
-                        "reason": "inspected removed expiry assertion and found no unresolved changed-test risk",
-                        "kind": "test",
-                        "inspected": True,
-                        "limitation": None,
-                    },
-                ],
-                "behavior_evidence_matrix": [
-                    {
-                        "behavior": "user-facing flow and helper resend semantics",
-                        "task_basis": "TASK.md",
-                        "files_considered": ["src/helper.py", "tests/test_flow.py"],
-                        "evidence": [
-                            {
-                                "validation_id": "validation-5",
-                                "command": "pytest tests/test_flow.py",
-                                "sequence": 5,
-                                "validation_type": "behavioral",
-                                "outcome": "pass",
-                                "freshness": "fresh",
-                                "why_it_covers_behavior": "runs the visible flow",
-                            },
-                            {
-                                "validation_id": "validation-6",
-                                "command": "python - <<'PY'\nprint(flow_visible_state())\nPY",
-                                "sequence": 6,
-                                "validation_type": "behavior_demo",
-                                "outcome": "pass",
-                                "freshness": "fresh",
-                                "why_it_covers_behavior": "captures factual resend state outside the changed test",
-                            },
-                        ],
-                        "status": "covered",
-                        "gap": None,
-                    }
-                ],
-                "uncovered_behaviors": [],
-                "validation_gaps": [],
-                "claim_evidence_mismatches": [],
-                "packet_or_access_limitations": [],
-                "changed_test_risks": [],
-                "message_to_coder": None,
-                "persistent_decision": None,
-                "progress_update": "Accepted.",
-                "clear_handoff": False,
-                "display_message": None,
-                "handoff": None,
-                "wake_sequence": 1,
-                "generation": 0,
-            }
-        ),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
-    assert len(controller.completion_returns) == 0
-    assert controller.coder.messages == []
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
-
-
-async def test_completion_accept_gate_rejects_changed_test_contract_shift_without_assessment(tmp_path: Path) -> None:
-    task = tmp_path / "TASK.md"
-    task.write_text("User-facing flow depends on helper resend semantics.", encoding="utf-8")
-    store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
-        overwrite=True,
-    )
-
-    class FakeCoder:
-        def __init__(self) -> None:
-            self.messages = []
-
-        async def steer_or_start(self, message):
-            self.messages.append(message)
-            return "turn"
-
-    controller = SentinelController.__new__(SentinelController)
-    controller.project_root = tmp_path
-    controller.task_path = task
-    controller.store = store
-    controller.coder = FakeCoder()
-    controller.pending_approvals = {}
-    controller.validations = [
-        ValidationRun(command="pytest tests/test_flow.py", exit_code=0, passed=True, summary="passed", sequence=5)
-    ]
-    controller.prior_interventions = []
-    controller.observed_changed_files = {}
-    controller.use_git_diff = False
-    controller.tui = _FakeTUI()
-    controller.running = True
-    controller.event_queue = asyncio.Queue()
-    controller._sequence = 0
-    controller.completion_returns = []
-    controller.completion_restarts = 0
-    controller.no_marker_idle_nudge_count = 0
-
-    packet = SupervisorWakePacket(
-        wake_sequence=1,
-        latest_event_sequence=1,
-        generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents=task.read_text(encoding="utf-8"),
-        coder_thread_id="thread",
-        changed_files=[
-            ChangedFile(path="src/helper.py", status="M", sequence=2),
-            ChangedFile(path="tests/test_flow.py", status="M", sequence=3),
-        ],
-        changed_file_diffs=[
-            ChangedFileDiff(
-                path="tests/test_flow.py",
-                file_kind="test",
-                change_kind="modified",
-                diff=(
-                    "diff --git a/tests/test_flow.py b/tests/test_flow.py\n"
-                    "@@\n"
-                    "-    await db.expire('confirm:user', 1)\n"
-                    "+    await db.set('helper:last_sent', old_enough)\n"
-                    "     assert ok\n"
-                ),
-            )
-        ],
-        validations=controller.validations,
-        latest_relevant_change_sequence=3,
-    )
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(
-            {
-                "decision": "accept",
-                "reason": "flow test passed",
-                "files_reviewed": [
-                    {"path": "src/helper.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-                    {"path": "tests/test_flow.py", "reason": "", "kind": "test", "inspected": True, "limitation": None},
-                ],
-                "behavior_evidence_matrix": [
-                    {
-                        "behavior": "user-facing flow and helper resend semantics",
-                        "task_basis": "TASK.md",
-                        "files_considered": ["src/helper.py", "tests/test_flow.py"],
-                        "evidence": [
-                            {
-                                "validation_id": "validation-5",
-                                "command": "pytest tests/test_flow.py",
-                                "sequence": 5,
-                                "validation_type": "behavioral",
-                                "outcome": "pass",
-                                "freshness": "fresh",
-                                "why_it_covers_behavior": "runs the visible flow",
-                            }
-                        ],
-                        "status": "covered",
-                        "gap": None,
-                    }
-                ],
-                "uncovered_behaviors": [],
-                "validation_gaps": [],
-                "claim_evidence_mismatches": [],
-                "packet_or_access_limitations": [],
-                "changed_test_risks": [],
-                "message_to_coder": None,
-                "persistent_decision": None,
-                "progress_update": "Accepted.",
-                "clear_handoff": False,
-                "display_message": None,
-                "handoff": None,
-                "wake_sequence": 1,
-                "generation": 0,
-            }
-        ),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert controller.coder.messages == []
-    assert "changed tests rewrite existing behavior" in store.path("PROGRESS.md").read_text(encoding="utf-8")
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-
-
-async def test_completion_accept_gate_rejects_unassessed_parallel_persistence_state(tmp_path: Path) -> None:
-    task = tmp_path / "TASK.md"
-    task.write_text("Fix resend fallback without breaking existing confirmation expiry semantics.", encoding="utf-8")
-    store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
-        overwrite=True,
-    )
-
-    class FakeCoder:
-        def __init__(self) -> None:
-            self.messages = []
-
-        async def steer_or_start(self, message):
-            self.messages.append(message)
-            return "turn"
-
-    controller = SentinelController.__new__(SentinelController)
-    controller.project_root = tmp_path
-    controller.task_path = task
-    controller.store = store
-    controller.coder = FakeCoder()
-    controller.pending_approvals = {}
-    controller.validations = [
-        ValidationRun(command="pytest tests/test_email.py", exit_code=0, passed=True, summary="passed", sequence=5)
-    ]
-    controller.prior_interventions = []
-    controller.observed_changed_files = {}
-    controller.use_git_diff = False
-    controller.tui = _FakeTUI()
-    controller.running = True
-    controller.event_queue = asyncio.Queue()
-    controller._sequence = 0
-    controller.completion_returns = []
-    controller.completion_restarts = 0
-    controller.completion_reviewer_rerun_count = 0
-    controller.no_marker_idle_nudge_count = 0
-
-    packet = SupervisorWakePacket(
-        wake_sequence=1,
-        latest_event_sequence=1,
-        generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents=task.read_text(encoding="utf-8"),
-        coder_thread_id="thread",
-        changed_files=[ChangedFile(path="src/email.js", status="M", sequence=2)],
-        changed_file_diffs=[
-            ChangedFileDiff(
-                path="src/email.js",
-                file_kind="source",
-                change_kind="modified",
-                diff=(
-                    "diff --git a/src/email.js b/src/email.js\n"
-                    "@@\n"
-                    " async function sendValidation(uid, code, ttl) {\n"
-                    "-  await db.set(`confirm:byUid:${uid}`, code);\n"
-                    "-  await db.pexpire(`confirm:byUid:${uid}`, ttl);\n"
-                    "+  await db.setObject(`confirm:pending:${uid}`, { code, expires: Date.now() + ttl });\n"
-                    "+  await db.set(`confirm:byUid:${uid}`, code);\n"
-                    "+  await db.pexpire(`confirm:byUid:${uid}`, ttl);\n"
-                    " }\n"
-                    " async function canSendValidation(uid) {\n"
-                    "-  const ttl = await db.pttl(`confirm:byUid:${uid}`);\n"
-                    "+  const pending = await db.getObject(`confirm:pending:${uid}`);\n"
-                    "+  const ttl = pending.expires - Date.now();\n"
-                    "   return ttl < 1000;\n"
-                    " }\n"
-                ),
-            )
-        ],
-        validations=controller.validations,
-        latest_relevant_change_sequence=2,
-    )
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(
-            {
-                "decision": "accept",
-                "reason": "resend fallback works",
-                "files_reviewed": [
-                    {"path": "src/email.js", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-                    {"path": "tests/test_email.py", "reason": "validation target", "kind": "test", "inspected": True, "limitation": None},
-                ],
-                "behavior_evidence_matrix": [
-                    {
-                        "behavior": "resend fallback works",
-                        "task_basis": "TASK.md",
-                        "files_considered": ["src/email.js", "tests/test_email.py"],
-                        "evidence": [
-                            {
-                                "validation_id": "validation-5",
-                                "command": "pytest tests/test_email.py",
-                                "sequence": 5,
-                                "validation_type": "behavioral",
-                                "outcome": "pass",
-                                "freshness": "fresh",
-                                "why_it_covers_behavior": "runs the recovered resend path",
-                            }
-                        ],
-                        "status": "covered",
-                        "gap": None,
-                    }
-                ],
-                "uncovered_behaviors": [],
-                "validation_gaps": [],
-                "claim_evidence_mismatches": [],
-                "packet_or_access_limitations": [],
-                "changed_test_risks": [],
-                "message_to_coder": None,
-                "persistent_decision": None,
-                "progress_update": "Accepted.",
-                "clear_handoff": False,
-                "display_message": None,
-                "handoff": None,
-                "wake_sequence": 1,
-                "generation": 0,
-            }
-        ),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert controller.coder.messages == []
-    assert "parallel persistence/source-of-truth risk" in store.path("PROGRESS.md").read_text(encoding="utf-8")
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-
-
-async def test_completion_accept_gate_allows_fresh_covered_code_change(tmp_path: Path) -> None:
-    task = tmp_path / "TASK.md"
-    task.write_text("# Task", encoding="utf-8")
-    store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
-        overwrite=True,
-    )
-
-    controller = SentinelController.__new__(SentinelController)
-    controller.project_root = tmp_path
-    controller.task_path = task
-    controller.store = store
-    controller.coder = None
-    controller.pending_approvals = {}
-    controller.validations = [
-        ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3),
-        ValidationRun(
-            command="python - <<'PY'\nprint(app())\nPY",
-            exit_code=0,
-            type="behavior_demo",
-            passed=True,
-            summary='{"rendered_text":"requested behavior"}',
-            captured_output='{"rendered_text":"requested behavior"}\n',
-            sequence=4,
-        ),
-    ]
-    controller.prior_interventions = []
-    controller.observed_changed_files = {}
-    controller.use_git_diff = False
-    controller.tui = _FakeTUI()
-    controller.running = True
-    controller.event_queue = asyncio.Queue()
-    controller._sequence = 0
-    controller.completion_returns = []
-    controller.completion_restarts = 0
-    controller.completion_reviewer_rerun_count = 0
-    controller.no_marker_idle_nudge_count = 0
-
-    packet = SupervisorWakePacket(
-        wake_sequence=1,
-        latest_event_sequence=1,
-        generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents="# Task",
-        coder_thread_id="thread",
-        changed_files=[
-            ChangedFile(path="src/app.py", status="M", sequence=2),
-            ChangedFile(path="tests/test_app.py", status="M", sequence=2),
-        ],
-        validations=controller.validations,
-        latest_relevant_change_sequence=2,
-    )
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(
-            {
-                "decision": "accept",
-                "reason": "covered",
-                "files_reviewed": [
-                    {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-                    {"path": "tests/test_app.py", "reason": "changed test", "kind": "test", "inspected": True, "limitation": None},
-                ],
-                "behavior_evidence_matrix": [
-                    {
-                        "behavior": "requested behavior",
-                        "task_basis": "TASK.md",
-                        "files_considered": ["src/app.py", "tests/test_app.py"],
-                            "evidence": [
-                                {
-                                    "validation_id": "validation-3",
-                                    "command": "pytest tests/test_app.py",
-                                    "sequence": 3,
-                                    "validation_type": "behavioral",
-                                    "outcome": "pass",
-                                    "freshness": "fresh",
-                                    "why_it_covers_behavior": "executes the changed behavior",
-                                },
-                                {
-                                    "validation_id": "validation-4",
-                                    "command": "python - <<'PY'\nprint(app())\nPY",
-                                    "sequence": 4,
-                                    "validation_type": "behavior_demo",
-                                    "outcome": "pass",
-                                    "freshness": "fresh",
-                                    "why_it_covers_behavior": "captures factual behavior outside the changed test",
-                                },
-                            ],
-                            "status": "covered",
-                            "gap": None,
-                    }
-                ],
-                "uncovered_behaviors": [],
-                "validation_gaps": [],
-                "claim_evidence_mismatches": [],
-                "packet_or_access_limitations": [],
-                "changed_test_risks": [],
-                "message_to_coder": None,
-                "persistent_decision": None,
-                "progress_update": "Accepted by completion review.",
-                "clear_handoff": False,
-                "display_message": None,
-                "handoff": None,
-                "wake_sequence": 1,
-                "generation": 0,
-            }
-        ),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
-    assert store.get_sentinel_config().accept_gate_accepts == 1
-    log_entry = json.loads(store.path(LOG).read_text(encoding="utf-8").splitlines()[-1])
-    assert log_entry["type"] == "completion_accept_gate_pass"
-    assert {"check_name": "evidence_binding", "passed": True} in log_entry["checks"]
-    assert {"check_name": "behavioral_floor", "passed": True} in log_entry["checks"]
-    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert "## Completion Behavior Evidence" in report
-    assert "## Completion Files Reviewed" in report
-
-
-async def test_completion_accept_gate_returns_for_self_confirming_added_test_and_snapshot(tmp_path: Path) -> None:
+async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validation(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
-            command="npm test -- DeviceDetailHeading",
+            command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            summary="PASS src/components/DeviceDetailHeading-test.ts\n1 passed",
-            captured_output="PASS src/components/DeviceDetailHeading-test.ts\n1 passed\n",
-            executed_test_files=["src/components/DeviceDetailHeading-test.ts"],
+            summary="tests/test_app.py::test_requested_behavior PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_requested_behavior PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app.py"],
             sequence=3,
         )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    packet = SupervisorWakePacket(
+    decision = CompletionReviewDecision(
+        decision="accept",
+        reason="fresh validation passed",
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update="Accepted by completion review.",
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
         wake_sequence=1,
-        latest_event_sequence=1,
         generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents="Render device detail heading from selected element data.",
-        coder_thread_id="thread",
-        changed_files=[
-            ChangedFile(path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2),
-            ChangedFile(path="src/components/DeviceDetailHeading-test.tsx", status="A", sequence=2),
-            ChangedFile(path="src/components/__snapshots__/DeviceDetailHeading-test.tsx.snap", status="A", sequence=2),
-        ],
-        changed_file_diffs=[
-            ChangedFileDiff(
-                path="src/components/DeviceDetailHeading-test.tsx",
-                file_kind="test",
-                change_kind="added",
-                diff="+test('renders heading', () => expect(screen.getByText('Device')).toBeVisible())",
-            ),
-            ChangedFileDiff(
-                path="src/components/__snapshots__/DeviceDetailHeading-test.tsx.snap",
-                file_kind="test",
-                change_kind="added",
-                diff="+<h1>Device</h1>",
-            ),
-        ],
-        validations=validations,
-        latest_relevant_change_sequence=2,
     )
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["files_reviewed"] = [
-        {"path": "src/components/DeviceDetailHeading.tsx", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-        {"path": "src/components/DeviceDetailHeading-test.tsx", "reason": "assessed added test", "kind": "test", "inspected": True, "limitation": None},
-        {
-            "path": "src/components/__snapshots__/DeviceDetailHeading-test.tsx.snap",
-            "reason": "assessed added snapshot",
-            "kind": "test",
-            "inspected": True,
-            "limitation": None,
-        },
-    ]
-    payload["behavior_evidence_matrix"] = [
-        {
-            "behavior": "device detail heading renders selected element data",
-            "task_basis": "TASK.md",
-            "files_considered": [
-                "src/components/DeviceDetailHeading.tsx",
-                "src/components/DeviceDetailHeading-test.tsx",
-            ],
-            "evidence": [
-                {
-                    "validation_id": "validation-3",
-                    "command": "npm test -- DeviceDetailHeading",
-                    "sequence": 3,
-                    "validation_type": "behavioral",
-                    "outcome": "pass",
-                    "freshness": "fresh",
-                    "why_it_covers_behavior": "runs the new heading test",
-                }
-            ],
-            "status": "covered",
-            "gap": None,
-        }
-    ]
-    decision = CompletionReviewDecision.model_validate(payload)
 
-    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
-    assert "self_confirming_test_evidence" in coder.messages[0]
-    assert "device detail heading renders selected element data" in coder.messages[0]
-    assert "validation-3" in coder.messages[0]
-    assert "DeviceDetailHeading-test.tsx" in coder.messages[0]
-    assert "behavior_demo" in coder.messages[0]
-    pending = controller._pending_completion_gate_rejection
-    assert pending is not None
-    assert pending["check_name"] == "self_confirming_test_evidence"
-    assert pending["details"]["behaviors"][0]["behavior"] == "device detail heading renders selected element data"
-    log_entry = json.loads(store.path(LOG).read_text(encoding="utf-8").splitlines()[-1])
-    assert log_entry["check_name"] == "self_confirming_test_evidence"
-    assert log_entry["details"]["requirement"] == "independent_evidence_binding"
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    assert store.get_sentinel_config().accept_gate_accepts == 1
+    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
+    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_pass")
+    check_names = {check["check_name"] for check in log_entry["checks"]}
+    assert "behavioral_floor" in check_names
+    assert "evidence_binding" not in check_names
+    assert "independent_evidence_binding" not in check_names
+    assert "file_review_coverage" not in check_names
 
 
-async def test_completion_accept_gate_allows_untouched_output_identified_test_with_added_test(tmp_path: Path) -> None:
+async def test_completion_accept_gate_allows_changed_test_without_independent_evidence(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
-            command="pytest tests/test_app_existing.py tests/test_app_new.py",
+            command="pytest tests/test_app_new.py",
             exit_code=0,
             passed=True,
-            summary="tests/test_app_existing.py::test_requested_behavior PASSED\ntests/test_app_new.py::test_requested_behavior PASSED\n2 passed",
-            captured_output=(
-                "tests/test_app_existing.py::test_requested_behavior PASSED\n"
-                "tests/test_app_new.py::test_requested_behavior PASSED\n2 passed\n"
-            ),
-            executed_test_files=["tests/test_app_existing.py", "tests/test_app_new.py"],
+            summary="tests/test_app_new.py::test_requested_behavior PASSED\n1 passed",
+            captured_output="tests/test_app_new.py::test_requested_behavior PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app_new.py"],
             sequence=3,
         )
     ]
-    controller, store, task, _coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["files_reviewed"].append(
-        {"path": "tests/test_app_new.py", "reason": "added test", "kind": "test", "inspected": True, "limitation": None}
-    )
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     packet = _gate_packet(task, validations=validations)
+    packet.changed_files = [
+        ChangedFile(path="src/app.py", status="M", sequence=2),
+        ChangedFile(path="tests/test_app_new.py", status="A", sequence=2),
+    ]
     packet.changed_file_diffs = [
         ChangedFileDiff(
             path="tests/test_app_new.py",
             file_kind="test",
             change_kind="added",
-            diff="+def test_requested_behavior():\n+    assert app() == 'ok'",
+            diff="+def test_requested_behavior():\n+    assert app() == 'requested'",
         )
     ]
-    packet.validations = validations
 
     await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
         packet_thread_id="thread",
         packet=packet,
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
     assert store.get_sentinel_config().accept_gate_accepts == 1
 
 
-async def test_completion_accept_gate_allows_behavior_demo_independent_evidence(tmp_path: Path) -> None:
+async def test_adversary_enabled_runs_before_completion_finalize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     validations = [
         ValidationRun(
-            command="npm test -- DeviceDetailHeading",
+            command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            summary="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed",
-            captured_output="PASS src/components/DeviceDetailHeading-test.tsx\n1 passed\n",
-            executed_test_files=["src/components/DeviceDetailHeading-test.tsx"],
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
             sequence=3,
-        ),
-        ValidationRun(
-            command="node -e \"console.log(renderHeading({name:'Device 42'}))\"",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="<h1>Device 42</h1>",
-            captured_output="<h1>Device 42</h1>\n",
-            sequence=4,
-        ),
-    ]
-    controller, store, task, _coder = _completion_gate_controller(tmp_path, validations=validations)
-    packet = SupervisorWakePacket(
-        wake_sequence=1,
-        latest_event_sequence=1,
-        generation=0,
-        restart_count=0,
-        task_path=str(task),
-        task_contents="Render device detail heading from selected element data.",
-        coder_thread_id="thread",
-        changed_files=[
-            ChangedFile(path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2),
-            ChangedFile(path="src/components/DeviceDetailHeading-test.tsx", status="A", sequence=2),
-        ],
-        changed_file_diffs=[
-            ChangedFileDiff(
-                path="src/components/DeviceDetailHeading-test.tsx",
-                file_kind="test",
-                change_kind="added",
-                diff="+test('renders heading', () => expect(screen.getByText('Device 42')).toBeVisible())",
-            )
-        ],
-        validations=validations,
-        latest_relevant_change_sequence=2,
-    )
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["files_reviewed"] = [
-        {"path": "src/components/DeviceDetailHeading.tsx", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-        {"path": "src/components/DeviceDetailHeading-test.tsx", "reason": "added test", "kind": "test", "inspected": True, "limitation": None},
-    ]
-    payload["behavior_evidence_matrix"][0]["behavior"] = "device detail heading renders selected element data"
-    payload["behavior_evidence_matrix"][0]["files_considered"] = ["src/components/DeviceDetailHeading.tsx"]
-    payload["behavior_evidence_matrix"][0]["evidence"] = [
-        {
-            "validation_id": "validation-4",
-            "command": "node -e \"console.log(renderHeading({name:'Device 42'}))\"",
-            "sequence": 4,
-            "validation_type": "behavior_demo",
-            "outcome": "pass",
-            "freshness": "fresh",
-            "why_it_covers_behavior": "captured rendered DOM output <h1>Device 42</h1> for the task scenario",
-        }
-    ]
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
-    assert store.get_sentinel_config().accept_gate_accepts == 1
-
-
-async def test_completion_accept_gate_allows_inspection_for_static_source_constraint(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="node -e \"console.log(render())\"",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="<h1>Requested</h1>",
-            captured_output="<h1>Requested</h1>\n",
-            sequence=3,
-        )
-    ]
-    inspections = [
-        InspectionRun(
-            command="rg -n \"system\\(|exec\\(\" src",
-            exit_code=1,
-            passed=True,
-            summary="no matches",
-            captured_output="",
-            sequence=4,
-            inspected_paths=["src"],
-        )
-    ]
-    controller, store, task, _coder = _completion_gate_controller(tmp_path, validations=validations)
-    controller.inspections = inspections
-    packet = _gate_packet(task, validations=validations)
-    packet.inspections = inspections
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-    payload["behavior_evidence_matrix"].append(
-        {
-            "behavior": "implementation satisfies anti-hacking source constraint: no shellout",
-            "task_basis": "TASK.md requires no shellout",
-            "files_considered": ["src/app.py"],
-            "evidence": [
-                {
-                    "inspection_id": inspections[0].inspection_id,
-                    "command": inspections[0].command,
-                    "sequence": 4,
-                    "validation_type": "inspection",
-                    "outcome": "pass",
-                    "freshness": "fresh",
-                    "why_it_covers_behavior": "source inspection found no system/exec shellout calls",
-                }
-            ],
-            "status": "covered",
-            "gap": None,
-        }
-    )
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=packet,
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
-    assert store.get_sentinel_config().accept_gate_accepts == 1
-
-
-async def test_completion_accept_gate_repairs_missing_inspection_evidence_id_without_escalation(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="node -e \"console.log(render())\"",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="<h1>Requested</h1>",
-            captured_output="<h1>Requested</h1>\n",
-            sequence=3,
-        )
-    ]
-    inspections = [
-        InspectionRun(
-            command="rg -n \"system\\(|exec\\(\" src",
-            exit_code=1,
-            passed=True,
-            summary="no matches",
-            captured_output="",
-            sequence=4,
-            inspected_paths=["src"],
         )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    controller.inspections = inspections
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.model = None
+    controller.running = False
+    controller._pending_adversary_report = None
+    controller._active_adversary_thread_id = None
+    controller._active_adversary_workspace_root = None
+    (tmp_path / ".supervisor" / "secret.txt").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".supervisor" / "secret.txt").write_text("runtime history", encoding="utf-8")
+    seen_snapshot_roots: list[Path] = []
+
+    class FakeAdversary:
+        def __init__(self, client, project_root, *, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+            self.project_root = Path(project_root)
+            self.on_thread_start = on_thread_start
+            self.on_thread_done = on_thread_done
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            seen_snapshot_roots.append(self.project_root)
+            assert self.project_root != tmp_path
+            assert (self.project_root / "TASK.md").exists()
+            assert not (self.project_root / ".supervisor").exists()
+            (self.project_root / "adversary_probe.txt").write_text("probe", encoding="utf-8")
+            assert previous_adversary_report is None
+            if self.on_thread_start:
+                self.on_thread_start("adv-thread")
+            if self.on_thread_done:
+                self.on_thread_done("adv-thread")
+            return SimpleNamespace(
+                report_text=(
+                    "attacked: boundary inputs\n"
+                    "findings: none\n"
+                    "held: boundary inputs held\n"
+                    "not_reached: none\n"
+                    "overall: held"
+                ),
+                thread_id="adv-thread",
+                turn_id="adv-turn",
+                candidate_finding=False,
+            )
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", FakeAdversary)
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert controller._pending_adversary_report is not None
+    assert controller._pending_adversary_report.thread_id == "adv-thread"
+    assert controller._pending_adversary_report.candidate_finding is False
+    assert controller._pending_adversary_report.latest_relevant_change_sequence == 2
+    assert controller._pending_adversary_report.workspace_state_id is not None
+    assert coder.messages == []
+    assert seen_snapshot_roots and not seen_snapshot_roots[0].exists()
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Adversarial tester completed" in progress
+    assert "without a candidate finding" in progress
+
+
+async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller.adversary_enabled = True
     packet = _gate_packet(task, validations=validations)
-    packet.inspections = inspections
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-    payload["behavior_evidence_matrix"].append(
-        {
-            "behavior": "implementation satisfies anti-hacking source constraint: no shellout",
-            "task_basis": "TASK.md requires no shellout",
-            "files_considered": ["src/app.py"],
-            "evidence": [
-                {
-                    "command": inspections[0].command,
-                    "sequence": 4,
-                    "validation_type": "inspection",
-                    "outcome": "pass",
-                    "freshness": "fresh",
-                    "why_it_covers_behavior": "source inspection found no system/exec shellout calls",
-                }
-            ],
-            "status": "covered",
-            "gap": None,
-        }
+    packet.adversary_report = AdversaryReport(
+        report_text="attacked: boundary\nfindings: none\noverall: held",
+        thread_id="adv-thread",
+        turn_id="adv-turn",
+        generation=0,
+        completion_wake_sequence=1,
+        latest_relevant_change_sequence=2,
+        validation_sequence=3,
+        created_at=datetime.now(timezone.utc).isoformat(),
     )
 
     await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
         packet_thread_id="thread",
         packet=packet,
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
     assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_accepts == 1
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
-    assert "Controller repaired completion evidence IDs" in store.path(PROGRESS).read_text(encoding="utf-8")
-    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
-    repair = next(entry for entry in log_entries if entry.get("type") == "completion_evidence_id_repair")
-    assert any("inspection-4" in item for item in repair["repairs"])
+    final_report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "## Adversary Reports" in final_report
 
 
-async def test_completion_accept_gate_unrepairable_evidence_id_failure_is_infra_invalid_not_escalated(
+async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     validations = [
         ValidationRun(
-            command="node -e \"console.log(render())\"",
+            command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            type="behavior_demo",
-            summary="<h1>Requested</h1>",
-            captured_output="<h1>Requested</h1>\n",
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations, reruns=1)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-    payload["behavior_evidence_matrix"].append(
-        {
-            "behavior": "implementation satisfies static source constraint",
-            "task_basis": "TASK.md requires source inspection",
-            "files_considered": ["src/app.py"],
-            "evidence": [
-                {
-                    "command": "rg -n \"forbidden\" src",
-                    "sequence": 99,
-                    "validation_type": "inspection",
-                    "outcome": "pass",
-                    "freshness": "fresh",
-                    "why_it_covers_behavior": "source inspection found no forbidden marker",
-                }
-            ],
-            "status": "covered",
-            "gap": None,
-        }
-    )
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    fake = _RuntimeFakeSupervisor(store, task)
+    controller.supervisor = fake
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.model = None
+    controller.running = True
+    controller.observed_changed_files = {"src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)}
+
+    class FakeAdversary:
+        def __init__(self, *args, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+            self.on_thread_start = on_thread_start
+            self.on_thread_done = on_thread_done
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            assert previous_adversary_report is None
+            if self.on_thread_start:
+                self.on_thread_start("adv-thread")
+            if self.on_thread_done:
+                self.on_thread_done("adv-thread")
+            return SimpleNamespace(
+                report_text="attacked: stack args\nfindings: crash on seven args\noverall: broke",
+                thread_id="adv-thread",
+                turn_id="adv-turn",
+                candidate_finding=True,
+            )
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", FakeAdversary)
 
     await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
         packet_thread_id="thread",
         packet=_gate_packet(task, validations=validations),
     )
-
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
-    assert len(controller.completion_returns) == 0
-    assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_audit_failures == 1
-    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert "infra-invalid: controller-side proof-format repair failed" in report
-    assert "escalated" not in report
-
-
-async def test_completion_accept_gate_rejects_inspection_only_behavior_row(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="node -e \"console.log(render())\"",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="<h1>Requested</h1>",
-            captured_output="<h1>Requested</h1>\n",
-            sequence=3,
-        )
-    ]
-    inspections = [
-        InspectionRun(
-            command="sed -n '1,120p' src/app.py",
-            exit_code=0,
-            passed=True,
-            summary="function render() { return '<h1>Requested</h1>'; }",
-            captured_output="function render() { return '<h1>Requested</h1>'; }\n",
-            sequence=4,
-            inspected_paths=["src/app.py"],
-        )
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    controller.inspections = inspections
-    packet = _gate_packet(task, validations=validations)
-    packet.inspections = inspections
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["behavior"] = "renders requested value"
-    payload["behavior_evidence_matrix"][0]["evidence"] = [
-        {
-            "inspection_id": inspections[0].inspection_id,
-            "command": inspections[0].command,
-            "sequence": 4,
-            "validation_type": "inspection",
-            "outcome": "pass",
-            "freshness": "fresh",
-            "why_it_covers_behavior": "read implementation text",
-        }
-    ]
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=packet,
-    )
+    assert controller._supervisor_task is not None
+    await controller._supervisor_task
 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-    assert "inspection evidence only covers static/source constraints" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert fake.completion_packets
+    assert fake.completion_packets[0].adversary_report is not None
+    assert fake.completion_packets[0].adversary_report.candidate_finding is True
+    assert "Adversarial tester report:" in coder.messages[0]
 
 
-async def test_completion_accept_gate_treats_breadth_risk_as_report_only(tmp_path: Path) -> None:
+async def test_adversary_receives_previous_report_as_regression_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     validations = [
         ValidationRun(
-            command="node -e \"console.log(render())\"",
+            command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            type="behavior_demo",
-            summary="<h1>Requested</h1>",
-            captured_output="<h1>Requested</h1>\n",
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
             sequence=3,
         )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    task.write_text(
-        "Implement parser, arrays, structs, enums, pointers, functions, errors, config, persistence, routing, "
-        "compatibility, fallback, validation, and storage behavior.",
-        encoding="utf-8",
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.model = None
+    controller.running = False
+    controller._pending_adversary_report = AdversaryReport(
+        candidate_finding=True,
+        report_text="attacked: previous edge\nfindings: previous crash\noverall: broke",
+        thread_id="old-adv-thread",
+        turn_id="old-adv-turn",
+        generation=0,
+        completion_wake_sequence=1,
+        latest_relevant_change_sequence=1,
+        validation_sequence=2,
+        workspace_state_id="old-state",
+        created_at=datetime.now(timezone.utc).isoformat(),
     )
-    packet = _gate_packet(task, validations=validations)
-    packet.breadth_risk_summary = BreadthRiskSummary(
-        flags=["task_spec_appears_broad", "many_task_feature_terms"],
-        task_line_count=3,
-        requirement_hint_count=12,
-        task_feature_terms=["parser", "array", "struct", "enum", "pointer", "function", "error", "config"],
-        changed_source_files_count=4,
-        changed_lines=700,
-        suggested_min_behavior_rows=6,
-    )
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["behavior"] = "available test coverage set passes"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+
+    class FakeAdversary:
+        def __init__(self, *args, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+            self.on_thread_start = on_thread_start
+            self.on_thread_done = on_thread_done
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            assert previous_adversary_report is not None
+            assert previous_adversary_report["report_text"].startswith("attacked: previous edge")
+            if self.on_thread_start:
+                self.on_thread_start("new-adv-thread")
+            if self.on_thread_done:
+                self.on_thread_done("new-adv-thread")
+            return SimpleNamespace(
+                report_text="attacked: previous edge, fresh edge\nfindings: none\noverall: held",
+                thread_id="new-adv-thread",
+                turn_id="new-adv-turn",
+                candidate_finding=False,
+            )
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", FakeAdversary)
 
     await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
         packet_thread_id="thread",
-        packet=packet,
+        packet=_gate_packet(task, validations=validations),
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert controller._accepted_adversary_report.thread_id == "new-adv-thread"
     assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_accepts == 1
-    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
-    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_pass")
-    assert {"check_name": "breadth_risk_report_only", "passed": True} in log_entry["checks"]
 
 
-async def test_completion_accept_gate_returns_for_empty_behavior_demo_output(tmp_path: Path) -> None:
+async def test_completion_return_after_adversary_includes_report_for_coder(tmp_path: Path) -> None:
     validations = [
-        ValidationRun(
-            command="python -m docs.generate_settings",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="command completed",
-            captured_output="",
-            sequence=3,
-        )
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["behavior"] = "Generated docs include the new setting"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "python -m docs.generate_settings"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert "full diff" in coder.messages[0]
-    assert "hand-picked grep/sed" in coder.messages[0]
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
-    assert "behavior_demo evidence validation-3 has no captured output" in store.path(PROGRESS).read_text(encoding="utf-8")
-
-
-async def test_completion_accept_gate_returns_for_self_verdict_behavior_demo(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./run_scenario src/app.py",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="PASS",
-            captured_output="PASS\n",
-            sequence=3,
-        )
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert "self-verdict" in coder.messages[0]
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 0
-
-
-async def test_completion_accept_gate_returns_for_failing_behavior_demo_evidence(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario requested",
-            exit_code=1,
-            passed=False,
-            type="behavior_demo",
-            summary="scenario failed",
-            captured_output="actual=old expected=requested\n",
-            sequence=3,
-        ),
         ValidationRun(
             command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            summary="tests/test_app.py::test_smoke PASSED\n1 passed",
-            captured_output="tests/test_app.py::test_smoke PASSED\n1 passed\n",
+            summary="1 passed",
+            captured_output="1 passed\n",
             executed_test_files=["tests/test_app.py"],
-            sequence=4,
-        ),
+            sequence=3,
+        )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["outcome"] = "fail"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["why_it_covers_behavior"] = (
-        "claims the failing demo covers the requested scenario"
+    packet = _gate_packet(task, validations=validations)
+    packet.adversary_report = AdversaryReport(
+        report_text="attacked: stack args\nfindings: crash on seven args\nraw observed output: SIGSEGV\noverall: broke",
+        thread_id="adv-thread",
+        turn_id="adv-turn",
+        generation=0,
+        completion_wake_sequence=1,
+        latest_relevant_change_sequence=2,
+        validation_sequence=3,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    decision = CompletionReviewDecision(
+        decision="return",
+        reason="adversary reproduced stack arg crash",
+        uncovered_behaviors=["stack-passed arguments crash"],
+        validation_gaps=[],
+        claim_evidence_mismatches=[],
+        packet_or_access_limitations=[],
+        changed_test_risks=[],
+        message_to_coder="Fix the reproduced stack-argument crash.",
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
     )
 
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
+    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
     assert len(controller.completion_returns) == 1
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert "no linked fresh passing validation" in coder.messages[0]
+    assert "Fix the reproduced stack-argument crash." in coder.messages[0]
+    assert "Adversarial tester report:" in coder.messages[0]
+    assert "SIGSEGV" in coder.messages[0]
 
 
-async def test_completion_accept_gate_returns_for_stale_behavior_demo_evidence(tmp_path: Path) -> None:
+async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(tmp_path: Path) -> None:
     validations = [
-        ValidationRun(
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario requested",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="actual=requested",
-            captured_output="actual=requested\n",
-            sequence=1,
-        ),
         ValidationRun(
             command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            summary="tests/test_app.py::test_smoke PASSED\n1 passed",
-            captured_output="tests/test_app.py::test_smoke PASSED\n1 passed\n",
+            summary="tests/test_app.py::test_requested_behavior PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_requested_behavior PASSED\n1 passed\n",
             executed_test_files=["tests/test_app.py"],
-            sequence=4,
-        ),
+            sequence=3,
+        )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-1").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["sequence"] = 1
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["freshness"] = "stale"
+    packet = _gate_packet(task, validations=validations)
+    packet.changed_file_diffs = [
+        ChangedFileDiff(
+            path="tests/test_app.py",
+            file_kind="test",
+            change_kind="modified",
+            diff=(
+                "diff --git a/tests/test_app.py b/tests/test_app.py\n"
+                "@@\n"
+                "-    assert app() == 'requested'\n"
+                "+    assert True\n"
+            ),
+        )
+    ]
 
     await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
         packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations, latest_change=2),
+        packet=packet,
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
     assert len(controller.completion_returns) == 1
     assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert "no linked fresh passing validation" in coder.messages[0]
+    assert "changed test appears to mask validation" in coder.messages[0]
+    assert "trivially true assertion" in coder.messages[0]
 
 
-async def test_completion_accept_gate_returns_for_masked_behavior_demo_evidence(tmp_path: Path) -> None:
+async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(tmp_path: Path) -> None:
     validations = [
-        ValidationRun(
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario requested | cat",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="actual=requested",
-            captured_output="actual=requested\n",
-            trusted_validation_outcome="masked_or_unknown",
-            masking_reason="pipeline_without_pipefail",
-            sequence=3,
-        ),
         ValidationRun(
             command="pytest tests/test_app.py",
             exit_code=0,
             passed=True,
-            summary="tests/test_app.py::test_smoke PASSED\n1 passed",
-            captured_output="tests/test_app.py::test_smoke PASSED\n1 passed\n",
+            summary="tests/test_app.py::test_requested_behavior PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_requested_behavior PASSED\n1 passed\n",
             executed_test_files=["tests/test_app.py"],
-            sequence=4,
-        ),
+            sequence=3,
+        )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = validations[0].command
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
+    packet = _gate_packet(task, validations=validations)
+    packet.changed_file_diffs = [
+        ChangedFileDiff(
+            path="tests/test_app.py",
+            file_kind="test",
+            change_kind="modified",
+            diff="+test.skip('requested behavior', () => expect(app()).toBe('requested'))",
+        )
+    ]
 
     await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
         packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
+        packet=packet,
     )
 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
     assert len(controller.completion_returns) == 1
     assert store.get_sentinel_config().accept_gate_coder_returns == 1
-    assert "no linked fresh passing validation" in coder.messages[0]
-
-
-async def test_completion_accept_gate_does_not_repeat_bounded_empty_demo_return(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="python -m docs.generate_settings",
-            exit_code=0,
-            passed=True,
-            type="behavior_demo",
-            summary="command completed",
-            captured_output="",
-            sequence=3,
-        )
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    controller.completion_returns = [
-        CompletionReturnRecord(
-            reason="controller accept-gate rejection (evidence_binding): missing output",
-            message_to_coder="capture artifact diff",
-            accept_gate_check_name="evidence_binding",
-            accept_gate_details={
-                "check_name": "evidence_binding",
-                "details": {
-                    "bounded_coder_return_key": (
-                        "behavior_demo_missing_output:Generated docs include the new setting:validation-3"
-                    )
-                },
-            },
-            sequence=1,
-            generation=0,
-        )
-    ]
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["behavior"] = "Generated docs include the new setting"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "python -m docs.generate_settings"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "behavior_demo"
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert coder.messages == []
-    assert len(controller.completion_returns) == 1
-    assert store.get_sentinel_config().accept_gate_coder_returns == 0
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
-    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_rejection")
-    assert log_entry["failure_type"] == "reviewer-incomplete"
-    assert log_entry["details"]["bounded_coder_return_already_used"] is True
-
-
-async def test_completion_accept_gate_reruns_reviewer_when_evidence_type_mismatches_ledger(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(
-            command="pytest tests/test_app.py",
-            exit_code=0,
-            passed=True,
-            summary="passed",
-            sequence=3,
-            type="behavioral",
-        )
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-3").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["validation_type"] = "static"
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-    progress = store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "evidence type mismatch" in progress
-    assert "validation-3 declares static but ledger has behavioral" in progress
-
-
-async def test_completion_accept_gate_reruns_reviewer_when_behavior_lacks_ledger_record(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1, validation_id="validation-missing").model_dump(mode="json")
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["command"] = "pytest tests/other_flow.py"
-    payload["behavior_evidence_matrix"][0]["evidence"][0]["sequence"] = 99
-
-    await controller.apply_completion_decision(
-        CompletionReviewDecision.model_validate(payload),
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-    assert "requested behavior" in store.path(PROGRESS).read_text(encoding="utf-8")
-    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
-    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_rejection")
-    assert log_entry["check_name"] == "evidence_binding"
+    assert "changed test appears to mask validation" in coder.messages[0]
+    assert "skipped/todo test marker" in coder.messages[0]
 
 
 async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_validation(tmp_path: Path) -> None:
@@ -3523,70 +2702,6 @@ async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_
     assert len(controller.completion_returns) == 1
     assert "no fresh passing behavioral validation" in coder.messages[0]
     assert store.get_sentinel_config().accept_gate_coder_returns == 1
-
-
-async def test_completion_accept_gate_reruns_reviewer_for_missing_changed_file_review(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    payload = _covered_accept_decision(wake_sequence=1).model_dump(mode="json")
-    payload["files_reviewed"] = [
-        {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
-    ]
-    decision = CompletionReviewDecision.model_validate(payload)
-
-    await controller.apply_completion_decision(
-        decision,
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert coder.messages == []
-    assert "changed source/test files were not reviewed" in store.path(PROGRESS).read_text(encoding="utf-8")
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-
-
-async def test_completion_accept_gate_reruns_reviewer_for_contradictory_accept(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    decision = _covered_accept_decision(wake_sequence=1).model_copy(update={"uncovered_behaviors": ["missing edge"]})
-
-    await controller.apply_completion_decision(
-        decision,
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    assert len(controller.completion_returns) == 0
-    assert coder.messages == []
-    assert "uncovered_behaviors is not empty" in store.path(PROGRESS).read_text(encoding="utf-8")
-    assert store.get_sentinel_config().accept_gate_reviewer_reruns == 1
-
-
-async def test_completion_accept_gate_double_reviewer_incomplete_escalates_audit_failure(tmp_path: Path) -> None:
-    validations = [
-        ValidationRun(command="pytest tests/test_app.py", exit_code=0, passed=True, summary="passed", sequence=3)
-    ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations, reruns=1)
-    decision = _covered_accept_decision(wake_sequence=1).model_copy(update={"uncovered_behaviors": ["missing edge"]})
-
-    await controller.apply_completion_decision(
-        decision,
-        packet_thread_id="thread",
-        packet=_gate_packet(task, validations=validations),
-    )
-
-    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
-    assert len(controller.completion_returns) == 0
-    assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_audit_failures == 1
-    assert "controller-side audit failure" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
 
 
 async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(tmp_path: Path) -> None:
@@ -4031,7 +3146,40 @@ async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: 
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
     assert controller.provider_failure_recovery_counts["no_message"] == 1
+    assert controller.provider_failure_recovery_counts["runtime_monitor_no_message"] == 1
     assert "supervisor produced no agent message" in store.path(PROGRESS).read_text(encoding="utf-8")
+
+
+async def test_repeated_runtime_supervisor_no_message_skips_current_review(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+
+    class AlwaysNoMessageRuntimeSupervisor:
+        def __init__(self, store: StateStore, task: Path) -> None:
+            self.agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+            self.calls = 0
+
+        def build_packet(self, **kwargs):
+            return self.agent.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            self.calls += 1
+            raise SupervisorAgentError("supervisor did not produce an agent message")
+
+    supervisor = AlwaysNoMessageRuntimeSupervisor(store, controller.task_path)
+    controller.supervisor = supervisor
+
+    await controller._supervisor_check_loop("runtime check", None, None, None, None, False)
+
+    assert supervisor.calls == 2
+    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
+    assert controller.running is True
+    assert controller._supervisor_dirty is False
+    assert controller.provider_failure_recovery_counts["no_message"] == 2
+    assert controller.provider_failure_recovery_counts["runtime_monitor_no_message"] == 2
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "retrying review from latest stable state" in progress
+    assert "skipping this runtime-only review" in progress
 
 
 async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failure(tmp_path: Path) -> None:
@@ -4610,7 +3758,63 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
     assert controller.coder.messages == ["writes to supervisor runtime/state files are denied"]
 
 
-async def test_policy_deny_no_active_turn_steer_does_not_fail_controller(tmp_path: Path) -> None:
+async def test_adversary_file_change_request_is_denied_without_steering_coder(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
+        overwrite=True,
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = []
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def steer_or_start(self, message):
+            self.messages.append(message)
+            return "turn"
+
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.store = store
+    controller.client = FakeClient()
+    controller.approvals = ApprovalManager(tmp_path)
+    controller.coder = FakeCoder()
+    controller.pending_approvals = {}
+    controller.tui = _FakeTUI()
+    controller._sequence = 0
+    controller._active_adversary_thread_id = "adv-thread"
+
+    await controller.handle_server_request(
+        AppServerMessage(
+            {
+                "id": 53,
+                "method": "item/fileChange/requestApproval",
+                "params": {
+                    "threadId": "adv-thread",
+                    "turnId": "adv-turn",
+                    "grantRoot": str(tmp_path / "src" / "app.py"),
+                    "availableDecisions": ["accept", "decline", "cancel"],
+                },
+            }
+        )
+    )
+
+    assert controller.client.responses == [(53, {"decision": "decline"})]
+    assert controller.coder.messages == []
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Adversary approval denied without steering coder" in progress
+
+
+async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -4627,15 +3831,25 @@ async def test_policy_deny_no_active_turn_steer_does_not_fail_controller(tmp_pat
             self.responses.append((request_id, response))
 
     class FakeCoder:
+        def __init__(self) -> None:
+            self.active_turn_id = "turn"
+            self.started_messages = []
+
         async def steer_or_start(self, message):
             raise AppServerError("{'code': -32600, 'message': 'no active turn to steer'}")
 
+        async def start_turn(self, message):
+            self.started_messages.append(message)
+            self.active_turn_id = "new-turn"
+            return "new-turn"
+
+    coder = FakeCoder()
     controller = SentinelController.__new__(SentinelController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
-    controller.coder = FakeCoder()
+    controller.coder = coder
     controller.pending_approvals = {}
     controller.tui = _FakeTUI()
     controller._sequence = 0
@@ -4657,7 +3871,9 @@ async def test_policy_deny_no_active_turn_steer_does_not_fail_controller(tmp_pat
     assert controller.client.responses == [(55, {"decision": "decline"})]
     assert health.denied_requests == 1
     assert health.last_denial == "writes to supervisor runtime/state files are denied"
-    assert "direct coder steering was skipped" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert coder.started_messages == ["writes to supervisor runtime/state files are denied"]
+    assert store.get_sentinel_config().active_coder_turn_id == "new-turn"
+    assert "started a new coder turn with the denial reason" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
 async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
@@ -4906,6 +4122,7 @@ def _completion_gate_controller(
     controller.supervisor = None
     controller.coder = coder
     controller.pending_approvals = {}
+    controller.last_coder_message = None
     controller.validations = validations
     controller.inspections = []
     controller.prior_interventions = []
@@ -4921,12 +4138,21 @@ def _completion_gate_controller(
     controller._supervisor_next_summary = None
     controller._supervisor_next_completion_review = False
     controller.completion_returns = []
+    controller.completion_attempt_count = 0
     controller.completion_restarts = 0
     controller.completion_reviewer_rerun_count = reruns
     controller.completion_decision_staleness_rerun_count = 0
     controller.no_marker_idle_nudge_count = 0
     controller.provider_failure_recovery_counts = {}
+    controller.validation_runtime_state = {}
+    controller.completion_review_return_sequence = None
+    controller.completion_review_return_validation_sequence = None
+    controller._terminal_cleanup_started = False
+    controller._command_output_chunks = {}
     controller._last_large_diff_signature = None
+    controller._pending_adversary_report = None
+    controller._active_adversary_thread_id = None
+    controller._active_adversary_workspace_root = None
     return controller, store, task, coder
 
 
@@ -5022,6 +4248,9 @@ def _runtime_controller(tmp_path: Path) -> tuple[SentinelController, StateStore,
     controller._terminal_cleanup_started = False
     controller._command_output_chunks = {}
     controller._last_large_diff_signature = None
+    controller._pending_adversary_report = None
+    controller._active_adversary_thread_id = None
+    controller._active_adversary_workspace_root = None
     return controller, store, fake
 
 
@@ -5143,7 +4372,7 @@ def _gate_packet(
     )
 
 
-async def test_completion_return_ignoring_fresh_delta_evidence_reruns_reviewer(tmp_path: Path) -> None:
+async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without_rerun(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             validation_id="validation-old",
@@ -5173,29 +4402,8 @@ async def test_completion_return_ignoring_fresh_delta_evidence_reruns_reviewer(t
         {
             "decision": "return",
             "reason": "old gap still lacks proof",
-            "files_reviewed": [
-                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
-            ],
-            "behavior_evidence_matrix": [
-                {
-                    "behavior": "requested behavior",
-                    "task_basis": "TASK.md",
-                    "files_considered": ["src/app.py"],
-                    "evidence": [
-                        {
-                            "validation_id": "validation-old",
-                            "command": "pytest tests/public",
-                            "sequence": 5,
-                            "validation_type": "behavioral",
-                            "outcome": "pass",
-                            "freshness": "stale",
-                            "why_it_covers_behavior": "old retained public validation",
-                        }
-                    ],
-                    "status": "partial",
-                    "gap": "needs direct behavior evidence",
-                }
-            ],
+            "files_reviewed": [],
+            "behavior_evidence_matrix": [],
             "uncovered_behaviors": [],
             "validation_gaps": ["needs direct behavior evidence"],
             "claim_evidence_mismatches": [],
@@ -5214,189 +4422,12 @@ async def test_completion_return_ignoring_fresh_delta_evidence_reruns_reviewer(t
 
     await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
 
-    assert coder.messages == []
-    assert controller.completion_returns == []
-    assert controller.completion_return_freshness_rerun_count == 1
-    assert "stale return ignored fresh delta evidence" in store.path(PROGRESS).read_text(encoding="utf-8")
-    log = store.path(LOG).read_text(encoding="utf-8")
-    assert "completion_return_freshness_failure" in log
-    assert "validation-demo" in log
-
-
-async def test_completion_return_freshness_rerun_prompt_binds_fresh_evidence_to_prior_gaps(tmp_path: Path) -> None:
-    controller, store, fake = _runtime_controller(tmp_path)
-    controller.coder = _GateFakeCoder()
-    controller.validations = [
-        ValidationRun(
-            validation_id="validation-old",
-            command="pytest tests/public",
-            exit_code=0,
-            passed=True,
-            summary="old public pass",
-            sequence=5,
-        ),
-        ValidationRun(
-            validation_id="validation-demo",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario missing-key",
-            exit_code=0,
-            type="behavior_demo",
-            passed=True,
-            trusted_validation_outcome="passed",
-            summary="fallback=default",
-            captured_output="fallback=default\n",
-            sequence=15,
-        ),
-    ]
-    controller.completion_returns = [
-        CompletionReturnRecord(
-            reason="missing-key fallback lacks direct proof",
-            validation_gaps=["missing-key fallback behavior_demo required"],
-            message_to_coder="provide missing-key fallback demo",
-            sequence=10,
-            generation=0,
-        )
-    ]
-    packet = _gate_packet(tmp_path / "TASK.md", validations=controller.validations, wake_sequence=20)
-    packet.completion_payload_mode = "delta"
-    packet.completion_payload_since_sequence = 10
-    decision = CompletionReviewDecision.model_validate(
-        {
-            "decision": "return",
-            "reason": "missing-key fallback still lacks direct proof",
-            "files_reviewed": [
-                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
-            ],
-            "behavior_evidence_matrix": [
-                {
-                    "behavior": "missing-key fallback",
-                    "task_basis": "TASK.md",
-                    "files_considered": ["src/app.py"],
-                    "evidence": [
-                        {
-                            "validation_id": "validation-old",
-                            "command": "pytest tests/public",
-                            "sequence": 5,
-                            "validation_type": "behavioral",
-                            "outcome": "pass",
-                            "freshness": "stale",
-                            "why_it_covers_behavior": "old public validation",
-                        }
-                    ],
-                    "status": "partial",
-                    "gap": "needs direct behavior evidence",
-                }
-            ],
-            "uncovered_behaviors": [],
-            "validation_gaps": ["needs direct behavior evidence"],
-            "claim_evidence_mismatches": [],
-            "packet_or_access_limitations": [],
-            "changed_test_risks": [],
-            "message_to_coder": "provide direct behavior evidence",
-            "persistent_decision": None,
-            "progress_update": None,
-            "clear_handoff": False,
-            "display_message": None,
-            "handoff": None,
-            "wake_sequence": 20,
-            "generation": 0,
-        }
-    )
-
-    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
-    assert controller._supervisor_task is not None
-    await controller._supervisor_task
-
-    rerun_packet = fake.completion_packets[0]
-    assert "validation-demo" in rerun_packet.current_summary
-    assert "fallback=default" in rerun_packet.current_summary
-    assert "missing-key fallback behavior_demo required" in rerun_packet.current_summary
-    assert "Do not repeat a prior return finding" in rerun_packet.current_summary
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-
-
-async def test_repeated_stale_completion_return_starts_fresh_full_review(tmp_path: Path) -> None:
-    controller, store, fake = _runtime_controller(tmp_path)
-    controller.coder = _GateFakeCoder()
-    fake.completion_thread_id = "stale-completion-thread"
-    controller.completion_return_freshness_rerun_count = 1
-    controller.completion_review_return_sequence = 10
-    controller.validations = [
-        ValidationRun(
-            validation_id="validation-old",
-            command="pytest tests/public",
-            exit_code=0,
-            passed=True,
-            summary="old public pass",
-            sequence=5,
-        ),
-        ValidationRun(
-            validation_id="validation-demo",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario fixed",
-            exit_code=0,
-            type="behavior_demo",
-            passed=True,
-            trusted_validation_outcome="passed",
-            summary="fixed=1",
-            captured_output="fixed=1\n",
-            sequence=15,
-        ),
-    ]
-    packet = _gate_packet(tmp_path / "TASK.md", validations=controller.validations, wake_sequence=20)
-    packet.completion_payload_mode = "delta"
-    packet.completion_payload_since_sequence = 10
-    decision = CompletionReviewDecision.model_validate(
-        {
-            "decision": "return",
-            "reason": "old fixed gap still lacks proof",
-            "files_reviewed": [
-                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
-            ],
-            "behavior_evidence_matrix": [
-                {
-                    "behavior": "fixed behavior",
-                    "task_basis": "TASK.md",
-                    "files_considered": ["src/app.py"],
-                    "evidence": [
-                        {
-                            "validation_id": "validation-old",
-                            "command": "pytest tests/public",
-                            "sequence": 5,
-                            "validation_type": "behavioral",
-                            "outcome": "pass",
-                            "freshness": "stale",
-                            "why_it_covers_behavior": "old public validation",
-                        }
-                    ],
-                    "status": "partial",
-                    "gap": "needs direct behavior evidence",
-                }
-            ],
-            "uncovered_behaviors": [],
-            "validation_gaps": ["needs direct behavior evidence"],
-            "claim_evidence_mismatches": [],
-            "packet_or_access_limitations": [],
-            "changed_test_risks": [],
-            "message_to_coder": "provide direct behavior evidence",
-            "persistent_decision": None,
-            "progress_update": None,
-            "clear_handoff": False,
-            "display_message": None,
-            "handoff": None,
-            "wake_sequence": 20,
-            "generation": 0,
-        }
-    )
-
-    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
-    assert controller._supervisor_task is not None
-    await controller._supervisor_task
-
-    assert fake.closed_completion_reviews == 1
-    assert fake.completion_packets[0].completion_payload_mode == "full"
-    assert fake.completion_packets[0].completion_payload_since_sequence is None
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
-    progress = store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "starting fresh completion_review" in progress
+    assert coder.messages == ["provide direct behavior evidence"]
+    assert len(controller.completion_returns) == 1
+    assert controller.completion_decision_staleness_rerun_count == 0
+    assert getattr(controller, "completion_return_freshness_rerun_count", 0) == 0
+    assert "stale return ignored fresh delta evidence" not in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "completion_return_freshness_failure" not in store.path(LOG).read_text(encoding="utf-8")
 
 
 class _FakeTUI:

@@ -28,15 +28,21 @@ from supervisor.task_select import TaskSelectionError
     is_flag=True,
     help="Delete everything in the current folder except the selected task file before starting.",
 )
+@click.option(
+    "--adversary",
+    is_flag=True,
+    help="Run the adversarial tester before final completion.",
+)
 def cli(
     task_path: Path | None,
     model: str | None,
     start_over: bool,
     protected_paths: tuple[Path, ...],
     clean: bool,
+    adversary: bool,
 ) -> None:
     try:
-        _run_async_cleanly(_run_sentinel(task_path, model, start_over, protected_paths, clean))
+        _run_async_cleanly(_run_sentinel(task_path, model, start_over, protected_paths, clean, adversary))
     except TaskSelectionError as exc:
         raise click.ClickException(str(exc)) from exc
     except RuntimeError as exc:
@@ -70,6 +76,7 @@ async def _run_sentinel(
     start_over: bool,
     protected_paths: tuple[Path, ...],
     clean: bool,
+    adversary: bool,
 ) -> int:
     controller = SentinelController(
         Path.cwd(),
@@ -78,6 +85,7 @@ async def _run_sentinel(
         overwrite_state=start_over,
         declared_grading_roots=protected_paths,
         clean_workspace=clean,
+        adversary_enabled=True if adversary else None,
     )
     await controller.run()
     status = controller.store.get_sentinel_config().status
