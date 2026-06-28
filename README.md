@@ -46,13 +46,13 @@ safety or guaranteed correctness.
 From a project directory:
 
 ```bash
-supervisor --task TASK.md
+sentinel --task TASK.md
 ```
 
 or:
 
 ```bash
-supervisor
+sentinel
 ```
 
 When `--task` is omitted, Sentinel scans for markdown task files and shows a
@@ -179,7 +179,7 @@ file at runtime before building coder and supervisor turns.
 For local experiments, point Sentinel at another prompt file:
 
 ```bash
-SENTINEL_PROMPTS_FILE=/path/to/prompts.toml supervisor --task TASK.md
+SENTINEL_PROMPTS_FILE=/path/to/prompts.toml sentinel --task TASK.md
 ```
 
 ## Approvals
@@ -342,7 +342,7 @@ EOF
 Run:
 
 ```bash
-/path/to/superviser/.venv/bin/supervisor --task TASK.md --start-over
+/path/to/Sentinel/.venv/bin/sentinel --task TASK.md --start-over
 ```
 
 Afterwards inspect:
@@ -359,7 +359,7 @@ To test markdown selection, create a second `.md` file and run without
 
 ```bash
 echo '# Other task' > NOTES.md
-/path/to/superviser/.venv/bin/supervisor --start-over
+/path/to/Sentinel/.venv/bin/sentinel --start-over
 ```
 
 ## Current Status

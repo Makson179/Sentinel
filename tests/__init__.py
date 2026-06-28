@@ -1,2 +1,1 @@
-"""Test package for supervisor-agent."""
-
+"""Test package for Sentinel."""

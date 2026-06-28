@@ -350,12 +350,12 @@ async def test_deterministic_allow_bypasses_cheap_and_full_review(tmp_path: Path
 async def test_deterministic_denial_bypasses_and_cannot_be_overridden_by_cheap_review(tmp_path: Path) -> None:
     cheap = FakeCheapReviewer()
     full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "supervisor --task TASK.md")
+    ctx = command_context(tmp_path, "sentinel --task TASK.md")
 
     decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
-    assert "supervisor" in decision.reason
+    assert "Sentinel" in decision.reason
     assert cheap.calls == 0
     assert full.calls == 0
 

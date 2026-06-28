@@ -12,7 +12,7 @@ from supervisor.schemas import SentinelStatus
 from supervisor.task_select import TaskSelectionError
 
 
-@click.command()
+@click.command(name="sentinel")
 @click.option("--task", "task_path", type=click.Path(exists=False, dir_okay=False, path_type=Path))
 @click.option("--model", default=None, help="Model to use for coder and supervisor turns.")
 @click.option("--start-over", is_flag=True, help="Reinitialize .supervisor state files.")
