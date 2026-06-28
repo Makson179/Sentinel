@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 
 import click
@@ -7,7 +8,7 @@ from click.testing import CliRunner
 import pytest
 
 from supervisor import update_check
-from supervisor.main import _format_version_report, _startup_update_gate, cli
+from supervisor.main import _format_version_report, _startup_update_gate, _update_and_reexec, cli
 
 
 FULL_A = "a" * 40
@@ -78,6 +79,31 @@ def test_startup_gate_continues_on_interactive_continue(monkeypatch: pytest.Monk
     _startup_update_gate()
 
 
+def test_startup_gate_accepts_case_and_retries_invalid_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    responses = iter(["x", " C\r"])
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
+    monkeypatch.setattr("builtins.input", lambda prompt: next(responses))
+
+    _startup_update_gate()
+
+    assert "Please choose u, c, or q." in capsys.readouterr().out
+
+
+def test_startup_gate_quit_exits_without_running_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
+    monkeypatch.setattr("builtins.input", lambda prompt: "q")
+
+    with pytest.raises(click.exceptions.Exit) as exc_info:
+        _startup_update_gate()
+
+    assert exc_info.value.exit_code == 0
+
+
 def test_startup_gate_update_choice_updates_and_reexecs(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[object] = []
     monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
@@ -96,6 +122,34 @@ def test_startup_gate_update_choice_updates_and_reexecs(monkeypatch: pytest.Monk
 
     assert calls[0] == _info()
     assert isinstance(calls[1], tuple)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sentinel", "--task", "TASK.md"],
+        ["/Users/alex/.local/bin/sentinel", "--task", "TASK.md"],
+        [r"C:\Users\alex\.local\bin\sentinel.exe", "--task", "TASK.md"],
+    ],
+)
+def test_update_reexec_preserves_original_launcher_and_task_args(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(update_check, "run_update", lambda info: calls.append(info))
+    monkeypatch.setattr("supervisor.main.sys.argv", argv)
+
+    def fake_execvp(program: str, args: list[str]) -> None:
+        calls.append((program, args))
+        raise RuntimeError("reexec requested")
+
+    monkeypatch.setattr("supervisor.main.os.execvp", fake_execvp)
+
+    with pytest.raises(RuntimeError, match="reexec requested"):
+        _update_and_reexec(_status(update_check.UpdateState.OUTDATED, FULL_B))
+
+    assert calls == [_info(), (argv[0], argv)]
 
 
 def test_startup_gate_skip_env_bypasses_check(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,3 +198,38 @@ def test_version_option_bypasses_startup_gate(monkeypatch: pytest.MonkeyPatch) -
 
     assert result.exit_code == 0
     assert "Sentinel 0.1.0" in result.output
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "darwin", "win32"])
+def test_cli_update_continue_runs_original_task_on_supported_platforms(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    platform_name: str,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr("supervisor.main.sys.platform", platform_name)
+    monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
+    monkeypatch.setattr("builtins.input", lambda prompt: "c")
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+
+    async def fake_run_sentinel(task_path, model, start_over, protected_paths, clean, adversary):
+        calls.append((task_path, model, start_over, protected_paths, clean, adversary))
+        return 0
+
+    def fake_run_async_cleanly(coro):
+        assert asyncio.run(coro) == 0
+        calls.append(("runtime-started",))
+
+    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
+
+    result = cli.main(
+        args=["--task", str(task), "--start-over"],
+        prog_name="sentinel",
+        standalone_mode=False,
+    )
+
+    assert result is None
+    assert calls == [(task, None, True, (), False, False), ("runtime-started",)]
