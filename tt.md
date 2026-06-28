@@ -1,148 +1,30 @@
-# Sentinel Install And Use Quick Start
+# Sentinel Command Order
 
-Sentinel is installed and run as the `sentinel` command. It supervises Codex
-through `codex app-server`, so Codex must be installed and logged in before the
-first Sentinel run.
+Rule: write command parts in the same order as this file. If item A should be
+before item B in a command, item A has a smaller line number here.
 
-## Requirements
+`pipx install "git+https://github.com/Makson179/Sentinel.git"` - install Sentinel from the default GitHub branch.
+`SENTINEL_SKIP_UPDATE_CHECK=1` - skip the startup update check for one command.
+`sentinel` - main command; run it from the project directory.
+`doctor` - check Python, Git, Codex, auth, app-server support, install metadata, and update status.
+`update` - update Sentinel, then use the updated install for future runs.
+`--version` - print Sentinel version, installed commit, and update status.
+`-V` - short form of `--version`.
+`--help` - show command help.
+`-h` - short form of `--help`.
+`--task TASK.md` - choose the markdown task file explicitly.
+`--model MODEL` - choose the Codex model for the run.
+`--start-over` - reset `.supervisor` state and start fresh.
+`--clean` - delete workspace files except the selected task file before starting; use only in disposable folders.
+`--adversary` - run the adversarial tester before final completion.
+`--protected-path PATH` - mark a hidden or grading path as protected; repeat this option for multiple paths.
 
-Install these first:
-
-- Python 3.11 or newer.
-- Git.
-- pipx.
-- Codex CLI on `PATH`.
-- A logged-in Codex account.
-
-Check the tools:
-
-```bash
-python3 --version
-git --version
-pipx --version
-codex --version
-```
-
-Log in to Codex if needed:
+Examples:
 
 ```bash
-codex login
-```
-
-## Install Sentinel With pipx
-
-Install Sentinel from the default GitHub branch:
-
-```bash
-pipx install "git+https://github.com/Makson179/Sentinel.git"
-```
-
-Verify the install:
-
-```bash
-sentinel --version
 sentinel doctor
-sentinel --help
-```
-
-`sentinel doctor` should find Python, Git, Codex, Codex app-server support,
-Sentinel metadata, and the `sentinel` executable. If it reports a Codex auth
-problem, run `codex login` and try again.
-
-## Update Sentinel
-
-For normal task runs, Sentinel checks whether the installed Git commit is up to
-date. If a newer commit is available, it prompts:
-
-```text
-[u] update now and rerun this command
-[c] continue with the installed version
-[q] quit
-```
-
-You can also update manually:
-
-```bash
+sentinel --version
 sentinel update
-```
-
-If you need to bypass the startup update check once:
-
-```bash
+sentinel --task TASK.md --model gpt-5 --start-over
 SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
-```
-
-## Run Sentinel On A Task
-
-Go to the project Sentinel should work on:
-
-```bash
-cd /path/to/your/project
-```
-
-Create or choose a markdown task file, for example `TASK.md`:
-
-```bash
-cat > TASK.md <<'EOF'
-Create hello.py that prints "hello from sentinel".
-Run python3 hello.py to validate it.
-EOF
-```
-
-Start Sentinel:
-
-```bash
-sentinel --task TASK.md
-```
-
-Start over from fresh `.supervisor` state:
-
-```bash
-sentinel --task TASK.md --start-over
-```
-
-Use a specific model:
-
-```bash
-sentinel --task TASK.md --model gpt-5
-```
-
-If you omit `--task`, Sentinel scans for markdown task files:
-
-```bash
-sentinel
-```
-
-## Install From Source For Development
-
-Clone the repository:
-
-```bash
-git clone https://github.com/Makson179/Sentinel.git
-cd Sentinel
-```
-
-Create a virtual environment and install:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e '.[test]'
-```
-
-Run the local command:
-
-```bash
-.venv/bin/sentinel --help
-```
-
-On Windows PowerShell:
-
-```powershell
-.venv\Scripts\sentinel.exe --help
-```
-
-Run the test suite from the repository:
-
-```bash
-.venv/bin/python -m pytest -q
 ```
