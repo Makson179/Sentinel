@@ -51,18 +51,18 @@ Install the latest Git version into an isolated pipx environment:
 pipx install "git+https://github.com/Makson179/Sentinel.git"
 ```
 
-Verify the installed command:
+Verify the installed command and local prerequisites:
 
 ```bash
+sentinel doctor
+sentinel --version
 sentinel --help
 ```
 
-If you previously installed an older build that exposed a `supervisor` command,
-remove that old pipx environment once, then install the current package:
+To refresh an existing pipx install from the same Git ref:
 
 ```bash
-pipx uninstall supervisor-agent
-pipx install "git+https://github.com/Makson179/Sentinel.git"
+pipx install --force "git+https://github.com/Makson179/Sentinel.git"
 ```
 
 ## Install Sentinel From Source
@@ -170,6 +170,21 @@ sentinel --task TASK.md
 
 Sentinel will run startup preflight checks, start the Codex app-server, create a
 coder thread, and begin supervising the run.
+
+For normal runs, Sentinel first checks the installed Git commit against the
+latest commit on the install source/ref. If an update is available, an
+interactive terminal can update and rerun the original command:
+
+```bash
+sentinel update
+```
+
+Non-interactive runs do not hang at the update prompt. To skip only this
+startup update gate in an emergency:
+
+```bash
+SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
+```
 
 If you omit `--task`, Sentinel scans for markdown files and opens a selector
 when there is more than one candidate:

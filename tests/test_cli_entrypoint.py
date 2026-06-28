@@ -39,6 +39,8 @@ def test_cli_help_uses_sentinel_command_name() -> None:
 
     assert result.exit_code == 0
     assert "Usage: sentinel [OPTIONS]" in result.output
+    assert "doctor" in result.output
+    assert "update" in result.output
 
 
 def test_runner_default_cli_paths_are_platform_specific(monkeypatch, tmp_path: Path) -> None:
