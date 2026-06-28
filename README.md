@@ -26,6 +26,8 @@ should not reach the human during a run.
 
 ## Why Not Just Give Codex Full Permissions?
 
+
+
 Full permissions are fast, but they also mean the same agent decides and
 executes everything.
 
