@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from supervisor.approval_triage import CheapApprovalReviewer, cheap_approval_triage_config_from_env
+from supervisor.approval_triage import (
+    DEFAULT_TRIAGE_MODEL,
+    CheapApprovalReviewer,
+    cheap_approval_triage_config_from_env,
+)
 from supervisor.appserver import AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.schemas import ApprovalDecisionKind, CheapApprovalDecision, SupervisorDecision, SupervisorDecisionKind
@@ -16,16 +20,26 @@ def message(method: str, request_id: int, params: dict) -> AppServerMessage:
     return AppServerMessage({"id": request_id, "method": method, "params": params})
 
 
-def test_cheap_approval_triage_config_requires_separate_model(monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_APPROVAL_TRIAGE_ENABLED", "true")
+def test_cheap_approval_triage_config_defaults_disabled_with_default_model(monkeypatch) -> None:
+    # Cheap approval stays opt-in; deterministic gates cover the obvious cases.
+    monkeypatch.delenv("SENTINEL_APPROVAL_TRIAGE_ENABLED", raising=False)
     monkeypatch.delenv("SENTINEL_APPROVAL_TRIAGE_MODEL", raising=False)
     monkeypatch.setenv("SENTINEL_APPROVAL_TRIAGE_TIMEOUT", "3.5")
 
     config = cheap_approval_triage_config_from_env()
 
-    assert config.enabled is True
-    assert config.model is None
+    assert config.enabled is False
+    assert config.model == DEFAULT_TRIAGE_MODEL
     assert config.timeout_seconds == 3.5
+
+
+def test_cheap_approval_triage_can_be_enabled_by_env(monkeypatch) -> None:
+    monkeypatch.setenv("SENTINEL_APPROVAL_TRIAGE_ENABLED", "true")
+    monkeypatch.delenv("SENTINEL_APPROVAL_TRIAGE_MODEL", raising=False)
+
+    config = cheap_approval_triage_config_from_env()
+
+    assert config.enabled is True
 
 
 def test_cheap_approval_reviewer_uses_configured_model(tmp_path: Path) -> None:
@@ -346,6 +360,58 @@ async def test_deterministic_allow_bypasses_cheap_and_full_review(tmp_path: Path
     assert full.calls == 0
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/bash -lc 'make -j4'",
+        "/bin/bash -lc ./run_visible_tests.sh",
+        "{workspace}/.venv/bin/python3 -m pytest tests/public/test_public.py::test_public -v --tb=short",
+        "/bin/bash -lc './c_compiler /tmp/input.c -o /tmp/out'",
+        "rm -rf tests/__pycache__",
+    ],
+)
+@pytest.mark.asyncio
+async def test_task_validation_commands_bypass_cheap_and_full_review(tmp_path: Path, command: str) -> None:
+    cheap = FakeCheapReviewer()
+    full = FakeFullSupervisor()
+    ctx = command_context(tmp_path, command.format(workspace=tmp_path))
+
+    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert cheap.calls == 0
+    assert full.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_shell_heredoc_task_command_still_uses_full_supervisor(tmp_path: Path) -> None:
+    cheap = FakeCheapReviewer()
+    full = FakeFullSupervisor()
+    ctx = command_context(
+        tmp_path,
+        "bash -lc 'cat > /tmp/input.c <<EOF\nint main(void){return 0;}\nEOF'",
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert cheap.calls == 0
+    assert full.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_private_c_compiler_input_still_uses_full_supervisor(tmp_path: Path) -> None:
+    cheap = FakeCheapReviewer()
+    full = FakeFullSupervisor()
+    ctx = command_context(tmp_path, "./c_compiler /tmp/private/input.c -o /tmp/out")
+
+    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert cheap.calls == 0
+    assert full.calls == 1
+
+
 @pytest.mark.asyncio
 async def test_deterministic_denial_bypasses_and_cannot_be_overridden_by_cheap_review(tmp_path: Path) -> None:
     cheap = FakeCheapReviewer()
@@ -371,11 +437,44 @@ async def test_eligible_command_can_be_plain_accepted_by_cheap_review(tmp_path: 
     decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
 
     assert decision.decision == "accept"
-    assert decision.reason == "bounded read-only command approved by cheap review"
+    assert decision.reason == "low-impact command approved by cheap review (bounded_read_only)"
     assert decision.persistent_decision is None
     assert decision.from_supervisor is False
     assert cheap.calls == 1
     assert full.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_local_write_is_eligible_for_cheap_approval(tmp_path: Path) -> None:
+    # Expanded eligibility: a bounded in-workspace write (not read-only) may be cheap-approved.
+    cheap = FakeCheapReviewer(
+        CheapApprovalDecision(decision="approve_low_impact", reason_code="workspace_local_safe")
+    )
+    full = FakeFullSupervisor()
+    ctx = command_context(tmp_path, "mkdir build")
+
+    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert decision.reason == "low-impact command approved by cheap review (workspace_local_safe)"
+    assert decision.from_supervisor is False
+    assert cheap.calls == 1
+    assert full.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_escaping_write_bypasses_cheap_review(tmp_path: Path) -> None:
+    # A write that leaves the workspace stays hard-blocked from cheap review (integrity/safety).
+    cheap = FakeCheapReviewer(
+        CheapApprovalDecision(decision="approve_low_impact", reason_code="workspace_local_safe")
+    )
+    full = FakeFullSupervisor()
+    ctx = command_context(tmp_path, "cp parser.c /tmp/leak.c")
+
+    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+
+    assert cheap.calls == 0
+    assert full.calls == 1
 
 
 @pytest.mark.asyncio
@@ -558,3 +657,56 @@ async def test_non_command_request_boundaries_never_use_cheap_review(tmp_path: P
     await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
 
     assert cheap.calls == 0
+
+
+def test_runtime_triage_config_defaults_enabled_with_default_model(monkeypatch) -> None:
+    from supervisor.approval_triage import DEFAULT_TRIAGE_MODEL, runtime_triage_config_from_env
+
+    monkeypatch.delenv("SENTINEL_RUNTIME_TRIAGE_ENABLED", raising=False)
+    monkeypatch.delenv("SENTINEL_RUNTIME_TRIAGE_MODEL", raising=False)
+    config = runtime_triage_config_from_env()
+    assert config.enabled is True
+    assert config.model == DEFAULT_TRIAGE_MODEL
+
+
+def test_runtime_triage_config_can_be_disabled(monkeypatch) -> None:
+    from supervisor.approval_triage import runtime_triage_config_from_env
+
+    monkeypatch.setenv("SENTINEL_RUNTIME_TRIAGE_ENABLED", "false")
+    assert runtime_triage_config_from_env().enabled is False
+
+
+def test_cheap_runtime_decision_validator() -> None:
+    from supervisor.schemas import CheapRuntimeDecision
+
+    assert CheapRuntimeDecision(decision="noop", reason_code="routine_progress").decision == "noop"
+    assert CheapRuntimeDecision(decision="escalate", reason_code="drift_or_risk").decision == "escalate"
+    with pytest.raises(Exception):
+        CheapRuntimeDecision(decision="noop", reason_code="drift_or_risk")  # noop needs benign code
+    with pytest.raises(Exception):
+        CheapRuntimeDecision(decision="escalate", reason_code="routine_progress")
+
+
+def test_cheap_runtime_packet_is_slim(tmp_path: Path) -> None:
+    import json
+
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.prompts import build_cheap_runtime_prompt
+    from supervisor.schemas import SupervisorWakePacket
+
+    pkt = SupervisorWakePacket(
+        wake_sequence=5,
+        latest_event_sequence=4,
+        generation=1,
+        restart_count=0,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="X" * 50000,  # large; must NOT be inlined into the cheap packet
+        current_summary="Runtime trigger (large_diff): coder edited codegen.c",
+    )
+    slim = cheap_runtime_packet(pkt)
+    assert "wake_reason" in slim
+    assert "task_contents" not in slim  # heavy field excluded
+    prompt = build_cheap_runtime_prompt(slim)
+    assert "X" * 1000 not in prompt  # task body not present
+    assert len(prompt) < 8000  # genuinely slim
+    assert json.loads(prompt)["instructions"]  # carries the classifier instructions

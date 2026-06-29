@@ -724,6 +724,7 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
     controller.prior_interventions = []
     controller.observed_changed_files = {}
     controller.use_git_diff = False
+    controller.adversary_enabled = False
     controller.tui = _FakeTUI()
     controller.running = True
     controller.event_queue = asyncio.Queue()
@@ -774,6 +775,7 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     controller.prior_interventions = []
     controller.observed_changed_files = {}
     controller.use_git_diff = False
+    controller.adversary_enabled = False
     controller.tui = _FakeTUI()
     controller.running = True
     controller.event_queue = asyncio.Queue()
@@ -830,6 +832,7 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
     controller.prior_interventions = []
     controller.observed_changed_files = {}
     controller.use_git_diff = False
+    controller.adversary_enabled = False
     controller.tui = _FakeTUI()
     controller.running = True
     controller.client = None
@@ -948,7 +951,7 @@ async def test_runtime_nonzero_action_wakes_supervisor(tmp_path: Path) -> None:
 
 async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    store.patch_health(lambda health: health.model_copy(update={"restart_count": 3}))
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 100}))
 
     await controller.handle_notification(
         AppServerMessage(
@@ -1023,9 +1026,128 @@ def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(t
     assert changed_signature.reasons == ("large_diff",)
 
 
+def test_file_change_large_diff_noops_without_runtime_model(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="fileChange",
+            paths=["src/app.py"],
+            status="completed",
+            summary="file change completed: src/app.py",
+        ),
+        validation=None,
+        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
+    )
+
+    assert decision.should_wake is False
+    assert decision.reasons == ()
+
+
+def test_safe_task_validation_large_diff_noops_without_runtime_model(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="commandExecution",
+            command="/bin/bash -lc 'make -j4'",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        validation=None,
+        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
+    )
+
+    assert decision.should_wake is False
+    assert decision.reasons == ()
+
+
+def test_safe_task_validation_nonzero_noops_without_protected_reason(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    action = TriggeringAction(
+        kind="commandExecution",
+        command="pytest tests/public/test_public.py",
+        exit_code=1,
+        status="completed",
+        summary="command completed",
+    )
+
+    decision = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=ValidationRun(
+            command=action.command or "",
+            exit_code=1,
+            type="behavioral",
+            passed=False,
+            summary="1 failed",
+            trusted_validation_outcome="failed",
+            sequence=3,
+        ),
+        changed_files=[],
+    )
+
+    assert decision.should_wake is False
+    assert decision.reasons == ()
+
+
+def test_protected_runtime_reason_overrides_safe_task_validation_noop(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="commandExecution",
+            command="pytest tests/public/test_public.py",
+            exit_code=1,
+            status="completed",
+            summary="command completed",
+        ),
+        validation=None,
+        changed_files=[],
+        validation_trigger_reasons=("repeated_same_failing_validation",),
+    )
+
+    assert decision.should_wake is True
+    assert decision.reasons == ("repeated_same_failing_validation", "nonzero_exit")
+
+
+def test_unresolved_masked_validation_blocks_safe_task_validation_noop(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    controller.validation_runtime_state = {
+        "validation-old": {
+            "trusted_validation_outcome": "masked_or_unknown",
+            "consecutive_failed_count": 0,
+            "sequence": 2,
+        }
+    }
+
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="commandExecution",
+            command="./run_visible_tests.sh",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        validation=ValidationRun(
+            command="./run_visible_tests.sh",
+            exit_code=0,
+            type="behavioral",
+            passed=True,
+            summary="45 passed",
+            trusted_validation_outcome="passed",
+            sequence=4,
+        ),
+        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=3)],
+    )
+
+    assert decision.should_wake is True
+    assert decision.reasons == ("large_diff",)
+
+
 def test_read_only_action_does_not_wake_only_for_restart_budget(tmp_path: Path) -> None:
     controller, store, _fake = _runtime_controller(tmp_path)
-    store.patch_health(lambda health: health.model_copy(update={"restart_count": 3}))
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 100}))
 
     decision = controller.should_wake_runtime_supervisor(
         action=TriggeringAction(
@@ -2206,6 +2328,15 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     controller.completion_reviewer_rerun_count = 0
     controller.no_marker_idle_nudge_count = 0
 
+    class _CloseTrackingSupervisor:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close_completion_review(self) -> None:
+            self.closed += 1
+
+    controller.supervisor = _CloseTrackingSupervisor()
+
     await controller.apply_completion_decision(
         CompletionReviewDecision(
             decision="return",
@@ -2229,6 +2360,9 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     assert len(controller.completion_returns) == 1
     assert store.get_health().interventions == 0
     assert "Completion review returned missing fallback coverage" in store.path("PROGRESS.md").read_text(encoding="utf-8")
+    # Fresh completion-review thread per review: a normal return closes the session so the
+    # next readiness review starts a new thread instead of accumulating prior turns.
+    assert controller.supervisor.closed == 1
 
 
 async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validation(tmp_path: Path) -> None:
@@ -2315,7 +2449,10 @@ async def test_completion_accept_gate_allows_changed_test_without_independent_ev
     assert store.get_sentinel_config().accept_gate_accepts == 1
 
 
-async def test_adversary_enabled_runs_before_completion_finalize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_adversary_remaining_limit_runs_before_completion_finalize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -2328,7 +2465,7 @@ async def test_adversary_enabled_runs_before_completion_finalize(tmp_path: Path,
         )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    controller.adversary_enabled = True
+    controller.adversary_enabled = None
     controller.client = object()
     controller.model = None
     controller.running = False
@@ -2383,11 +2520,54 @@ async def test_adversary_enabled_runs_before_completion_finalize(tmp_path: Path,
     assert controller._pending_adversary_report.candidate_finding is False
     assert controller._pending_adversary_report.latest_relevant_change_sequence == 2
     assert controller._pending_adversary_report.workspace_state_id is not None
+    assert store.get_sentinel_config().adversary_run_count == 1
     assert coder.messages == []
     assert seen_snapshot_roots and not seen_snapshot_roots[0].exists()
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Adversarial tester completed" in progress
     assert "without a candidate finding" in progress
+
+
+async def test_adversary_run_limit_skips_additional_run_and_finalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller.adversary_enabled = True
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(update={"max_adversary_runs": 1, "adversary_run_count": 1})
+    )
+
+    class UnexpectedAdversary:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("adversary should not run after limit is reached")
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", UnexpectedAdversary)
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_sentinel_config().adversary_run_count == 1
+    assert coder.messages == []
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Skipping adversarial tester before complete: adversary run limit reached (1/1)" in progress
+    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    assert any(event["event_type"] == "adversary/limit_reached" for event in events)
 
 
 async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path) -> None:
@@ -2484,6 +2664,7 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     assert fake.completion_packets
     assert fake.completion_packets[0].adversary_report is not None
     assert fake.completion_packets[0].adversary_report.candidate_finding is True
+    assert store.get_sentinel_config().adversary_run_count == 1
     assert "Adversarial tester report:" in coder.messages[0]
 
 
@@ -2507,6 +2688,9 @@ async def test_adversary_receives_previous_report_as_regression_context(
     controller.client = object()
     controller.model = None
     controller.running = False
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "adversary_run_count": 1})
+    )
     controller._pending_adversary_report = AdversaryReport(
         candidate_finding=True,
         report_text="attacked: previous edge\nfindings: previous crash\noverall: broke",
@@ -2549,6 +2733,7 @@ async def test_adversary_receives_previous_report_as_regression_context(
 
     assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
     assert controller._accepted_adversary_report.thread_id == "new-adv-thread"
+    assert store.get_sentinel_config().adversary_run_count == 2
     assert coder.messages == []
 
 
@@ -3145,8 +3330,9 @@ async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: 
     assert supervisor.calls == 2
     assert store.get_sentinel_config().status == SentinelStatus.STARTING
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
-    assert controller.provider_failure_recovery_counts["no_message"] == 1
-    assert controller.provider_failure_recovery_counts["runtime_monitor_no_message"] == 1
+    # After a successful recovery the consecutive no_message budget resets, so a recovered
+    # provider does not carry earlier blips toward infra-invalid.
+    assert controller.provider_failure_recovery_counts == {}
     assert "supervisor produced no agent message" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
@@ -3202,6 +3388,10 @@ async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failu
 
     supervisor = AlwaysNoMessageSupervisor(store, controller.task_path)
     controller.supervisor = supervisor
+    # Pin the configurable completion no_message budget low and disable backoff so the test
+    # reaches the infra-invalid path fast (default budget rides out a transient blip).
+    controller._completion_no_message_max_retries = 1
+    controller._no_message_backoff_seconds = ()
 
     await controller._supervisor_check_loop("completion check", None, None, None, None, True)
 
@@ -3211,6 +3401,38 @@ async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failu
     assert "infra-invalid: supervisor no_message provider failure after retry/resume" in report
     assert "- Status: provider_failure" in report
     assert "repeated supervisor no_message" in store.path(PROGRESS).read_text(encoding="utf-8")
+
+
+async def test_completion_no_message_budget_rides_out_blip_before_infra_invalid(tmp_path: Path) -> None:
+    # A transient provider blip (empty completions) must be ridden out with backed-off retries
+    # up to the configurable budget; infra-invalid only fires after the full budget is spent.
+    controller, store, _ = _runtime_controller(tmp_path)
+
+    class AlwaysNoMessageSupervisor:
+        def __init__(self, store: StateStore, task: Path) -> None:
+            self.agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+            self.calls = 0
+
+        def build_packet(self, **kwargs):
+            return self.agent.build_packet(**kwargs)
+
+        async def decide_completion(self, packet):
+            self.calls += 1
+            raise SupervisorAgentError("supervisor did not produce an agent message")
+
+        async def close_completion_review(self):
+            return None
+
+    supervisor = AlwaysNoMessageSupervisor(store, controller.task_path)
+    controller.supervisor = supervisor
+    controller._completion_no_message_max_retries = 3
+    controller._no_message_backoff_seconds = ()  # no real sleeping in the test
+
+    await controller._supervisor_check_loop("completion check", None, None, None, None, True)
+
+    # 3 retries then the infra-invalid attempt = 4 model calls (old behavior gave up after 1 retry).
+    assert supervisor.calls == 4
+    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
 
 
 async def test_preflight_appserver_timeout_writes_provider_failure_final_report(tmp_path: Path, monkeypatch) -> None:
@@ -4128,6 +4350,7 @@ def _completion_gate_controller(
     controller.prior_interventions = []
     controller.observed_changed_files = {}
     controller.use_git_diff = False
+    controller.adversary_enabled = False
     controller.tui = _FakeTUI()
     controller.running = True
     controller.paused = False

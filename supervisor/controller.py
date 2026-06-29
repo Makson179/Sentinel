@@ -19,13 +19,18 @@ from supervisor.approval_triage import (
     CheapApprovalReviewer,
     CheapApprovalReviewerError,
     CheapApprovalTriageConfig,
+    CheapRuntimeReviewer,
+    CheapRuntimeReviewerError,
+    CheapRuntimeTriageConfig,
     cheap_approval_triage_config_from_env,
+    runtime_triage_config_from_env,
 )
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import CODER_SANDBOX_DANGER_FULL_ACCESS, CoderSession, coder_sandbox_mode, coder_thread_params
 from supervisor.health import kill_restart_candidate, patch_health
+from supervisor.policy import deterministic_task_command_reason
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
@@ -35,6 +40,7 @@ from supervisor.schemas import (
     ApprovalWakeContext,
     BreadthRiskSummary,
     CheapApprovalDecision,
+    CheapRuntimeDecision,
     ChangedFile,
     ChangedFileContext,
     ChangedFileDiff,
@@ -84,8 +90,22 @@ ACCEPT_GATE_CODER_CORRECTABLE = "coder-correctable"
 ACCEPT_GATE_AUDIT_FAILURE = "audit-failure"
 LARGE_DIFF_CHANGED_LINES_THRESHOLD = 500
 LARGE_DIFF_CHANGED_FILES_THRESHOLD = 10
+PROTECTED_RUNTIME_WAKE_REASONS = {
+    "done_without_fresh_validation",
+    "masked_validation",
+    "repeated_same_failing_validation",
+    "restart_budget",
+    "suspicious_file_touched",
+    "validation_regression",
+}
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
+# Provider no_message (empty-completion) recovery for the completion review. A transient
+# backend blip can return empty "completed" turns for a couple of minutes; ride it out with
+# backed-off retries before declaring the run infra-invalid. The budget is CONSECUTIVE
+# (reset on any successful supervisor decision), so a recovered provider keeps working.
+COMPLETION_NO_MESSAGE_MAX_RETRIES = 6
+NO_MESSAGE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 120.0, 120.0)
 # Observation-only breadth-risk hints for reviewer context. These terms must
 # never drive an accept gate, mandatory demo, or forced code change; required
 # behavior is derived from task_contents and repository contract instead.
@@ -210,6 +230,8 @@ class SentinelController:
         self.approvals: ApprovalManager | None = None
         self.approval_triage_config: CheapApprovalTriageConfig = cheap_approval_triage_config_from_env()
         self.approval_triage_reviewer: CheapApprovalReviewer | None = None
+        self.runtime_triage_config: CheapRuntimeTriageConfig = runtime_triage_config_from_env()
+        self.runtime_triage_reviewer: CheapRuntimeReviewer | None = None
         self.coder: CoderSession | None = None
         self.pending_approvals: dict[int | str, ApprovalContext] = {}
         self.last_coder_message: CoderMessage | None = None
@@ -330,6 +352,7 @@ class SentinelController:
         self.tui.status("checking supervisor structured output")
         await self._structured_output_self_test()
         await self._configure_approval_triage()
+        await self._configure_runtime_triage()
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
@@ -1140,6 +1163,53 @@ class SentinelController:
         }
         return tuple(dict.fromkeys(reasons))
 
+    def _has_unresolved_runtime_validation_risk(self) -> bool:
+        state = getattr(self, "validation_runtime_state", None) or {}
+        for entry in state.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("trusted_validation_outcome") == "masked_or_unknown":
+                return True
+            try:
+                failed_count = int(entry.get("consecutive_failed_count") or 0)
+            except (TypeError, ValueError):
+                failed_count = 0
+            if failed_count >= 2:
+                return True
+        return False
+
+    def _deterministic_runtime_noop_reason(
+        self,
+        *,
+        action: TriggeringAction,
+        validation: ValidationRun | None,
+        reasons: list[str],
+    ) -> str | None:
+        if not reasons:
+            return None
+        reason_set = set(reasons)
+        if reason_set & PROTECTED_RUNTIME_WAKE_REASONS:
+            return None
+        if self._has_unresolved_runtime_validation_risk():
+            return None
+        if reason_set == {"large_diff"} and _is_file_change_activity(action):
+            return "routine file-change large diff"
+        command = action.command or ""
+        if not command:
+            return None
+        task_command_reason = deterministic_task_command_reason(self.project_root, command, cwd=action.cwd)
+        if task_command_reason is None:
+            return None
+        if reason_set == {"large_diff"} and action.exit_code == 0:
+            return task_command_reason
+        if reason_set <= {"nonzero_exit", "timeout", "large_diff"} and (
+            action.exit_code is None or action.exit_code != 0 or _action_timed_out(action)
+        ):
+            if validation is not None and validation.trusted_validation_outcome == "masked_or_unknown":
+                return None
+            return task_command_reason
+        return None
+
     def _update_relevant_edit_state(self, changed_files: list[ChangedFile]) -> None:
         task_contents = _read_task_text(self.task_path)
         relevant_sequences = [
@@ -1192,6 +1262,12 @@ class SentinelController:
         if restart_candidate and restart_reason and not read_only_action:
             reasons.append("restart_budget")
         reasons = list(dict.fromkeys(reasons))
+        if self._deterministic_runtime_noop_reason(
+            action=action,
+            validation=validation,
+            reasons=reasons,
+        ):
+            return RuntimeTriggerDecision(should_wake=False, reasons=())
         if (
             reasons == ["large_diff"]
             and large_diff_signature is not None
@@ -1426,6 +1502,18 @@ class SentinelController:
                 self.completion_attempt_count = getattr(self, "completion_attempt_count", 0) + 1
                 decision = await self.supervisor.decide_completion(packet)
             else:
+                # Cheap-model triage: let a lightweight model route clear non-events to noop
+                # before paying for the full supervisor. Never short-circuit human messages or
+                # pending approvals (those always need the full supervisor); on any cheap-side
+                # error or escalate, fall through to the full supervisor.
+                if (
+                    getattr(self, "runtime_triage_reviewer", None) is not None
+                    and human_message is None
+                    and not packet.pending_approvals
+                ):
+                    cheap = await self._cheap_runtime_route(packet)
+                    if cheap is not None and cheap.decision == "noop":
+                        return
                 decision = await self.supervisor.decide(packet)
         except SupervisorAgentError as exc:
             failure_kind = _classify_supervisor_agent_error(exc)
@@ -1455,6 +1543,11 @@ class SentinelController:
                 return
             await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
             return
+        # Successful supervisor decision: reset the transient provider no_message budget so it
+        # counts CONSECUTIVE empty-completion failures, not lifetime ones (a recovered provider
+        # should not inherit earlier blips toward an infra-invalid).
+        if getattr(self, "provider_failure_recovery_counts", None):
+            self.provider_failure_recovery_counts = {}
         if completion_review:
             await self.apply_completion_decision(decision, packet_thread_id=packet.coder_thread_id, packet=packet)
         else:
@@ -1486,13 +1579,24 @@ class SentinelController:
                 "message": message,
             }
         )
-        if attempts < 1:
+        budget = (
+            getattr(self, "_completion_no_message_max_retries", COMPLETION_NO_MESSAGE_MAX_RETRIES)
+            if completion_review
+            else 1
+        )
+        if attempts < budget:
             counts[count_key] = attempts + 1
             if completion_review and self.supervisor is not None and hasattr(self.supervisor, "close_completion_review"):
                 await self.supervisor.close_completion_review()
+            backoff = 0.0
+            if completion_review:
+                schedule = getattr(self, "_no_message_backoff_seconds", NO_MESSAGE_RETRY_BACKOFF_SECONDS)
+                if schedule:
+                    backoff = float(schedule[min(attempts, len(schedule) - 1)])
             self.store.append_text_locked(
                 PROGRESS,
-                "- Provider recovery: supervisor produced no agent message; retrying review from latest stable state.\n",
+                f"- Provider recovery: supervisor produced no agent message; retrying review from latest "
+                f"stable state (attempt {attempts + 1}/{budget}, backoff {backoff:.0f}s).\n",
             )
             self._append_event(
                 AppEventSource.SUPERVISOR,
@@ -1500,6 +1604,8 @@ class SentinelController:
                 decision="retry",
                 reason=message,
             )
+            if backoff > 0:
+                await asyncio.sleep(backoff)
             self._supervisor_dirty = True
             self._supervisor_next_summary = (
                 "Retry supervisor review from the latest stable controller state after provider no_message. "
@@ -1639,9 +1745,11 @@ class SentinelController:
                 await self._handle_completion_accept_gate_failure(decision, gate_result)
                 return
             self._record_accept_gate_success(gate_result)
-            if getattr(self, "adversary_enabled", False) and not self._packet_has_fresh_adversary_report(packet):
-                await self._run_adversary_before_complete(decision, packet=packet)
-                return
+            if self._should_run_adversary_before_complete(packet):
+                if packet is None or self._adversary_runs_remaining():
+                    await self._run_adversary_before_complete(decision, packet=packet)
+                    return
+                self._record_adversary_limit_reached(packet)
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
         if decision.progress_update:
@@ -1694,10 +1802,14 @@ class SentinelController:
                 status=SentinelStatus.PROVIDER_FAILURE,
             )
             return
-        self.tui.render("ADVERSARY", "running pre-complete adversarial tester")
+        adversary_run_count, max_adversary_runs = self._reserve_adversary_run()
+        self.tui.render(
+            "ADVERSARY",
+            f"running pre-complete adversarial tester ({adversary_run_count}/{max_adversary_runs})",
+        )
         self.store.append_text_locked(
             PROGRESS,
-            "- Adversarial tester starting before final complete.\n",
+            f"- Adversarial tester starting before final complete ({adversary_run_count}/{max_adversary_runs}).\n",
         )
         workspace_state_id = _workspace_state_id(self.project_root)
         snapshot_root: Path | None = None
@@ -1728,6 +1840,8 @@ class SentinelController:
                     "type": "adversary_error",
                     "generation": packet.generation,
                     "completion_wake_sequence": decision.wake_sequence,
+                    "adversary_run_count": adversary_run_count,
+                    "max_adversary_runs": max_adversary_runs,
                     "error": str(exc),
                 }
             )
@@ -1766,6 +1880,8 @@ class SentinelController:
                 "candidate_finding": report.candidate_finding,
                 "thread_id": report.thread_id,
                 "turn_id": report.turn_id,
+                "adversary_run_count": adversary_run_count,
+                "max_adversary_runs": max_adversary_runs,
                 "report_text": report.report_text,
             }
         )
@@ -1818,6 +1934,50 @@ class SentinelController:
             "Adversarial tester report is available. Rerun completion_review; weigh the report as input, "
             "return only for a real reproduced required-behavior defect, otherwise accept.",
             completion_review=True,
+        )
+
+    def _adversary_runs_remaining(self) -> bool:
+        cfg = self.store.get_sentinel_config()
+        return cfg.adversary_run_count < cfg.max_adversary_runs
+
+    def _should_run_adversary_before_complete(self, packet: SupervisorWakePacket | None) -> bool:
+        if self._packet_has_fresh_adversary_report(packet):
+            return False
+        enabled = getattr(self, "adversary_enabled", None)
+        if enabled is False:
+            return False
+        if enabled is True:
+            return True
+        return self.store.get_sentinel_config().max_adversary_runs > 0
+
+    def _reserve_adversary_run(self) -> tuple[int, int]:
+        updated = self.store.update_sentinel_config(
+            lambda current: current.model_copy(update={"adversary_run_count": current.adversary_run_count + 1})
+        )
+        return updated.adversary_run_count, updated.max_adversary_runs
+
+    def _record_adversary_limit_reached(self, packet: SupervisorWakePacket | None) -> None:
+        cfg = self.store.get_sentinel_config()
+        reason = f"adversary run limit reached ({cfg.adversary_run_count}/{cfg.max_adversary_runs})"
+        self.tui.render("ADVERSARY", f"{reason}; finalizing completion accept")
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Skipping adversarial tester before complete: {reason}.\n",
+        )
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "adversary_limit_reached",
+                "generation": packet.generation if packet is not None else None,
+                "wake_sequence": packet.wake_sequence if packet is not None else None,
+                "adversary_run_count": cfg.adversary_run_count,
+                "max_adversary_runs": cfg.max_adversary_runs,
+            }
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "adversary/limit_reached",
+            reason=reason,
         )
 
     def _fresh_adversary_report(
@@ -2372,6 +2532,15 @@ class SentinelController:
             return
         if self.coder and decision.message_to_coder:
             await self.coder.steer_or_start(decision.message_to_coder)
+        # Fresh completion-review thread per review: close the session after each return so
+        # the next readiness review starts a new thread instead of accumulating prior turns.
+        # The persistent thread otherwise grows ~55-85k tokens per return and crossed the
+        # model context window within a generation, forcing lossy auto-compaction. Prior
+        # returns are still carried into the next review via previous_completion_returns,
+        # and the reviewer re-reads the workspace live, so no context is lost.
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is not None and hasattr(supervisor, "close_completion_review"):
+            await supervisor.close_completion_review()
 
     async def _resolve_pending_approvals(self, reason: str) -> None:
         approvals = getattr(self, "approvals", None)
@@ -2818,6 +2987,101 @@ class SentinelController:
                 "latency_seconds": attempt.latency_seconds,
                 "model": attempt.model,
                 "full_supervisor_fallback": attempt.full_supervisor_fallback,
+            }
+        )
+
+    async def _configure_runtime_triage(self) -> None:
+        config = runtime_triage_config_from_env()
+        self.runtime_triage_config = config
+        self.runtime_triage_reviewer = None
+        if not config.enabled:
+            self.tui.render("SYSTEM", "cheap runtime triage disabled by configuration")
+            return
+        if config.model is None:
+            self.tui.render("SYSTEM", "cheap runtime triage disabled: no model configured")
+            self.runtime_triage_config = CheapRuntimeTriageConfig(
+                enabled=False, model=None, timeout_seconds=config.timeout_seconds
+            )
+            return
+        reviewer = CheapRuntimeReviewer(
+            self.client,
+            self.project_root,
+            model=config.model,
+            timeout_seconds=config.timeout_seconds,
+        )
+        try:
+            await self._cheap_runtime_structured_output_self_test(reviewer)
+        except Exception as exc:
+            self.tui.render(
+                "SYSTEM",
+                f"cheap runtime triage unavailable; full supervisor on every wake ({exc.__class__.__name__})",
+            )
+            self.runtime_triage_config = CheapRuntimeTriageConfig(
+                enabled=False, model=config.model, timeout_seconds=config.timeout_seconds
+            )
+            return
+        self.runtime_triage_reviewer = reviewer
+        self.tui.render("SYSTEM", f"cheap runtime triage enabled with model {config.model}")
+
+    async def _cheap_runtime_structured_output_self_test(self, reviewer: CheapRuntimeReviewer) -> None:
+        packet = SupervisorWakePacket(
+            wake_sequence=1,
+            latest_event_sequence=0,
+            generation=0,
+            restart_count=0,
+            task_path=str(self.task_path),
+            task_contents="",
+            current_summary="Startup runtime-triage self-test: routine read-only progress, no failing checks.",
+        )
+        decision = await asyncio.wait_for(reviewer.review(packet), timeout=reviewer.timeout_seconds)
+        if decision.decision not in {"noop", "escalate"}:
+            raise RuntimeError("cheap runtime structured-output self-test returned an unexpected decision")
+
+    async def _cheap_runtime_route(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision | None:
+        reviewer = self.runtime_triage_reviewer
+        if reviewer is None:
+            return None
+        started = time.monotonic()
+        try:
+            decision = await reviewer.review(packet)
+        except CheapRuntimeReviewerError as exc:
+            self._record_cheap_runtime_attempt(
+                packet, decision=None, outcome=f"error:{exc.__class__.__name__}", started=started, fallback=True
+            )
+            return None
+        self._record_cheap_runtime_attempt(
+            packet,
+            decision=decision,
+            outcome=decision.decision,
+            started=started,
+            fallback=(decision.decision == "escalate"),
+        )
+        if decision.decision == "noop":
+            self.tui.render("SUPERVISOR", f"cheap runtime triage: noop ({decision.reason_code})")
+        return decision
+
+    def _record_cheap_runtime_attempt(
+        self,
+        packet: SupervisorWakePacket,
+        *,
+        decision: CheapRuntimeDecision | None,
+        outcome: str,
+        started: float,
+        fallback: bool,
+    ) -> None:
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "cheap_runtime_review",
+                "wake_sequence": packet.wake_sequence,
+                "generation": packet.generation,
+                "current_summary": (packet.current_summary or "")[:160],
+                "decision": decision.decision if decision is not None else None,
+                "reason_code": decision.reason_code if decision is not None else None,
+                "outcome": outcome,
+                "latency_seconds": time.monotonic() - started,
+                "model": self.runtime_triage_config.model,
+                "full_supervisor_fallback": fallback,
             }
         )
 
@@ -5758,6 +6022,16 @@ def _action_timed_out(action: TriggeringAction) -> bool:
     return "timeout" in text or "timed out" in text
 
 
+def _is_file_change_activity(action: TriggeringAction) -> bool:
+    if action.command:
+        return False
+    kind = action.kind.lower()
+    summary = action.summary.lower()
+    return kind in {"filechange", "file_change", "file-change"} or (
+        bool(action.paths) and "file" in summary and "change" in summary
+    )
+
+
 def _change_kind(status: str) -> str:
     normalized = status.strip().upper()
     if "D" in normalized:
@@ -6527,9 +6801,15 @@ def _is_completed_action(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
 
 
-def _adversary_enabled_from_env() -> bool:
+def _adversary_enabled_from_env() -> bool | None:
     raw = os.environ.get("SENTINEL_ADVERSARY_ENABLED", "").strip().lower()
-    return raw in {"1", "true", "yes", "on", "enabled"}
+    if not raw:
+        return None
+    if raw in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return None
 
 
 def _create_adversary_snapshot(project_root: Path) -> Path:

@@ -77,6 +77,12 @@ def build_cheap_approval_prompt(packet: dict[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def build_cheap_runtime_prompt(packet: dict[str, Any]) -> str:
+    payload = dict(packet)
+    payload["instructions"] = [_cheap_runtime_prompt_text()]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def _load_prompt_config() -> dict[str, Any]:
     override = os.environ.get(PROMPTS_ENV_VAR)
     if override:
@@ -107,6 +113,13 @@ def _cheap_approval_prompt_text() -> str:
     value = _section("cheap_approval").get("text")
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("[cheap_approval] must define non-empty text")
+    return value.strip()
+
+
+def _cheap_runtime_prompt_text() -> str:
+    value = _section("cheap_runtime").get("text")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("[cheap_runtime] must define non-empty text")
     return value.strip()
 
 

@@ -11,28 +11,43 @@ from pydantic import ValidationError
 
 from supervisor.appserver import AppServerClient, AppServerError, last_agent_message_text, text_input
 from supervisor.policy import (
+    CHEAP_REVIEW_BLOCK_TAGS,
     CommandAnalysis,
     FORBIDDEN_CHEAP_RISK_TAGS,
     analyze_command,
 )
-from supervisor.prompts import build_cheap_approval_prompt
+from supervisor.prompts import build_cheap_approval_prompt, build_cheap_runtime_prompt
 from supervisor.schemas import (
     ApprovalContext,
     ApprovalRequestType,
     ApprovalResolution,
     CheapApprovalDecision,
+    CheapRuntimeDecision,
     PolicyDecision,
     PolicyDecisionKind,
+    SupervisorWakePacket,
 )
-from supervisor.schemas.models import openai_strict_json_schema_for_cheap_approval_decision
+from supervisor.schemas.models import (
+    openai_strict_json_schema_for_cheap_approval_decision,
+    openai_strict_json_schema_for_cheap_runtime_decision,
+)
 from supervisor.supervisor_agent import _agent_message_text_from_turns, _parse_json_object
 
+
+# Default cheap-triage model: a lightweight codex-tuned model, capable enough for the
+# narrow approve/noop routing decisions but far cheaper/faster than the full supervisor.
+DEFAULT_TRIAGE_MODEL = "gpt-5.3-codex-spark"
 
 APPROVAL_TRIAGE_ENABLED_ENV = "SENTINEL_APPROVAL_TRIAGE_ENABLED"
 APPROVAL_TRIAGE_MODEL_ENV = "SENTINEL_APPROVAL_TRIAGE_MODEL"
 APPROVAL_TRIAGE_TIMEOUT_ENV = "SENTINEL_APPROVAL_TRIAGE_TIMEOUT"
 DEFAULT_APPROVAL_TRIAGE_TIMEOUT_SECONDS = 20.0
-CHEAP_APPROVAL_REASON = "bounded read-only command approved by cheap review"
+CHEAP_APPROVAL_REASON = "low-impact command approved by cheap review"
+
+RUNTIME_TRIAGE_ENABLED_ENV = "SENTINEL_RUNTIME_TRIAGE_ENABLED"
+RUNTIME_TRIAGE_MODEL_ENV = "SENTINEL_RUNTIME_TRIAGE_MODEL"
+RUNTIME_TRIAGE_TIMEOUT_ENV = "SENTINEL_RUNTIME_TRIAGE_TIMEOUT"
+DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS = 25.0
 
 
 class CheapApprovalReviewerError(RuntimeError):
@@ -180,10 +195,194 @@ class CheapApprovalReviewer:
 
 
 def cheap_approval_triage_config_from_env() -> CheapApprovalTriageConfig:
+    # Disabled by default: deterministic approval gates should handle the obvious cases.
     enabled = _env_flag(os.environ.get(APPROVAL_TRIAGE_ENABLED_ENV), default=False)
-    model = _env_str(os.environ.get(APPROVAL_TRIAGE_MODEL_ENV))
+    model = _env_str(os.environ.get(APPROVAL_TRIAGE_MODEL_ENV)) or DEFAULT_TRIAGE_MODEL
     timeout_seconds = _env_float(os.environ.get(APPROVAL_TRIAGE_TIMEOUT_ENV), DEFAULT_APPROVAL_TRIAGE_TIMEOUT_SECONDS)
     return CheapApprovalTriageConfig(enabled=enabled, model=model, timeout_seconds=timeout_seconds)
+
+
+@dataclass(frozen=True)
+class CheapRuntimeTriageConfig:
+    enabled: bool
+    model: str | None
+    timeout_seconds: float = DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS
+
+
+def runtime_triage_config_from_env() -> CheapRuntimeTriageConfig:
+    # Enabled by default with a cheap default model; env can override or disable.
+    enabled = _env_flag(os.environ.get(RUNTIME_TRIAGE_ENABLED_ENV), default=True)
+    model = _env_str(os.environ.get(RUNTIME_TRIAGE_MODEL_ENV)) or DEFAULT_TRIAGE_MODEL
+    timeout_seconds = _env_float(os.environ.get(RUNTIME_TRIAGE_TIMEOUT_ENV), DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS)
+    return CheapRuntimeTriageConfig(enabled=enabled, model=model, timeout_seconds=timeout_seconds)
+
+
+class CheapRuntimeReviewerError(RuntimeError):
+    pass
+
+
+def _bounded(text: str, limit: int) -> str:
+    if not text:
+        return text or ""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def cheap_runtime_packet(packet: SupervisorWakePacket) -> dict[str, Any]:
+    """Slim snapshot for the cheap runtime router: only signals needed to route noop/escalate."""
+    action = packet.triggering_action
+
+    def vrun(v: Any) -> dict[str, Any]:
+        return {
+            "type": getattr(v, "type", None),
+            "outcome": getattr(v, "outcome", None),
+            "trusted_validation_outcome": getattr(v, "trusted_validation_outcome", None),
+            "masking_reason": getattr(v, "masking_reason", None),
+            "passed": getattr(v, "passed", None),
+            "summary": _bounded(getattr(v, "summary", "") or "", 200),
+        }
+
+    health = packet.health if isinstance(packet.health, dict) else {}
+    return {
+        "wake_reason": packet.current_summary,
+        "triggering_action": (
+            {
+                "kind": action.kind,
+                "command": _bounded(action.command or "", 200),
+                "exit_code": action.exit_code,
+                "status": action.status,
+            }
+            if action is not None
+            else None
+        ),
+        "diff_summary": _bounded(packet.diff_summary or "", 400),
+        "changed_files_count": len(packet.changed_files or []),
+        "validation_freshness_summary": _bounded(packet.validation_freshness_summary or "", 300),
+        "recent_validations": [vrun(v) for v in (packet.validations or [])[-3:]],
+        "recent_events": (packet.recent_events or [])[-8:],
+        "health_risk": {
+            "risk_signals": health.get("risk_signals"),
+            "consecutive_failed_tests": health.get("consecutive_failed_tests"),
+            "repeated_command_count": health.get("repeated_command_count"),
+            "minutes_without_progress": health.get("minutes_without_progress"),
+        },
+        "pending_approvals_count": len(packet.pending_approvals or []),
+        "has_human_message": packet.human_message is not None,
+        "last_coder_message_present": packet.last_coder_message is not None,
+    }
+
+
+class CheapRuntimeReviewer:
+    def __init__(
+        self,
+        client: AppServerClient,
+        workspace: Path,
+        *,
+        model: str | None,
+        timeout_seconds: float = DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS,
+    ):
+        self.client = client
+        self.workspace = workspace.resolve()
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+
+    async def review(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision:
+        if not self.model:
+            raise CheapRuntimeReviewerError("cheap runtime triage model is not configured")
+        prompt = build_cheap_runtime_prompt(cheap_runtime_packet(packet))
+        return await self._decide(prompt)
+
+    async def _decide(self, prompt: str) -> CheapRuntimeDecision:
+        thread_id: str | None = None
+        turn_id: str | None = None
+        try:
+            thread_response = await asyncio.wait_for(
+                self.client.thread_start(self._thread_params(), timeout=self.timeout_seconds),
+                timeout=self.timeout_seconds,
+            )
+            thread = thread_response.get("thread", {})
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            if not isinstance(thread_id, str):
+                raise CheapRuntimeReviewerError("cheap runtime thread/start did not return thread id")
+            turn_response = await asyncio.wait_for(
+                self.client.turn_start(
+                    {
+                        "threadId": thread_id,
+                        "input": [text_input(prompt)],
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                        "outputSchema": openai_strict_json_schema_for_cheap_runtime_decision(),
+                        "model": self.model,
+                    },
+                    timeout=self.timeout_seconds,
+                ),
+                timeout=self.timeout_seconds,
+            )
+            turn = turn_response.get("turn", {})
+            turn_id_value = turn.get("id")
+            if not isinstance(turn_id_value, str):
+                raise CheapRuntimeReviewerError("cheap runtime turn/start did not return turn id")
+            turn_id = turn_id_value
+            if turn.get("status") != "completed":
+                try:
+                    completed = await self.client.wait_for_notification(
+                        lambda message: message.method == "turn/completed"
+                        and message.params.get("threadId") == thread_id
+                        and isinstance(message.params.get("turn"), dict)
+                        and message.params["turn"].get("id") == turn_id,
+                        timeout=self.timeout_seconds,
+                    )
+                except (asyncio.TimeoutError, AppServerError) as exc:
+                    raise CheapRuntimeReviewerError("cheap runtime turn timed out") from exc
+                turn = completed.params.get("turn", {})
+            text = last_agent_message_text(turn)
+            if text is None:
+                turns = await asyncio.wait_for(
+                    self.client.thread_turns_list(
+                        thread_id,
+                        limit=5,
+                        items_view="full",
+                        timeout=self.timeout_seconds,
+                    ),
+                    timeout=self.timeout_seconds,
+                )
+                text = _agent_message_text_from_turns(turns.get("data", []), turn_id=turn_id)
+            if text is None:
+                raise CheapRuntimeReviewerError("cheap runtime reviewer did not produce an agent message")
+            return CheapRuntimeDecision.model_validate(_parse_json_object(text))
+        except asyncio.TimeoutError as exc:
+            raise CheapRuntimeReviewerError("cheap runtime reviewer timed out") from exc
+        except (ValidationError, ValueError) as exc:
+            raise CheapRuntimeReviewerError("invalid cheap runtime decision") from exc
+        except CheapRuntimeReviewerError:
+            raise
+        except Exception as exc:
+            raise CheapRuntimeReviewerError(f"cheap runtime reviewer failed: {exc.__class__.__name__}") from exc
+        finally:
+            if thread_id:
+                await self._cleanup_thread(thread_id)
+
+    def _thread_params(self) -> dict[str, Any]:
+        return {
+            "cwd": str(self.workspace),
+            "runtimeWorkspaceRoots": [str(self.workspace)],
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "sandbox": "read-only",
+            "ephemeral": False,
+            "experimentalRawEvents": False,
+            "persistExtendedHistory": False,
+            "model": self.model,
+        }
+
+    async def _cleanup_thread(self, thread_id: str) -> None:
+        cleanup_timeout = min(self.timeout_seconds, 10.0)
+        try:
+            await asyncio.wait_for(self.client.thread_archive(thread_id, timeout=cleanup_timeout), timeout=cleanup_timeout)
+        except Exception:
+            try:
+                await asyncio.wait_for(self.client.thread_unsubscribe(thread_id, timeout=cleanup_timeout), timeout=cleanup_timeout)
+            except Exception:
+                return
 
 
 def command_analysis_from_policy_decision(evaluation: PolicyDecision) -> CommandAnalysis | None:
@@ -216,9 +415,14 @@ def is_cheap_review_candidate(context: ApprovalContext, evaluation: PolicyDecisi
         analysis = analyze_command(workspace, context.command, context.cwd)
     if analysis.command != context.command:
         return False
-    if analysis.risk_tags & FORBIDDEN_CHEAP_RISK_TAGS:
+    # Expanded eligibility: any command without a hard-block tag may be cheap-reviewed
+    # (including in-workspace filesystem writes), not just read-only commands. The cheap
+    # model still escalates anything it can't deem safe; hard-block tags (grading-path,
+    # destructive, network, escape, secret, interpreter execution, shell composition, ...)
+    # are never eligible.
+    if analysis.risk_tags & CHEAP_REVIEW_BLOCK_TAGS:
         return False
-    return bool(analysis.cheap_review_candidate)
+    return True
 
 
 def cheap_approval_fingerprint(context: ApprovalContext, evaluation: PolicyDecision, workspace: Path) -> tuple[Any, ...]:
@@ -249,7 +453,8 @@ def validate_cheap_approval(
     workspace: Path,
     expected_fingerprint: tuple[Any, ...],
 ) -> ApprovalResolution | None:
-    if cheap_decision.decision != "approve_low_impact" or cheap_decision.reason_code != "bounded_read_only":
+    # The schema guarantees reason_code is an approve code when decision is approve_low_impact.
+    if cheap_decision.decision != "approve_low_impact":
         return None
     if cheap_approval_fingerprint(context, evaluation, workspace) != expected_fingerprint:
         return None
@@ -259,7 +464,10 @@ def validate_cheap_approval(
         return None
     if not _decision_available(context, "accept"):
         return None
-    return ApprovalResolution(decision="accept", reason=CHEAP_APPROVAL_REASON)
+    return ApprovalResolution(
+        decision="accept",
+        reason=f"{CHEAP_APPROVAL_REASON} ({cheap_decision.reason_code})",
+    )
 
 
 def cheap_approval_packet(context: ApprovalContext, evaluation: PolicyDecision, analysis: CommandAnalysis) -> dict[str, Any]:

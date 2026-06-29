@@ -75,17 +75,47 @@ class CheapApprovalDecision(BaseModel):
     decision: Literal["approve_low_impact", "escalate"]
     reason_code: Literal[
         "bounded_read_only",
+        "workspace_local_safe",
         "needs_task_judgment",
         "possible_side_effect",
         "sensitive_or_ambiguous",
         "unsupported_request",
     ]
 
+    _APPROVE_CODES = {"bounded_read_only", "workspace_local_safe"}
+
     @model_validator(mode="after")
     def validate_reason_code(self) -> "CheapApprovalDecision":
-        if self.decision == "approve_low_impact" and self.reason_code != "bounded_read_only":
-            raise ValueError("approve_low_impact requires bounded_read_only reason_code")
-        if self.decision == "escalate" and self.reason_code == "bounded_read_only":
+        if self.decision == "approve_low_impact" and self.reason_code not in self._APPROVE_CODES:
+            raise ValueError("approve_low_impact requires an approve reason_code")
+        if self.decision == "escalate" and self.reason_code in self._APPROVE_CODES:
+            raise ValueError("escalate requires an escalation reason_code")
+        return self
+
+
+class CheapRuntimeDecision(BaseModel):
+    """Cheap-model triage of a runtime supervisor wake: route to full supervisor or skip."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["noop", "escalate"]
+    reason_code: Literal[
+        "routine_progress",
+        "benign_diff",
+        "expected_test_iteration",
+        "needs_supervisor_judgment",
+        "failed_or_masked_validation",
+        "drift_or_risk",
+        "uncertain",
+    ]
+
+    _NOOP_CODES = {"routine_progress", "benign_diff", "expected_test_iteration"}
+
+    @model_validator(mode="after")
+    def validate_reason_code(self) -> "CheapRuntimeDecision":
+        if self.decision == "noop" and self.reason_code not in self._NOOP_CODES:
+            raise ValueError("noop requires a benign reason_code")
+        if self.decision == "escalate" and self.reason_code in self._NOOP_CODES:
             raise ValueError("escalate requires an escalation reason_code")
         return self
 
@@ -118,14 +148,16 @@ class SentinelConfig(BaseModel):
     active_coder_turn_id: str | None = None
     generation: int = 0
     restart_count: int = 0
-    max_restarts: int = 3
+    max_restarts: int = 5
     last_event_sequence: int = 0
     last_applied_supervisor_sequence: int = 0
     pending_server_request_ids: list[int | str] = Field(default_factory=list)
     status: SentinelStatus = SentinelStatus.STARTING
     model: str | None = None
     max_no_marker_idle_nudges: int = 2
-    max_completion_returns_per_generation: int = 2
+    max_completion_returns_per_generation: int = 10
+    max_adversary_runs: int = 1
+    adversary_run_count: int = 0
     accept_gate_accepts: int = 0
     accept_gate_rejections: int = 0
     accept_gate_reviewer_reruns: int = 0
@@ -768,6 +800,14 @@ def json_schema_for_cheap_approval_decision() -> dict[str, Any]:
 
 def openai_strict_json_schema_for_cheap_approval_decision() -> dict[str, Any]:
     return openai_strict_json_schema(json_schema_for_cheap_approval_decision())
+
+
+def json_schema_for_cheap_runtime_decision() -> dict[str, Any]:
+    return CheapRuntimeDecision.model_json_schema()
+
+
+def openai_strict_json_schema_for_cheap_runtime_decision() -> dict[str, Any]:
+    return openai_strict_json_schema(json_schema_for_cheap_runtime_decision())
 
 
 def openai_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:

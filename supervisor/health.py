@@ -48,7 +48,8 @@ def patch_health(store: StateStore, delta: HealthDelta) -> HealthState:
 
 
 def kill_restart_candidate(state: HealthState) -> tuple[bool, str | None]:
-    if state.restart_count >= 3:
+    # Keep this aligned with SentinelConfig.max_restarts (schemas/models.py).
+    if state.restart_count >= 5:
         return True, "restart cap reached"
     if state.interventions >= 3 and state.last_progress_sequence == 0:
         return True, "three interventions without progress"
