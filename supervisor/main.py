@@ -158,10 +158,11 @@ def _startup_update_gate() -> None:
     if not sys.stdin.isatty():
         click.echo(_format_update_available_message(status), err=True)
         click.echo(
-            f"Sentinel is not running from a TTY. Set {update_check.SKIP_UPDATE_CHECK_ENV}=1 to bypass this check.",
+            f"Sentinel is not running from a TTY; continuing without prompting. "
+            f"Set {update_check.SKIP_UPDATE_CHECK_ENV}=1 to bypass this check.",
             err=True,
         )
-        raise click.exceptions.Exit(update_check.NONINTERACTIVE_UPDATE_EXIT_CODE)
+        return
 
     click.echo(_format_update_available_message(status))
     while True:

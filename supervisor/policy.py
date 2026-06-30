@@ -1184,8 +1184,33 @@ def _executable_basename(executable: str) -> str:
     return name
 
 
+def _is_env_assignment_token(token: str) -> bool:
+    name, sep, _value = token.partition("=")
+    return bool(sep and name and (name[0].isalpha() or name[0] == "_") and all(ch.isalnum() or ch == "_" for ch in name))
+
+
+def _tokens_invoke_sentinel_cli(tokens: list[str]) -> bool:
+    index = 0
+    if tokens and _executable_basename(tokens[0]) == "env":
+        index = 1
+    while index < len(tokens) and _is_env_assignment_token(tokens[index]):
+        index += 1
+    return index < len(tokens) and _executable_basename(tokens[index]) in SENTINEL_CLI_NAMES
+
+
+def _token_segments_invoke_sentinel_cli(tokens: list[str]) -> bool:
+    raw_segments, _operators, _tags, _problem = _split_command_segments(tokens)
+    return any(_tokens_invoke_sentinel_cli(segment) for segment in raw_segments)
+
+
 def command_invokes_sentinel_cli(analysis: CommandAnalysis) -> bool:
-    return any(_executable_basename(segment.executable) in SENTINEL_CLI_NAMES for segment in analysis.segments)
+    if any(_tokens_invoke_sentinel_cli(segment.tokens) for segment in analysis.segments):
+        return True
+    shell_payload = _shell_payload_from_tokens(analysis.tokens)
+    if shell_payload is None:
+        return False
+    tokens, _problem = parse_command(shell_payload)
+    return bool(tokens and _token_segments_invoke_sentinel_cli(tokens))
 
 
 def command_mentions_supervisor(command: str) -> bool:

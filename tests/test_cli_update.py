@@ -56,19 +56,18 @@ def test_version_report_shows_update_available(monkeypatch: pytest.MonkeyPatch) 
     assert "sentinel update" in report
 
 
-def test_startup_gate_exits_nonzero_when_outdated_without_tty(
+def test_startup_gate_warns_and_continues_when_outdated_without_tty(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
     monkeypatch.setattr("supervisor.main.sys.stdin", NonTty())
 
-    with pytest.raises(click.exceptions.Exit) as exc_info:
-        _startup_update_gate()
+    _startup_update_gate()
 
-    assert exc_info.value.exit_code == update_check.NONINTERACTIVE_UPDATE_EXIT_CODE
     captured = capsys.readouterr()
     assert "A newer Sentinel version is available." in captured.err
+    assert "continuing without prompting" in captured.err
     assert "Set SENTINEL_SKIP_UPDATE_CHECK=1" in captured.err
 
 

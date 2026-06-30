@@ -103,6 +103,12 @@ def test_commands_invoking_sentinel_cli_deny(workspace: Path) -> None:
 
     commands = [
         "sentinel --task TASK.md",
+        "./sentinel",
+        "/bin/bash -lc ./sentinel",
+        "/bin/bash -lc './sentinel --task TASK.md'",
+        "bash -lc 'cd . && ./sentinel --task TASK.md'",
+        "bash -lc 'SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md'",
+        "env SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md",
         "/opt/sentinel-venv/bin/sentinel --task TASK.md",
         "'.venv\\Scripts\\sentinel.exe' --task TASK.md",
         "supervisor --task TASK.md",

@@ -40,6 +40,7 @@ from supervisor.schemas import (
     BreadthRiskSummary,
     ChangedFile,
     ChangedFileDiff,
+    CheapRuntimeDecision,
     CoderMessage,
     CompletionReturnRecord,
     CompletionReviewDecision,
@@ -976,6 +977,32 @@ async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
     assert len(fake.runtime_packets) == 1
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert "restart_budget" in trace["trigger_reasons"]
+
+
+async def test_protected_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path) -> None:
+    controller, _store, fake = _runtime_controller(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+
+    await controller._run_supervisor_check(
+        "Runtime trigger (suspicious_file_touched): command completed: sed -n '1,120p' app.test.js exit=0",
+        triggering_item_id="cmd-1",
+        triggering_action=TriggeringAction(
+            kind="commandExecution",
+            command="sed -n '1,120p' app.test.js",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        human_message=None,
+        patch_summary=None,
+        completion_review=False,
+    )
+
+    assert cheap.calls == []
+    assert len(fake.runtime_packets) == 1
+    assert fake.runtime_packets[0].current_summary.startswith("Runtime trigger (suspicious_file_touched)")
 
 
 def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(tmp_path: Path) -> None:
@@ -4554,6 +4581,17 @@ class _RuntimeFakeSupervisor:
         self.closed_completion_reviews += 1
         self.completion_thread_id = None
         return None
+
+
+class _CheapRuntimeNoopReviewer:
+    model = "cheap-runtime-test"
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def review(self, packet):
+        self.calls.append(packet)
+        return CheapRuntimeDecision(decision="noop", reason_code="routine_progress")
 
 
 def _runtime_controller(tmp_path: Path) -> tuple[SentinelController, StateStore, _RuntimeFakeSupervisor]:

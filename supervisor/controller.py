@@ -1582,6 +1582,7 @@ class SentinelController:
                     getattr(self, "runtime_triage_reviewer", None) is not None
                     and human_message is None
                     and not packet.pending_approvals
+                    and not _runtime_packet_has_protected_reason(packet)
                 ):
                     cheap = await self._cheap_runtime_route(packet)
                     if cheap is not None and cheap.decision == "noop":
@@ -3174,6 +3175,19 @@ def _approval_wake_context(context: ApprovalContext, reason: str | None = None) 
         proposed_network_policy_amendments=context.proposed_network_policy_amendments,
         reason=reason,
     )
+
+
+def _runtime_packet_has_protected_reason(packet: SupervisorWakePacket) -> bool:
+    return bool(set(_runtime_trigger_reasons_from_summary(packet.current_summary)) & PROTECTED_RUNTIME_WAKE_REASONS)
+
+
+def _runtime_trigger_reasons_from_summary(summary: str | None) -> tuple[str, ...]:
+    if not summary:
+        return ()
+    match = re.match(r"\s*Runtime trigger \(([^)]*)\):", summary)
+    if not match:
+        return ()
+    return tuple(reason.strip() for reason in match.group(1).split(",") if reason.strip())
 
 
 def _is_no_active_turn_to_steer_error(exc: AppServerError) -> bool:
