@@ -152,6 +152,8 @@ BREADTH_FEATURE_TERMS = (
     "update",
     "validation",
 )
+DEFAULT_MODEL = "gpt-5.5"
+ADVERSARY_MODEL = "gpt-5.5"
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,16 @@ class RuntimeTriggerDecision:
 
 
 @dataclass(frozen=True)
+class ModelAvailabilityResult:
+    missing_roles: tuple[str, ...]
+    available_models: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing_roles
+
+
+@dataclass(frozen=True)
 class EvidenceBindingIssue:
     reason: str
     kind: str
@@ -202,6 +214,8 @@ class SentinelController:
         client: AppServerClient | None = None,
         tui: TerminalTUI | None = None,
         model: str | None = None,
+        coder_model: str | None = None,
+        supervisor_model: str | None = None,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
         use_git_diff: bool = True,
@@ -213,7 +227,12 @@ class SentinelController:
         if clean_workspace:
             clean_workspace_except_task(self.project_root, self.task_path)
         self.store = StateStore(self.project_root)
-        self.model = model
+        self.coder_model, self.supervisor_model = _resolve_controller_models(
+            model=model,
+            coder_model=coder_model,
+            supervisor_model=supervisor_model,
+        )
+        self.model = self.coder_model if self.coder_model == self.supervisor_model else None
         self.overwrite_state = overwrite_state
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
@@ -279,11 +298,13 @@ class SentinelController:
             await self.tui.start()
             self.running = True
             await self.preflight()
+            if not self.running:
+                return
             self.supervisor = StatelessSupervisorAgent(
                 self.client,
                 self.store,
                 self.task_path,
-                model=self.model,
+                model=self._supervisor_model(),
             )
             self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
             self.approvals = ApprovalManager(
@@ -293,7 +314,7 @@ class SentinelController:
                 declared_grading_roots=self.declared_grading_roots,
                 cheap_review_timeout_seconds=self.approval_triage_config.timeout_seconds,
             )
-            self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
+            self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self._coder_model())
             await self.coder.start_thread()
             await self.coder.start_initial_turn()
             self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
@@ -313,9 +334,31 @@ class SentinelController:
             task_path=str(self.task_path),
             task_hash=_hash_file(self.task_path),
             model=self.model,
+            coder_model=self.coder_model,
+            supervisor_model=self.supervisor_model,
         )
         self.store.initialize_sentinel(config, overwrite=self.overwrite_state)
         _ensure_internal_runtime_git_excluded(self.project_root)
+
+    def _persist_model_config(self) -> None:
+        self.store.update_sentinel_config(
+            lambda cfg: cfg.model_copy(
+                update={
+                    "model": self.model,
+                    "coder_model": self.coder_model,
+                    "supervisor_model": self.supervisor_model,
+                }
+            )
+        )
+
+    def _coder_model(self) -> str | None:
+        return getattr(self, "coder_model", getattr(self, "model", DEFAULT_MODEL))
+
+    def _supervisor_model(self) -> str | None:
+        return getattr(self, "supervisor_model", getattr(self, "model", DEFAULT_MODEL))
+
+    def _adversary_model(self) -> str:
+        return ADVERSARY_MODEL
 
     async def preflight(self) -> None:
         self.tui.status("checking Codex version")
@@ -345,10 +388,11 @@ class SentinelController:
                 }
             )
         self.tui.status("checking available models")
-        models = await self.client.model_list()
-        if self.model is None:
-            self.model = _default_model(models)
-            self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"model": self.model}))
+        models_response = await self.client.model_list()
+        self._persist_model_config()
+        await self._ensure_selected_models_available(models_response)
+        if self.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE:
+            return
         self.tui.status("checking supervisor structured output")
         await self._structured_output_self_test()
         await self._configure_approval_triage()
@@ -356,7 +400,7 @@ class SentinelController:
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
-        thread = await self.client.thread_start(coder_thread_params(self.project_root, model=self.model))
+        thread = await self.client.thread_start(coder_thread_params(self.project_root, model=self._coder_model()))
         approval_policy = thread.get("approvalPolicy")
         sandbox = thread.get("sandbox")
         thread_id = thread.get("thread", {}).get("id") if isinstance(thread.get("thread"), dict) else None
@@ -367,6 +411,34 @@ class SentinelController:
             raise RuntimeError(f"app-server did not accept {expected_sandbox} coder sandbox")
         if isinstance(thread_id, str):
             await self._cleanup_preflight_probe_thread(thread_id)
+
+    async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
+        result = _selected_model_availability(
+            models_response,
+            coder_model=self._coder_model(),
+            supervisor_model=self._supervisor_model(),
+            adversary_model=self._adversary_model() if self._adversary_model_required_for_preflight() else None,
+        )
+        if result.ok:
+            return
+        available = ", ".join(result.available_models) if result.available_models else "none reported"
+        missing = ", ".join(result.missing_roles)
+        message = (
+            "model availability preflight failed before coder start: "
+            f"selected model(s) are not available from Codex app-server model/list: {missing}. "
+            f"Available models: {available}. "
+            "The interruption is recorded in .supervisor/FINAL_REPORT.md."
+        )
+        self.store.append_text_locked(PROGRESS, f"- {message}\n")
+        await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
+
+    def _adversary_model_required_for_preflight(self) -> bool:
+        enabled = getattr(self, "adversary_enabled", None)
+        if enabled is False:
+            return False
+        if enabled is True:
+            return True
+        return self.store.get_sentinel_config().max_adversary_runs > 0
 
     async def event_loop(self) -> None:
         assert self.tui is not None
@@ -952,7 +1024,7 @@ class SentinelController:
                 }
             )
         )
-        self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self.model)
+        self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self._coder_model())
         await self.coder.start_thread()
         await self.coder.start_restart_turn()
         self.tui.render("SYSTEM", "restart complete")
@@ -1827,7 +1899,7 @@ class SentinelController:
         agent = AdversaryAgent(
             self.client,
             snapshot_root,
-            model=self.model,
+            model=self._adversary_model(),
             on_thread_start=self._mark_adversary_thread_started,
             on_thread_done=self._mark_adversary_thread_done,
         )
@@ -2876,7 +2948,7 @@ class SentinelController:
             self.client,
             self.store,
             self.task_path,
-            model=self.model,
+            model=self._supervisor_model(),
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -6514,18 +6586,60 @@ def _run_probe(args: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     return completed.returncode == 0, (completed.stdout + completed.stderr).strip()
 
 
-def _default_model(response: dict[str, Any]) -> str | None:
-    data = response.get("data")
-    if not isinstance(data, list) or not data:
-        return None
-    first = data[0]
-    if not isinstance(first, dict):
-        return None
-    for key in ("id", "slug", "name"):
-        value = first.get(key)
-        if isinstance(value, str):
-            return value
-    return None
+def _resolve_controller_models(
+    *,
+    model: str | None,
+    coder_model: str | None,
+    supervisor_model: str | None,
+) -> tuple[str, str]:
+    if model and (coder_model or supervisor_model):
+        raise RuntimeError("model cannot be combined with coder_model or supervisor_model")
+    if bool(coder_model) != bool(supervisor_model):
+        raise RuntimeError("coder_model and supervisor_model must be used together")
+    if model:
+        return model, model
+    if coder_model and supervisor_model:
+        return coder_model, supervisor_model
+    return DEFAULT_MODEL, DEFAULT_MODEL
+
+
+def _selected_model_availability(
+    models_response: dict[str, Any],
+    *,
+    coder_model: str | None,
+    supervisor_model: str | None,
+    adversary_model: str | None = None,
+) -> ModelAvailabilityResult:
+    available_models = tuple(sorted(_extract_model_ids(models_response)))
+    available = set(available_models)
+    missing: list[str] = []
+    if coder_model and coder_model not in available:
+        missing.append(f"coder={coder_model}")
+    if supervisor_model and supervisor_model not in available:
+        missing.append(f"supervisor={supervisor_model}")
+    if adversary_model and adversary_model not in available:
+        missing.append(f"adversary={adversary_model}")
+    return ModelAvailabilityResult(missing_roles=tuple(missing), available_models=available_models)
+
+
+def _extract_model_ids(value: Any) -> set[str]:
+    ids: set[str] = set()
+    if isinstance(value, dict):
+        for key in ("id", "model", "slug", "name"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                ids.add(candidate.strip())
+        for key in ("data", "models", "items"):
+            if key in value:
+                ids.update(_extract_model_ids(value[key]))
+        return ids
+    if isinstance(value, list):
+        for item in value:
+            ids.update(_extract_model_ids(item))
+        return ids
+    if isinstance(value, str) and value.strip():
+        ids.add(value.strip())
+    return ids
 
 
 def _sandbox_is_read_only(value: Any) -> bool:

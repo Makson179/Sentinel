@@ -13,6 +13,7 @@ import pytest
 
 from supervisor.approvals import ApprovalManager
 from supervisor.controller import (
+    ADVERSARY_MODEL,
     NO_MARKER_IDLE_NUDGE,
     ControllerEvent,
     SentinelController,
@@ -2629,11 +2630,14 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     controller.adversary_enabled = True
     controller.client = object()
     controller.model = None
+    controller.coder_model = "gpt-5.4"
+    controller.supervisor_model = "gpt-5.4"
     controller.running = True
     controller.observed_changed_files = {"src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)}
 
     class FakeAdversary:
-        def __init__(self, *args, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+        def __init__(self, *args, model=None, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+            assert model == ADVERSARY_MODEL
             self.on_thread_start = on_thread_start
             self.on_thread_done = on_thread_done
 
@@ -3472,6 +3476,127 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
     assert "account/read response timed out" in text
 
 
+async def test_missing_selected_model_interrupts_before_coder_and_writes_final_report(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    class MissingModelClient:
+        def __init__(self) -> None:
+            self.thread_started = False
+            self.stopped = False
+
+        async def start(self):
+            return None
+
+        async def initialize(self):
+            return {}
+
+        async def stop(self):
+            self.stopped = True
+
+        async def account_read(self):
+            return {"requiresOpenaiAuth": False, "account": {"id": "acct"}}
+
+        async def account_rate_limits_read(self):
+            return {}
+
+        async def model_list(self):
+            return {"data": [{"id": "gpt-5.4"}, {"id": "gpt-5.5"}]}
+
+        async def thread_start(self, params):
+            self.thread_started = True
+            raise AssertionError("coder must not start with an unavailable model")
+
+    client = MissingModelClient()
+    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        client=client,  # type: ignore[arg-type]
+        tui=_FakeTUI(),
+        coder_model="gpt-5.44",
+        supervisor_model="gpt-5.4",
+        overwrite_state=True,
+        use_git_diff=False,
+    )
+    controller._generate_schema_hash_async = _async_schema_hash
+
+    await controller.run()
+
+    report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert controller.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert "- Status: provider_failure" in report
+    assert "model availability preflight failed before coder start" in report
+    assert "coder=gpt-5.44" in report
+    assert "Available models: gpt-5.4, gpt-5.5" in report
+    assert ".supervisor/FINAL_REPORT.md" in report
+    assert client.thread_started is False
+    assert client.stopped is True
+
+
+async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_final_report(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    class MissingAdversaryModelClient:
+        def __init__(self) -> None:
+            self.thread_started = False
+            self.stopped = False
+
+        async def start(self):
+            return None
+
+        async def initialize(self):
+            return {}
+
+        async def stop(self):
+            self.stopped = True
+
+        async def account_read(self):
+            return {"requiresOpenaiAuth": False, "account": {"id": "acct"}}
+
+        async def account_rate_limits_read(self):
+            return {}
+
+        async def model_list(self):
+            return {"data": [{"id": "gpt-5.4"}]}
+
+        async def thread_start(self, params):
+            self.thread_started = True
+            raise AssertionError("coder must not start with an unavailable adversary model")
+
+    client = MissingAdversaryModelClient()
+    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        client=client,  # type: ignore[arg-type]
+        tui=_FakeTUI(),
+        coder_model="gpt-5.4",
+        supervisor_model="gpt-5.4",
+        overwrite_state=True,
+        use_git_diff=False,
+    )
+    controller._generate_schema_hash_async = _async_schema_hash
+
+    await controller.run()
+
+    report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert controller.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert "- Status: provider_failure" in report
+    assert "model availability preflight failed before coder start" in report
+    assert f"adversary={ADVERSARY_MODEL}" in report
+    assert "Available models: gpt-5.4" in report
+    assert client.thread_started is False
+    assert client.stopped is True
+
+
 async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
     tmp_path: Path,
     monkeypatch,
@@ -3490,7 +3615,7 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-test"}]}
+            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}
@@ -3526,7 +3651,10 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
     await controller.preflight()
 
     assert client.unsubscribed == ["probe-thread"]
-    assert controller.store.get_sentinel_config().model == "gpt-test"
+    config = controller.store.get_sentinel_config()
+    assert config.model == "gpt-5.5"
+    assert config.coder_model == "gpt-5.5"
+    assert config.supervisor_model == "gpt-5.5"
     log_lines = controller.store.path(LOG).read_text(encoding="utf-8").splitlines()
     assert log_lines
     entry = json.loads(log_lines[-1])
@@ -3553,7 +3681,7 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
             )
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-test"}]}
+            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}
@@ -3586,7 +3714,10 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
 
     await controller.preflight()
 
-    assert controller.store.get_sentinel_config().model == "gpt-test"
+    config = controller.store.get_sentinel_config()
+    assert config.model == "gpt-5.5"
+    assert config.coder_model == "gpt-5.5"
+    assert config.supervisor_model == "gpt-5.5"
     assert client.unsubscribed == ["probe-thread"]
     assert any("rate limit check unavailable" in message for _, message in tui.messages)
     log_lines = controller.store.path(LOG).read_text(encoding="utf-8").splitlines()
@@ -3613,7 +3744,7 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-test"}]}
+            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}
@@ -4236,7 +4367,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-test"}]}
+            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}

@@ -155,6 +155,8 @@ def main() -> int:
             auth_dir=args.auth_dir.expanduser().resolve(),
             runtime_config=runtime_config,
             model=args.model,
+            coder_model=args.coder_mod,
+            supervisor_model=args.super_mod,
             platform=args.platform,
             extra_supervisor_args=args.supervisor_args,
             egress=egress,
@@ -194,7 +196,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-version", help="Version of @openai/codex to install. Defaults to local codex --version.")
     parser.add_argument("--auth-dir", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
-    parser.add_argument("--model", help="Optional model passed to supervisor.")
+    parser.add_argument("--model", help="Optional model passed to both coder and supervisor.")
+    parser.add_argument("--coder-mod", help="Optional coder model passed to supervisor mode. Requires --super-mod.")
+    parser.add_argument("--super-mod", help="Optional supervisor model passed to supervisor mode. Requires --coder-mod.")
     parser.add_argument(
         "--agent-mode",
         choices=["supervisor", "raw-codex"],
@@ -229,6 +233,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide --instance-json or --task-id")
     if args.supervisor_args and args.supervisor_args[0] == "--":
         args.supervisor_args = args.supervisor_args[1:]
+    if args.model and (args.coder_mod or args.super_mod):
+        parser.error("--model cannot be combined with --coder-mod or --super-mod")
+    if bool(args.coder_mod) != bool(args.super_mod):
+        parser.error("--coder-mod and --super-mod must be used together")
+    if args.agent_mode == "raw-codex" and (args.coder_mod or args.super_mod):
+        parser.error("--coder-mod and --super-mod are only valid with --agent-mode supervisor")
     if args.agent_mode == "raw-codex" and args.raw_prompt_file is None:
         parser.error("--raw-prompt-file is required with --agent-mode raw-codex")
     if args.agent_mode == "raw-codex" and args.supervisor_args:
@@ -861,13 +871,21 @@ def run_attempt_container(
     auth_dir: Path,
     runtime_config: Path,
     model: str | None,
+    coder_model: str | None,
+    supervisor_model: str | None,
     platform: str,
     extra_supervisor_args: list[str],
     egress: EgressRuntime | None,
     agent_mode: str = "supervisor",
 ) -> int:
     base_commit = str(instance["base_commit"])
-    agent_command = agent_invocation_script(agent_mode=agent_mode, model=model, extra_supervisor_args=extra_supervisor_args)
+    agent_command = agent_invocation_script(
+        agent_mode=agent_mode,
+        model=model,
+        coder_model=coder_model,
+        supervisor_model=supervisor_model,
+        extra_supervisor_args=extra_supervisor_args,
+    )
     command = textwrap.dedent(
         f"""
         set -euo pipefail
@@ -964,11 +982,24 @@ def run_attempt_container(
     return run_streaming(cmd, log_path=log_path)
 
 
-def agent_invocation_script(*, agent_mode: str, model: str | None, extra_supervisor_args: list[str]) -> str:
+def agent_invocation_script(
+    *,
+    agent_mode: str,
+    model: str | None,
+    coder_model: str | None,
+    supervisor_model: str | None,
+    extra_supervisor_args: list[str],
+) -> str:
     if agent_mode == "supervisor":
+        role_model_args = (
+            f"--coder-mod {sh_single(coder_model)} --super-mod {sh_single(supervisor_model)} "
+            if coder_model and supervisor_model
+            else ""
+        )
         return (
             "/opt/sentinel-venv/bin/supervisor --task TASK.md --start-over "
             f"{('--model ' + sh_single(model)) if model else ''} "
+            f"{role_model_args}"
             f"{' '.join(sh_single(arg) for arg in extra_supervisor_args)}"
         ).strip()
     if agent_mode == "raw-codex":

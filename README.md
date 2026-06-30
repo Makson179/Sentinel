@@ -68,6 +68,40 @@ Task selection rules:
   `build`, `target`, `.venv`, and `venv`;
 - `TASK.md`, `task.md`, `PLAN.md`, `plan.md`, and `TODO.md` rank first.
 
+## Model Selection
+
+By default, Sentinel uses `gpt-5.5` for both the coder and the full
+supervisor.
+
+Use the same model for both roles:
+
+```bash
+supervisor --task TASK.md --model gpt-5.5
+```
+
+Use different models for coder and supervisor:
+
+```bash
+supervisor --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
+```
+
+`--coder-mod` and `--super-mod` must be provided together. `--model` cannot be
+combined with either of them.
+
+Model names are Codex/OpenAI model slugs accepted by the installed Codex
+app-server and the authenticated account. Use `gpt-5.5` for the default 5.5
+model. Other usable values are the model slugs exposed to your account by
+Codex; Sentinel passes them through unchanged and does not maintain a separate
+hard-coded allow-list.
+
+The adversarial tester always uses `gpt-5.5`, independent of `--model`,
+`--coder-mod`, or `--super-mod`.
+
+Supported values:
+
+- `gpt-5.5`: default and recommended.
+- Any other model slug accepted by your Codex app-server/account.
+
 ## What You See
 
 The terminal stream is chronological and lane-based:
@@ -100,7 +134,7 @@ Before starting the real coder, Sentinel checks:
 - `codex --version`;
 - app-server schema generation and required protocol files;
 - Codex account/auth state;
-- available models;
+- selected coder, supervisor, and adversarial tester models are available;
 - account rate limits when available;
 - structured JSON output for the supervisor;
 - optional cheap approval triage structured output when
@@ -109,7 +143,8 @@ Before starting the real coder, Sentinel checks:
 - app-server config requirements;
 - requested coder sandbox and approval settings.
 
-If one of these fails, Sentinel exits before real work starts.
+If one of these fails, Sentinel exits before real work starts and records the
+interruption in `.supervisor/FINAL_REPORT.md`.
 
 ## Runtime Model
 
@@ -282,7 +317,8 @@ Sentinel writes state under `.supervisor/` in the target project:
 
 Useful files:
 
-- `config.json`: task path, Codex version, schema hash, thread ids, generation.
+- `config.json`: task path, coder and supervisor models, Codex version, schema
+  hash, thread ids, generation.
 - `events.jsonl`: normalized event stream.
 - `PROGRESS.md`: supervisor progress notes.
 - `DECISIONS.md`: persistent supervisor decisions.

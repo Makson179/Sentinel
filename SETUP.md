@@ -175,6 +175,23 @@ Use a specific model for both coder and supervisor turns:
 supervisor --task TASK.md --model <model-name>
 ```
 
+By default, both roles use `gpt-5.5`. Use `gpt-5.5` for the 5.5 model; model
+names are Codex/OpenAI slugs accepted by the installed Codex app-server and the
+authenticated account. Sentinel checks the selected coder and supervisor models
+during startup preflight; if a selected model is unavailable, Sentinel stops
+before the coder starts and writes the reason to `.supervisor/FINAL_REPORT.md`.
+The adversarial tester always uses `gpt-5.5`, independent of the coder and
+supervisor model choices.
+
+Use different models for coder and supervisor turns:
+
+```bash
+supervisor --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
+```
+
+`--coder-mod` and `--super-mod` must be provided together. Do not combine them
+with `--model`.
+
 Clean a disposable task directory before starting:
 
 ```bash
@@ -291,8 +308,8 @@ Useful files:
 
 - `FINAL_REPORT.md`: final status, result, changed files, validations, and
   remaining risks.
-- `config.json`: selected task, model, Codex version, schema hash, thread ids,
-  generation, and status.
+- `config.json`: selected task, coder and supervisor models, Codex version,
+  schema hash, thread ids, generation, and status.
 - `events.jsonl`: normalized event stream.
 - `PROGRESS.md`: durable progress notes.
 - `DECISIONS.md`: durable supervisor decisions and constraints.

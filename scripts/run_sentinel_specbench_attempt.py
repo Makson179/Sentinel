@@ -546,7 +546,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-root", type=Path, required=True, help="Directory for all run outputs.")
     parser.add_argument("--sentinel-src", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--sentinel-bin", type=Path, help="Supervisor CLI to run. Defaults to sentinel-src/.venv/bin/supervisor.")
-    parser.add_argument("--model", help="Optional model passed through to the supervisor CLI.")
+    parser.add_argument("--model", help="Optional model passed through to both coder and supervisor.")
+    parser.add_argument("--coder-mod", help="Optional coder model passed through to the supervisor CLI. Requires --super-mod.")
+    parser.add_argument("--super-mod", help="Optional supervisor model passed through to the supervisor CLI. Requires --coder-mod.")
     parser.add_argument("--difficulty-level", type=int, default=1, help="Visible public-test difficulty level. Default: 1.")
     parser.add_argument("--test-timeout", type=int, default=900, help="SpecBench suite timeout in seconds.")
     parser.add_argument("--test-python", type=Path, help="Python executable used to run pytest for post-run scoring. Defaults to the runner Python.")
@@ -558,9 +560,17 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.supervisor_args and args.supervisor_args[0] == "--":
         args.supervisor_args = args.supervisor_args[1:]
+    validate_model_args(args, parser)
     if args.difficulty_level < 1:
         parser.error("--difficulty-level must be >= 1")
     return args
+
+
+def validate_model_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.model and (args.coder_mod or args.super_mod):
+        parser.error("--model cannot be combined with --coder-mod or --super-mod")
+    if bool(args.coder_mod) != bool(args.super_mod):
+        parser.error("--coder-mod and --super-mod must be used together")
 
 
 def make_paths(root: Path) -> RunPaths:
@@ -811,6 +821,8 @@ def run_sentinel(args: argparse.Namespace, paths: RunPaths, sentinel_src: Path) 
             cmd.extend(["--protected-path", protected_path])
     if args.model:
         cmd.extend(["--model", args.model])
+    if args.coder_mod and args.super_mod:
+        cmd.extend(["--coder-mod", args.coder_mod, "--super-mod", args.super_mod])
     cmd.extend(args.supervisor_args)
     write_json(paths.artifacts / "sentinel-command.json", cmd)
     env = os.environ.copy()
