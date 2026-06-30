@@ -98,11 +98,26 @@ def test_apply_patch_secret_write_denies(workspace: Path) -> None:
     assert decision.kind == PolicyDecisionKind.DENY
 
 
+def test_commands_invoking_sentinel_cli_deny(workspace: Path) -> None:
+    engine = PolicyEngine(workspace)
+
+    commands = [
+        "sentinel --task TASK.md",
+        "/opt/sentinel-venv/bin/sentinel --task TASK.md",
+        "'.venv\\Scripts\\sentinel.exe' --task TASK.md",
+        "supervisor --task TASK.md",
+    ]
+
+    for command in commands:
+        decision = engine.evaluate({"command": command})
+        assert decision.kind == PolicyDecisionKind.DENY
+        assert decision.reason == "commands invoking Sentinel are denied"
+
+
 def test_commands_containing_supervisor_deny(workspace: Path) -> None:
     engine = PolicyEngine(workspace)
 
     commands = [
-        "supervisor --task TASK.md",
         "cat .supervisor/HANDOFF.md",
         "echo SUPERVISOR",
     ]

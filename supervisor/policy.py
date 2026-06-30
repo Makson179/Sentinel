@@ -1174,6 +1174,20 @@ def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, 
         return False
 
 
+SENTINEL_CLI_NAMES = {"sentinel", "supervisor"}
+
+
+def _executable_basename(executable: str) -> str:
+    name = executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
+
+
+def command_invokes_sentinel_cli(analysis: CommandAnalysis) -> bool:
+    return any(_executable_basename(segment.executable) in SENTINEL_CLI_NAMES for segment in analysis.segments)
+
+
 def command_mentions_supervisor(command: str) -> bool:
     return "supervisor" in command.lower()
 
@@ -1277,6 +1291,8 @@ class PolicyEngine:
             analysis.risk_tags.add(GRADING_PATH_RISK_TAG)
             payload["risk_tags"] = sorted(analysis.risk_tags)
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}", **payload)
+        if command_invokes_sentinel_cli(analysis):
+            return PolicyDecision.deny("commands invoking Sentinel are denied", **payload)
         if command_mentions_supervisor(command):
             return PolicyDecision.deny("commands containing supervisor are denied", **payload)
         patch_paths = extract_apply_patch_paths(command)

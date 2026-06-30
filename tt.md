@@ -1,0 +1,30 @@
+# Sentinel Command Order
+
+Rule: write command parts in the same order as this file. If item A should be
+before item B in a command, item A has a smaller line number here.
+
+`pipx install "git+https://github.com/Makson179/Sentinel.git"` - install Sentinel from the default GitHub branch.
+`SENTINEL_SKIP_UPDATE_CHECK=1` - skip the startup update check for one command.
+`sentinel` - main command; run it from the project directory.
+`doctor` - check Python, Git, Codex, auth, app-server support, install metadata, and update status.
+`update` - update Sentinel, then use the updated install for future runs.
+`--version` - print Sentinel version, installed commit, and update status.
+`-V` - short form of `--version`.
+`--help` - show command help.
+`-h` - short form of `--help`.
+`--task TASK.md` - choose the markdown task file explicitly.
+`--model MODEL` - choose the Codex model for the run.
+`--start-over` - reset `.supervisor` state and start fresh.
+`--clean` - delete workspace files except the selected task file before starting; use only in disposable folders.
+`--adversary` - run the adversarial tester before final completion.
+`--protected-path PATH` - mark a hidden or grading path as protected; repeat this option for multiple paths.
+
+Examples:
+
+```bash
+sentinel doctor
+sentinel --version
+sentinel update
+sentinel --task TASK.md --model gpt-5 --start-over
+SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
+```

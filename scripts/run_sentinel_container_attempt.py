@@ -997,7 +997,7 @@ def agent_invocation_script(
             else ""
         )
         return (
-            "/opt/sentinel-venv/bin/supervisor --task TASK.md --start-over "
+            "/opt/sentinel-venv/bin/sentinel --task TASK.md --start-over "
             f"{('--model ' + sh_single(model)) if model else ''} "
             f"{role_model_args}"
             f"{' '.join(sh_single(arg) for arg in extra_supervisor_args)}"

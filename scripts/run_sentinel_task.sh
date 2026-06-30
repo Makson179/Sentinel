@@ -12,7 +12,7 @@ log_file=$3
 shift 3
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-sentinel_bin=${SENTINEL_BIN:-"$repo_root/.venv/bin/supervisor"}
+sentinel_bin=${SENTINEL_BIN:-"$repo_root/.venv/bin/sentinel"}
 
 if [[ "$log_file" != /* ]]; then
   log_file="$(pwd)/$log_file"

@@ -43,6 +43,28 @@ codex app-server generate-json-schema --experimental --out /tmp/sentinel-schema-
 The second command writes schema files into `/tmp/sentinel-schema-check`. It is
 only a capability check and can be removed afterwards.
 
+## Install Sentinel With pipx
+
+Install the latest Git version into an isolated pipx environment:
+
+```bash
+pipx install "git+https://github.com/Makson179/Sentinel.git"
+```
+
+Verify the installed command and local prerequisites:
+
+```bash
+sentinel doctor
+sentinel --version
+sentinel --help
+```
+
+To refresh an existing pipx install from the same Git ref:
+
+```bash
+pipx install --force "git+https://github.com/Makson179/Sentinel.git"
+```
+
 ## Install Sentinel From Source
 
 Clone the repository:
@@ -68,17 +90,24 @@ For development or test work, install the test extras:
 Verify the command is available:
 
 ```bash
-.venv/bin/supervisor --help
+.venv/bin/sentinel --help
 ```
 
-The package installs a console script named `supervisor`. The Python package
-name is `supervisor-agent`, but users normally run the `supervisor` command.
+On Windows, the virtualenv command path is:
+
+```powershell
+.venv\Scripts\sentinel.exe --help
+```
+
+The package installs a console script named `sentinel`. The internal Python
+import package is still named `supervisor`, but users normally run the
+`sentinel` command.
 
 If you prefer an activated shell:
 
 ```bash
 source .venv/bin/activate
-supervisor --help
+sentinel --help
 ```
 
 ## Optional Development Check
@@ -129,24 +158,39 @@ coder should run before claiming completion.
 From the target project directory:
 
 ```bash
-/path/to/Sentinel/.venv/bin/supervisor --task TASK.md
+/path/to/Sentinel/.venv/bin/sentinel --task TASK.md
 ```
 
 With an activated Sentinel virtual environment:
 
 ```bash
 cd /path/to/target-project
-supervisor --task TASK.md
+sentinel --task TASK.md
 ```
 
 Sentinel will run startup preflight checks, start the Codex app-server, create a
 coder thread, and begin supervising the run.
 
+For normal runs, Sentinel first checks the installed Git commit against the
+latest commit on the install source/ref. If an update is available, an
+interactive terminal can update and rerun the original command:
+
+```bash
+sentinel update
+```
+
+Non-interactive runs do not hang at the update prompt. To skip only this
+startup update gate in an emergency:
+
+```bash
+SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
+```
+
 If you omit `--task`, Sentinel scans for markdown files and opens a selector
 when there is more than one candidate:
 
 ```bash
-supervisor
+sentinel
 ```
 
 Preferred task filenames are ranked first:
@@ -166,13 +210,13 @@ and `venv`.
 Start from fresh Sentinel state:
 
 ```bash
-supervisor --task TASK.md --start-over
+sentinel --task TASK.md --start-over
 ```
 
 Use a specific model for both coder and supervisor turns:
 
 ```bash
-supervisor --task TASK.md --model <model-name>
+sentinel --task TASK.md --model <model-name>
 ```
 
 By default, both roles use `gpt-5.5`. Use `gpt-5.5` for the 5.5 model; model
@@ -195,7 +239,7 @@ with `--model`.
 Clean a disposable task directory before starting:
 
 ```bash
-supervisor --task TASK.md --clean
+sentinel --task TASK.md --clean
 ```
 
 `--clean` deletes every file and directory in the current folder except the
@@ -206,7 +250,7 @@ selected task file. Use it only in disposable task workspaces.
 By default, the coder runs with Sentinel's read-only sandbox request:
 
 ```bash
-SENTINEL_CODER_SANDBOX=read-only supervisor --task TASK.md
+SENTINEL_CODER_SANDBOX=read-only sentinel --task TASK.md
 ```
 
 In this mode, Codex asks for approvals when it needs to edit files, run
@@ -217,7 +261,7 @@ fresh supervisor review.
 For disposable environments where broader access is intentional:
 
 ```bash
-SENTINEL_CODER_SANDBOX=danger-full-access supervisor --task TASK.md
+SENTINEL_CODER_SANDBOX=danger-full-access sentinel --task TASK.md
 ```
 
 Only use `danger-full-access` in isolated workspaces or containers.
@@ -233,7 +277,7 @@ supervisor/prompts/prompts.toml
 For local prompt experiments, point Sentinel at another TOML file:
 
 ```bash
-SENTINEL_PROMPTS_FILE=/path/to/prompts.toml supervisor --task TASK.md
+SENTINEL_PROMPTS_FILE=/path/to/prompts.toml sentinel --task TASK.md
 ```
 
 The override file must contain the same required prompt sections as the bundled
@@ -340,7 +384,7 @@ Create hello.py that prints "hello from sentinel".
 Then run python3 hello.py to validate it.
 EOF
 
-/path/to/Sentinel/.venv/bin/supervisor --task TASK.md --start-over
+/path/to/Sentinel/.venv/bin/sentinel --task TASK.md --start-over
 ```
 
 After Sentinel exits:
@@ -355,7 +399,7 @@ To test task selection:
 
 ```bash
 echo '# Other task' > NOTES.md
-/path/to/Sentinel/.venv/bin/supervisor --start-over
+/path/to/Sentinel/.venv/bin/sentinel --start-over
 ```
 
 Sentinel should show a task selector because both `TASK.md` and `NOTES.md`
@@ -409,7 +453,7 @@ SENTINEL_CODER_SANDBOX=danger-full-access
 Create a task file such as `TASK.md`, or pass an explicit file:
 
 ```bash
-supervisor --task path/to/task.md
+sentinel --task path/to/task.md
 ```
 
 `task file must be inside project root`
@@ -418,14 +462,14 @@ Run Sentinel from the project root and choose a task file inside that directory.
 
 ## Current Runtime Notes
 
-The primary runtime is the plain `supervisor` command. It uses Codex app-server
+The primary runtime is the plain `sentinel` command. It uses Codex app-server
 JSON-RPC and does not run Codex through hooks, plugins, subagents, or
 `codex exec --json`.
 
 Start with:
 
 ```bash
-supervisor --task TASK.md
+sentinel --task TASK.md
 ```
 
 Do not run first experiments in an important repository. Start with a throwaway

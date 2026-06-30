@@ -545,10 +545,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--specbench-dir", type=Path, required=True, help="Path to the installed SpecBench checkout.")
     parser.add_argument("--results-root", type=Path, required=True, help="Directory for all run outputs.")
     parser.add_argument("--sentinel-src", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--sentinel-bin", type=Path, help="Supervisor CLI to run. Defaults to sentinel-src/.venv/bin/supervisor.")
+    parser.add_argument("--sentinel-bin", type=Path, help="Sentinel CLI to run. Defaults to sentinel-src/.venv/bin/sentinel, or .venv/Scripts/sentinel.exe on Windows.")
     parser.add_argument("--model", help="Optional model passed through to both coder and supervisor.")
-    parser.add_argument("--coder-mod", help="Optional coder model passed through to the supervisor CLI. Requires --super-mod.")
-    parser.add_argument("--super-mod", help="Optional supervisor model passed through to the supervisor CLI. Requires --coder-mod.")
+    parser.add_argument("--coder-mod", help="Optional coder model passed through to the Sentinel CLI. Requires --super-mod.")
+    parser.add_argument("--super-mod", help="Optional supervisor model passed through to the Sentinel CLI. Requires --coder-mod.")
     parser.add_argument("--difficulty-level", type=int, default=1, help="Visible public-test difficulty level. Default: 1.")
     parser.add_argument("--test-timeout", type=int, default=900, help="SpecBench suite timeout in seconds.")
     parser.add_argument("--test-python", type=Path, help="Python executable used to run pytest for post-run scoring. Defaults to the runner Python.")
@@ -600,7 +600,7 @@ def validate_inputs(args: argparse.Namespace, specbench_dir: Path, sentinel_src:
         raise SystemExit(f"sentinel source does not look like a Python project: {sentinel_src}")
     sentinel_bin = resolve_sentinel_bin(args, sentinel_src)
     if not sentinel_bin.exists():
-        raise SystemExit(f"supervisor CLI is missing: {sentinel_bin}")
+        raise SystemExit(f"Sentinel CLI is missing: {sentinel_bin}")
     test_python = resolve_test_python(args)
     if not test_python.exists():
         raise SystemExit(f"test Python is missing: {test_python}")
@@ -621,7 +621,9 @@ def validate_inputs(args: argparse.Namespace, specbench_dir: Path, sentinel_src:
 def resolve_sentinel_bin(args: argparse.Namespace, sentinel_src: Path) -> Path:
     if args.sentinel_bin:
         return args.sentinel_bin.expanduser().resolve()
-    return sentinel_src / ".venv" / "bin" / "supervisor"
+    if os.name == "nt":
+        return sentinel_src / ".venv" / "Scripts" / "sentinel.exe"
+    return sentinel_src / ".venv" / "bin" / "sentinel"
 
 
 def resolve_codex_source_home(args: argparse.Namespace) -> Path:
@@ -665,6 +667,8 @@ def resolve_visible_test_python(visible_test_venv: Path) -> Path:
 
 
 def resolve_venv_python(venv: Path) -> Path:
+    if os.name == "nt":
+        return venv / "Scripts" / "python.exe"
     python3 = venv / "bin" / "python3"
     python = venv / "bin" / "python"
     if python3.exists():

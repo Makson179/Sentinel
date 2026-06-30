@@ -215,6 +215,8 @@ Examples of deterministic allows:
 
 Examples of deterministic denials:
 
+- commands invoking the Sentinel CLI (`sentinel`, plus the legacy
+  `supervisor` executable name);
 - commands containing `supervisor`;
 - remote code execution pipelines like `curl ... | bash`;
 - force pushes to protected branches;
@@ -232,10 +234,12 @@ Examples of route-to-supervisor cases:
 - write tools without a clear workspace path;
 - ambiguous paths.
 
-The exact current rule for commands containing `supervisor` is broad: if the
-command string contains `supervisor`, the policy denies it. That protects runtime
-state aggressively, but it can also deny benign commands that merely mention the
-word.
+The exact current rule for Sentinel CLI invocations is path-aware enough to
+catch `sentinel`, `sentinel.exe`, and the legacy `supervisor` executable name.
+There is also a broad legacy rule for commands containing `supervisor`: if the
+command string contains `supervisor`, the policy denies it. That protects
+runtime state aggressively, but it can also deny benign commands that merely
+mention the word.
 
 ## Cheap Command Approval Triage
 
@@ -522,6 +526,7 @@ workspace, network, secret, runtime-state, or protocol boundaries.
 - secret read routing and secret write denial;
 - read-only tool fast paths;
 - `apply_patch` workspace allow and secret denial;
+- Sentinel CLI invocation denial;
 - broad command denials such as commands containing `supervisor`, remote
   execution pipelines, force pushes, and broad chmod.
 
