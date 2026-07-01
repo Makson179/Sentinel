@@ -25,6 +25,7 @@ from supervisor.task_select import TaskSelectionError
 @click.option("--model", default=None, help=f"Model to use for both coder and supervisor turns. Default: {DEFAULT_MODEL}.")
 @click.option("--coder-mod", "coder_model", default=None, help="Model to use for coder turns. Must be used with --super-mod.")
 @click.option("--super-mod", "supervisor_model", default=None, help="Model to use for supervisor turns. Must be used with --coder-mod.")
+@click.option("--fast", is_flag=True, help="Use Codex Fast service tier for both coder and supervisor turns.")
 @click.option("--start-over", is_flag=True, help="Reinitialize .supervisor state files.")
 @click.option(
     "--protected-path",
@@ -58,6 +59,7 @@ def cli(
     model: str | None,
     coder_model: str | None,
     supervisor_model: str | None,
+    fast: bool,
     start_over: bool,
     protected_paths: tuple[Path, ...],
     clean: bool,
@@ -77,6 +79,7 @@ def cli(
                 task_path,
                 selected_coder_model,
                 selected_supervisor_model,
+                fast,
                 start_over,
                 protected_paths,
                 clean,
@@ -229,6 +232,7 @@ async def _run_sentinel(
     task_path: Path | None,
     coder_model: str,
     supervisor_model: str,
+    fast: bool,
     start_over: bool,
     protected_paths: tuple[Path, ...],
     clean: bool,
@@ -239,6 +243,7 @@ async def _run_sentinel(
         task_path=task_path,
         coder_model=coder_model,
         supervisor_model=supervisor_model,
+        fast=fast,
         overwrite_state=start_over,
         declared_grading_roots=protected_paths,
         clean_workspace=clean,

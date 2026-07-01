@@ -9,6 +9,7 @@ from typing import Any, Callable, Literal
 from pydantic import ValidationError
 
 from supervisor.appserver import AppServerClient, AppServerError, last_agent_message_text, text_input
+from supervisor.coder import codex_service_tier
 from supervisor.prompts import build_completion_review_prompt, build_stateless_supervisor_prompt
 from supervisor.schemas import (
     AdversaryReport,
@@ -66,6 +67,7 @@ class StatelessSupervisorAgent:
         task_path: Path,
         *,
         model: str | None = None,
+        fast: bool = False,
         timeout_seconds: float = DEFAULT_SUPERVISOR_TIMEOUT_SECONDS,
         completion_timeout_seconds: float = DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS,
     ):
@@ -73,6 +75,7 @@ class StatelessSupervisorAgent:
         self.store = store
         self.task_path = task_path.resolve()
         self.model = model
+        self.fast = fast
         self.timeout_seconds = timeout_seconds
         self.completion_timeout_seconds = completion_timeout_seconds
         self.completion_thread_id: str | None = None
@@ -204,6 +207,7 @@ class StatelessSupervisorAgent:
                             "approvalPolicy": "never",
                             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
                             "outputSchema": schema,
+                            "serviceTier": codex_service_tier(fast=self.fast),
                             **({"model": self.model} if self.model else {}),
                         },
                         timeout=timeout_seconds,
@@ -530,6 +534,7 @@ class StatelessSupervisorAgent:
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
             "sandbox": "read-only",
+            "serviceTier": codex_service_tier(fast=self.fast),
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,

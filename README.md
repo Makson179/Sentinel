@@ -90,6 +90,10 @@ supervisor --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-mode
 `--coder-mod` and `--super-mod` must be provided together. `--model` cannot be
 combined with either of them.
 
+Add `--fast` to use the Codex Fast service tier for both coder and full
+supervisor turns. Without `--fast`, Sentinel explicitly clears the service tier
+for both roles instead of inheriting a fast tier from user Codex config.
+
 Model names are Codex/OpenAI model slugs accepted by the installed Codex
 app-server and the authenticated account. Use `gpt-5.5` for the default 5.5
 model. Other usable values are the model slugs exposed to your account by

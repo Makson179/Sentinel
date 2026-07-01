@@ -216,6 +216,7 @@ class SentinelController:
         model: str | None = None,
         coder_model: str | None = None,
         supervisor_model: str | None = None,
+        fast: bool = False,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
         use_git_diff: bool = True,
@@ -233,6 +234,7 @@ class SentinelController:
             supervisor_model=supervisor_model,
         )
         self.model = self.coder_model if self.coder_model == self.supervisor_model else None
+        self.fast = fast
         self.overwrite_state = overwrite_state
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
@@ -305,6 +307,7 @@ class SentinelController:
                 self.store,
                 self.task_path,
                 model=self._supervisor_model(),
+                fast=self._fast_mode(),
             )
             self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
             self.approvals = ApprovalManager(
@@ -314,7 +317,14 @@ class SentinelController:
                 declared_grading_roots=self.declared_grading_roots,
                 cheap_review_timeout_seconds=self.approval_triage_config.timeout_seconds,
             )
-            self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self._coder_model())
+            self.coder = CoderSession(
+                self.client,
+                self.store,
+                self.project_root,
+                self.task_path,
+                model=self._coder_model(),
+                fast=self._fast_mode(),
+            )
             await self.coder.start_thread()
             await self.coder.start_initial_turn()
             self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
@@ -336,6 +346,7 @@ class SentinelController:
             model=self.model,
             coder_model=self.coder_model,
             supervisor_model=self.supervisor_model,
+            fast=self._fast_mode(),
         )
         self.store.initialize_sentinel(config, overwrite=self.overwrite_state)
         _ensure_internal_runtime_git_excluded(self.project_root)
@@ -347,6 +358,7 @@ class SentinelController:
                     "model": self.model,
                     "coder_model": self.coder_model,
                     "supervisor_model": self.supervisor_model,
+                    "fast": self._fast_mode(),
                 }
             )
         )
@@ -356,6 +368,9 @@ class SentinelController:
 
     def _supervisor_model(self) -> str | None:
         return getattr(self, "supervisor_model", getattr(self, "model", DEFAULT_MODEL))
+
+    def _fast_mode(self) -> bool:
+        return bool(getattr(self, "fast", False))
 
     def _adversary_model(self) -> str:
         return ADVERSARY_MODEL
@@ -400,7 +415,9 @@ class SentinelController:
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
-        thread = await self.client.thread_start(coder_thread_params(self.project_root, model=self._coder_model()))
+        thread = await self.client.thread_start(
+            coder_thread_params(self.project_root, model=self._coder_model(), fast=self._fast_mode())
+        )
         approval_policy = thread.get("approvalPolicy")
         sandbox = thread.get("sandbox")
         thread_id = thread.get("thread", {}).get("id") if isinstance(thread.get("thread"), dict) else None
@@ -1024,7 +1041,14 @@ class SentinelController:
                 }
             )
         )
-        self.coder = CoderSession(self.client, self.store, self.project_root, self.task_path, model=self._coder_model())
+        self.coder = CoderSession(
+            self.client,
+            self.store,
+            self.project_root,
+            self.task_path,
+            model=self._coder_model(),
+            fast=self._fast_mode(),
+        )
         await self.coder.start_thread()
         await self.coder.start_restart_turn()
         self.tui.render("SYSTEM", "restart complete")
@@ -2950,6 +2974,7 @@ class SentinelController:
             self.store,
             self.task_path,
             model=self._supervisor_model(),
+            fast=self._fast_mode(),
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -3347,6 +3372,9 @@ def _classify_validation_command(command: str, *, changed_paths: list[str]) -> s
 
 
 def _is_static_validation_command(command: str) -> bool:
+    inner = _shell_command_payload(command)
+    if inner is not None and inner != command:
+        return _is_static_validation_command(inner)
     lowered = command.lower()
     executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
     node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
@@ -3499,6 +3527,9 @@ def _is_read_only_inspection_tokens(tokens: list[str]) -> bool:
 
 
 def _is_behavioral_validation_command(command: str) -> bool:
+    inner = _shell_command_payload(command)
+    if inner is not None and inner != command:
+        return _is_behavioral_validation_command(inner)
     lowered = command.lower()
     executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"

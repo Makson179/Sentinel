@@ -19,6 +19,7 @@ from supervisor.state import StateStore
 CODER_SANDBOX_ENV = "SENTINEL_CODER_SANDBOX"
 CODER_SANDBOX_READ_ONLY = "read-only"
 CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
+CODEX_FAST_SERVICE_TIER = "priority"
 
 
 def coder_sandbox_mode() -> str:
@@ -44,13 +45,18 @@ def coder_turn_sandbox_policy() -> dict[str, Any]:
     return {"type": "readOnly", "networkAccess": False}
 
 
-def coder_thread_params(project_root: Path, *, model: str | None = None) -> dict[str, Any]:
+def codex_service_tier(*, fast: bool) -> str | None:
+    return CODEX_FAST_SERVICE_TIER if fast else None
+
+
+def coder_thread_params(project_root: Path, *, model: str | None = None, fast: bool = False) -> dict[str, Any]:
     params: dict[str, Any] = {
         "cwd": str(project_root),
         "runtimeWorkspaceRoots": [str(project_root)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
+        "serviceTier": codex_service_tier(fast=fast),
         "ephemeral": False,
         "experimentalRawEvents": False,
         "persistExtendedHistory": False,
@@ -60,7 +66,14 @@ def coder_thread_params(project_root: Path, *, model: str | None = None) -> dict
     return params
 
 
-def coder_turn_params(thread_id: str, text: str, project_root: Path, *, model: str | None = None) -> dict[str, Any]:
+def coder_turn_params(
+    thread_id: str,
+    text: str,
+    project_root: Path,
+    *,
+    model: str | None = None,
+    fast: bool = False,
+) -> dict[str, Any]:
     params: dict[str, Any] = {
         "threadId": thread_id,
         "input": [text_input(text)],
@@ -69,6 +82,7 @@ def coder_turn_params(thread_id: str, text: str, project_root: Path, *, model: s
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandboxPolicy": coder_turn_sandbox_policy(),
+        "serviceTier": codex_service_tier(fast=fast),
     }
     if model:
         params["model"] = model
@@ -82,13 +96,14 @@ class CoderSession:
     project_root: Path
     task_path: Path
     model: str | None = None
+    fast: bool = False
     thread_id: str | None = None
     active_turn_id: str | None = None
     coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
 
     async def start_thread(self) -> str:
         response = await self.client.thread_start(
-            coder_thread_params(self.project_root, model=self.model),
+            coder_thread_params(self.project_root, model=self.model, fast=self.fast),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
         )
         thread = response.get("thread", {})
@@ -108,7 +123,7 @@ class CoderSession:
     async def start_turn(self, message: str) -> str:
         thread_id = self.thread_id or await self.start_thread()
         response = await self.client.turn_start(
-            coder_turn_params(thread_id, message, self.project_root, model=self.model),
+            coder_turn_params(thread_id, message, self.project_root, model=self.model, fast=self.fast),
             timeout=self.coder_rpc_timeout_seconds,
         )
         turn = response.get("turn", {})

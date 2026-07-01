@@ -53,3 +53,19 @@ def test_controller_records_split_models(tmp_path) -> None:
     assert config.model is None
     assert config.coder_model == "gpt-coder"
     assert config.supervisor_model == "gpt-supervisor"
+
+
+def test_controller_records_fast_mode(tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        coder_model="gpt-coder",
+        supervisor_model="gpt-supervisor",
+        fast=True,
+    )
+    controller.initialize_state()
+
+    assert controller.store.get_sentinel_config().fast is True
