@@ -349,6 +349,7 @@ class SentinelController:
             fast=self._fast_mode(),
         )
         self.store.initialize_sentinel(config, overwrite=self.overwrite_state)
+        self._sequence = self.store.max_event_sequence()
         _ensure_internal_runtime_git_excluded(self.project_root)
 
     def _persist_model_config(self) -> None:

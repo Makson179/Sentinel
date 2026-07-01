@@ -186,6 +186,20 @@ class StateStore:
     def append_event(self, event: AppEvent) -> None:
         self.append_text_locked(EVENTS, event.model_dump_json() + "\n")
 
+    def max_event_sequence(self) -> int:
+        max_sequence = 0
+        for line in self.read_text(EVENTS, "").splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sequence = payload.get("sequence")
+            if isinstance(sequence, int) and sequence > max_sequence:
+                max_sequence = sequence
+        return max_sequence
+
     def append_raw_log(self, entry: dict[str, Any]) -> None:
         self.append_text_locked(LOG, json.dumps(entry, default=str, sort_keys=True) + "\n")
 

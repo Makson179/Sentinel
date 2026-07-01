@@ -278,6 +278,42 @@ def test_sentinel_events_are_append_only_jsonl(tmp_path: Path) -> None:
     assert json.loads(lines[0])["event_type"] == "test"
 
 
+def test_controller_event_sequence_starts_at_one_when_events_are_empty(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    controller = SentinelController(tmp_path, task_path=task)
+    controller.initialize_state()
+
+    assert controller._sequence == 0
+
+    controller._append_event(AppEventSource.SYSTEM, "test/new")
+
+    lines = controller.store.path(EVENTS).read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[-1])["sequence"] == 1
+    assert controller.store.get_sentinel_config().last_event_sequence == 1
+
+
+def test_controller_event_sequence_continues_existing_events(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.append_event(AppEvent(sequence=7, source=AppEventSource.SYSTEM, event_type="old"))
+    store.append_event(AppEvent(sequence=42, source=AppEventSource.SYSTEM, event_type="newer"))
+
+    controller = SentinelController(tmp_path, task_path=task)
+    controller.initialize_state()
+
+    assert controller._sequence == 42
+
+    controller._append_event(AppEventSource.SYSTEM, "test/new")
+
+    lines = controller.store.path(EVENTS).read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[-1])["sequence"] == 43
+    assert controller.store.get_sentinel_config().last_event_sequence == 43
+
+
 def test_final_report_rendering(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
