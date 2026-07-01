@@ -126,6 +126,7 @@ python3 -m venv .venv
 .venv/bin/pytest -q
 ```
 
+
 ## Project Layout
 
 - `README.md` and `SETUP.md`: user-facing overview and installation/run guide.
