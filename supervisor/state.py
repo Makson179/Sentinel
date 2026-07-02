@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, Literal, TypeVar
 
 import fcntl
 from pydantic import BaseModel
@@ -29,6 +30,9 @@ SUPERVISOR_WAKES = "supervisor_wakes.jsonl"
 RUNTIME_TRACE = "runtime_trace.jsonl"
 RUNTIME_METRICS = "runtime_metrics.json"
 AGENT_SETTINGS = "agent-settings.json"
+PREVIOUS_RUNS = "previous_runs"
+
+INITIALIZATION_MODES = Literal["fresh", "resume"]
 
 
 def require_inside_workspace(workspace: Path, path: Path) -> Path:
@@ -149,8 +153,34 @@ class StateStore:
     def write_handoff(self, content: str) -> None:
         self.write_text_locked(HANDOFF, content)
 
-    def initialize_sentinel(self, config: SentinelConfig, overwrite: bool = False) -> None:
-        files = {
+    def initialize_sentinel(
+        self,
+        config: SentinelConfig,
+        overwrite: bool = False,
+        *,
+        mode: INITIALIZATION_MODES | None = None,
+    ) -> None:
+        mode = mode or ("fresh" if overwrite else "resume")
+        if mode == "fresh":
+            self._clear_state_dir(preserve=set())
+        elif mode == "resume":
+            self._clear_state_dir(preserve={EVENTS, LOG, PREVIOUS_RUNS})
+        else:
+            raise ValueError(f"unknown sentinel initialization mode: {mode}")
+
+        files = self._initial_state_files(config)
+        for name, value in files.items():
+            path = self.path(name)
+            if name in {EVENTS, LOG} and mode == "resume" and path.exists():
+                continue
+            if isinstance(value, BaseModel):
+                self.atomic_write_json(path, value)
+            else:
+                self.atomic_write_text(path, value)
+        self.ensure_previous_runs_dir()
+
+    def _initial_state_files(self, config: SentinelConfig) -> dict[str, Any]:
+        return {
             CONFIG: config,
             HEALTH: HealthState(generation=config.generation, restart_count=config.restart_count),
             PROGRESS: "# Progress\n\n- Current step: not started\n- Completed steps: none\n- Known issues: none\n",
@@ -164,14 +194,43 @@ class StateStore:
             RUNTIME_TRACE: "",
             RUNTIME_METRICS: "{}\n",
         }
-        for name, value in files.items():
-            path = self.path(name)
-            if path.exists() and not overwrite:
+
+    def _clear_state_dir(self, *, preserve: set[str]) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        for child in self.state_dir.iterdir():
+            if child.name in preserve:
                 continue
-            if isinstance(value, BaseModel):
-                self.atomic_write_json(path, value)
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
             else:
-                self.atomic_write_text(path, value)
+                child.unlink(missing_ok=True)
+
+    def ensure_previous_runs_dir(self) -> Path:
+        path = self.path(PREVIOUS_RUNS)
+        if path.exists() and not path.is_dir():
+            path.unlink()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def archive_completed_run(self, task_path: Path) -> Path:
+        previous_runs = self.ensure_previous_runs_dir()
+        run_dir = self._next_previous_run_dir(previous_runs)
+        run_dir.mkdir()
+        task_source = require_inside_workspace(self.workspace, task_path)
+        final_report_source = self.path(FINAL_REPORT)
+        shutil.copyfile(task_source, run_dir / "task.md")
+        shutil.copyfile(final_report_source, run_dir / FINAL_REPORT)
+        return run_dir
+
+    def _next_previous_run_dir(self, previous_runs: Path) -> Path:
+        max_run = 0
+        for child in previous_runs.iterdir():
+            if not child.is_dir() or not child.name.startswith("run"):
+                continue
+            suffix = child.name[3:]
+            if suffix.isdigit():
+                max_run = max(max_run, int(suffix))
+        return previous_runs / f"run{max_run + 1}"
 
     def get_sentinel_config(self) -> SentinelConfig:
         return SentinelConfig.model_validate(self.read_json(CONFIG, {}))

@@ -201,6 +201,9 @@ The snapshot is your evidence. task_contents is the objective. progress and deci
 Read current_summary first. It carries the wake reason, including the specific runtime trigger when there is one. If several events were coalesced, triggering_action and other single-event fields may be null even though a real trigger fired; judge from current_summary plus the full current state: changed_files, validations, validation freshness, recent_events, and last_coder_message.
 
 If the snapshot does not support a claim, do not make it. Absence of evidence is not evidence of success. masked_or_unknown validation is not passing evidence.
+
+You may read `.supervisor/previous_runs/run*/task.md` and `.supervisor/previous_runs/run*/FINAL_REPORT.md` as historical context from completed prior runs. Treat prior-run history as background only: the current task_contents, progress, decisions, handoff, recent_events, and current snapshot remain authoritative.
+
 </inputs>'''
 
 [stateless_supervisor.sections.state_writes]
@@ -328,6 +331,8 @@ text = '''<completion_inputs>
 This section defines the inputs and what counts as evidence.
 
 The snapshot carries task_contents (the objective), durable state, recent activity, the changed-file manifest, the validation ledger, the readiness message, prior runtime interventions, health, generation, and wake_sequence. To keep this snapshot small, full file diffs and full captured command output are NOT inlined: the validation and inspection ledgers carry only ids, outcomes, a short command, and a short summary per check. You have read-only access to the workspace — read the source with rg/sed/cat/nl, run `git diff`, and re-run any check yourself to obtain the detail you need. Do not assume a behavior holds without inspecting the actual code or output. If you are re-invoked after a prior return, judge the current submitted state and confirm by your own inspection that the defects you named are actually fixed.
+
+You may read `.supervisor/previous_runs/run*/task.md` and `.supervisor/previous_runs/run*/FINAL_REPORT.md` as historical context from completed prior runs. Treat prior-run history as background only: the current task_contents, durable state, recent activity, validation ledger, changed-file manifest, and current submitted workspace remain authoritative.
 
 Evidence, and how to weigh it:
 - validations is the machine-collected check ledger; use trusted_validation_outcome when available, and re-run the check or read its output yourself when you need the captured detail (it is not inlined). A validation supports a behavior only if it ran after the last relevant edit; a run before that edit is stale for that behavior.

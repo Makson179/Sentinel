@@ -291,6 +291,7 @@ class SentinelController:
         self._pending_adversary_report: AdversaryReport | None = None
         self._active_adversary_thread_id: str | None = None
         self._active_adversary_workspace_root: Path | None = None
+        self._final_report_archived = False
 
     async def run(self) -> None:
         self.initialize_state()
@@ -348,7 +349,8 @@ class SentinelController:
             supervisor_model=self.supervisor_model,
             fast=self._fast_mode(),
         )
-        self.store.initialize_sentinel(config, overwrite=self.overwrite_state)
+        mode = "fresh" if self.overwrite_state else "resume"
+        self.store.initialize_sentinel(config, mode=mode)
         self._sequence = self.store.max_event_sequence()
         _ensure_internal_runtime_git_excluded(self.project_root)
 
@@ -1095,12 +1097,19 @@ class SentinelController:
             diff_summary=diff,
         )
         self.store.write_final_report(report)
+        self._archive_final_report_once()
         self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": status}))
         self.tui.render("SUPERVISOR", result)
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
         await self._prepare_terminal_shutdown(result)
         self.running = False
         self._wake_event_loop_for_shutdown()
+
+    def _archive_final_report_once(self) -> None:
+        if getattr(self, "_final_report_archived", False):
+            return
+        self.store.archive_completed_run(self.task_path)
+        self._final_report_archived = True
 
     async def _prepare_terminal_shutdown(self, reason: str) -> None:
         if getattr(self, "_terminal_cleanup_started", False):
