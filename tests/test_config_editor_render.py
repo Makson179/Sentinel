@@ -48,6 +48,7 @@ def test_config_editor_render_marks_collapsed_expandable_fields() -> None:
     output = _render(height=14)
 
     assert any("││   ▸ ◇  coder-mod" in line for line in output.splitlines())
+    assert any("││  ─" in line for line in output.splitlines())
 
 
 def test_config_editor_render_shows_expanded_field_options() -> None:
@@ -82,7 +83,7 @@ def test_config_editor_render_uses_dynamic_model_options() -> None:
         EditorState(parameter_index=coder_index, expanded_index=coder_index),
         model_choices=("alpha-model", "beta-model"),
         width=100,
-        height=18,
+        height=22,
     )
 
     assert "alpha-model" in output
@@ -136,6 +137,8 @@ def test_config_editor_formatted_fragments_paint_backgrounds() -> None:
     assert all("bg:" in style for style, text in output if text != "\n")
     assert any("#18f8ff bg:#050716" in style for style, text in output if text == "╭")
     assert any("#f060f8 bg:#050716" in style for style, text in output if text == "╮")
+    assert any("bg:#21146a" in style for style, text in output if text.strip())
+    assert any("bg:#100832" in style for style, text in output if text.strip())
 
 
 def test_config_editor_layout_fits_supported_widths() -> None:
@@ -208,7 +211,7 @@ def test_config_editor_default_design_matches_reference_structure() -> None:
     params = parameter_defs(config)
     super_index = [param.key for param in params].index("super_mod")
 
-    output = _render(config, EditorState(parameter_index=super_index, expanded_index=super_index), width=120, height=24)
+    output = _render(config, EditorState(parameter_index=super_index, expanded_index=super_index), width=120, height=30)
 
     assert "CONFIG LOADED" in output
     assert "NAVIGATION" in output

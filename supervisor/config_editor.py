@@ -48,6 +48,14 @@ PANEL_BORDER_GRADIENT = (
     "#383080",
     "#303878",
 )
+ACTIVE_ROW_BG_GRADIENT = (
+    "#21146a",
+    "#1d115c",
+    "#190f4c",
+    "#170d3f",
+    "#130a34",
+    "#100832",
+)
 
 
 @dataclass(frozen=True)
@@ -162,6 +170,8 @@ class Theme:
             "active": "#f7f1ff bg:#170d3f",
             "active_dark": "#f7f1ff bg:#100832",
             "active_marker": "#08ffff bold",
+            "active_glow_left": "#18f8ff bg:#21146a",
+            "active_glow_right": "#f060f8 bg:#100832",
             "name": "#f0eaff",
             "border": "#383080 bg:#050716",
             "border_soft": "#182850 bg:#050716",
@@ -174,6 +184,7 @@ class Theme:
             "panel": "#d8d0ea bg:#06091c",
             "panel_header": "#d8d0ea bg:#070a20",
             "panel_title": "#8078ff bold",
+            "row_divider": "#182850 bg:#06091c",
             "table_header": "#8078ff bold",
             "tree": "#7050c0",
             "white": "#f0eaff",
@@ -575,6 +586,7 @@ class ConfigList:
         rows: list[FragmentLine] = []
         active_row = 0
         label_width = _label_width(parameters, max(0, width - 2))
+        inner_width = max(0, width - 2)
         for parameter_index, parameter in enumerate(parameters):
             expanded = state.expanded_index == parameter_index
             active_parameter = state.parameter_index == parameter_index and state.option_index is None
@@ -587,6 +599,8 @@ class ConfigList:
                     if active_option:
                         active_row = len(rows)
                     rows.append(ConfigList._option_row(config, parameter, option, active_option, theme))
+            if parameter_index + 1 < len(parameters):
+                rows.append(ConfigList._row_divider(inner_width, theme))
         return rows, active_row
 
     @staticmethod
@@ -597,6 +611,16 @@ class ConfigList:
             (_merge_styles(theme.style("panel_header"), theme.style("table_header")), WidthUtils.pad_right("SETTING", label_width)),
             (theme.style("panel_header"), "  "),
             (_merge_styles(theme.style("panel_header"), theme.style("table_header")), "VALUE"),
+        ]
+
+    @staticmethod
+    def _row_divider(width: int, theme: Theme) -> FragmentLine:
+        if width <= 4:
+            return [(theme.style("row_divider"), theme.symbols.horizontal * max(0, width))]
+        return [
+            (theme.style("panel"), "  "),
+            (theme.style("row_divider"), theme.symbols.horizontal * (width - 4)),
+            (theme.style("panel"), "  "),
         ]
 
     @staticmethod
@@ -868,12 +892,50 @@ def _panel_row(fragments: FragmentLine, inner_width: int, theme: Theme) -> Fragm
         fill_style = theme.style("panel_header")
     else:
         fill_style = theme.style("panel")
-    edge_style = theme.style("panel_active_border") if active else theme.style("panel_border")
+    fitted = _fit_active_row_fragments(fragments, inner_width, theme) if active else _fit_fragments(
+        fragments,
+        inner_width,
+        theme,
+        fill_style=fill_style,
+    )
+    left_edge_style = theme.style("active_glow_left") if active else theme.style("panel_border")
+    right_edge_style = theme.style("active_glow_right") if active else theme.style("panel_border")
     return [
-        (edge_style, theme.symbols.vertical),
-        *_fit_fragments(fragments, inner_width, theme, fill_style=fill_style),
-        (edge_style, theme.symbols.vertical),
+        (left_edge_style, theme.symbols.vertical),
+        *fitted,
+        (right_edge_style, theme.symbols.vertical),
     ]
+
+
+def _fit_active_row_fragments(fragments: FragmentLine, width: int, theme: Theme) -> FragmentLine:
+    fitted = _fit_fragments(fragments, width, theme, fill_style=theme.style("active"))
+    return _apply_background_gradient(fitted, max(1, width), ACTIVE_ROW_BG_GRADIENT)
+
+
+def _apply_background_gradient(fragments: FragmentLine, width: int, colors: tuple[str, ...]) -> FragmentLine:
+    rendered: FragmentLine = []
+    column = 0
+    for style, text in fragments:
+        current_style: str | None = None
+        current_text: list[str] = []
+        for char in text:
+            char_width = max(wcwidth(char), 0)
+            color_index = min(len(colors) - 1, column * len(colors) // width)
+            next_style = _style_with_bg(style, colors[color_index])
+            if next_style != current_style and current_text:
+                rendered.append((cast(str, current_style), "".join(current_text)))
+                current_text = []
+            current_style = next_style
+            current_text.append(char)
+            column += char_width
+        if current_text and current_style is not None:
+            rendered.append((current_style, "".join(current_text)))
+    return rendered
+
+
+def _style_with_bg(style: str, bg: str) -> str:
+    tokens = [token for token in style.split() if not token.startswith("bg:")]
+    return " ".join([*tokens, f"bg:{bg}"])
 
 
 def _side_text(text: str, theme: Theme, *, style_key: str) -> FragmentLine:
