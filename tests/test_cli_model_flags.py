@@ -151,3 +151,26 @@ def test_controller_records_fast_mode(tmp_path) -> None:
     controller.initialize_state()
 
     assert controller.store.get_sentinel_config().fast is True
+
+
+def test_controller_records_runtime_config_flags(tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    protected_path = tmp_path / "hidden"
+
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        clean_workspace=True,
+        overwrite_state=False,
+        adversary_enabled=False,
+        declared_grading_roots=(protected_path,),
+    )
+    controller.initialize_state()
+
+    config = controller.store.get_sentinel_config()
+    assert config.start_over is False
+    assert config.clean is True
+    assert config.protected_paths == [str(protected_path)]
+    assert config.adversary is False
+    assert config.max_adversary_runs == 0

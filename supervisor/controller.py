@@ -246,6 +246,7 @@ class SentinelController:
         self.supervisor_intelligence = supervisor_intelligence
         self.fast = fast
         self.overwrite_state = overwrite_state
+        self.clean_workspace = clean_workspace
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
@@ -352,6 +353,7 @@ class SentinelController:
             await self.client.stop()
 
     def initialize_state(self) -> None:
+        adversary_enabled = self._adversary_enabled_for_config()
         config = SentinelConfig(
             project_root=str(self.project_root),
             task_path=str(self.task_path),
@@ -362,6 +364,11 @@ class SentinelController:
             coder_intelligence=self._coder_intelligence(),
             supervisor_intelligence=self._supervisor_intelligence(),
             fast=self._fast_mode(),
+            start_over=self.overwrite_state,
+            clean=self.clean_workspace,
+            protected_paths=list(self.declared_grading_roots),
+            adversary=adversary_enabled,
+            max_adversary_runs=1 if adversary_enabled else 0,
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_sentinel(config, mode=mode)
@@ -369,6 +376,7 @@ class SentinelController:
         _ensure_internal_runtime_git_excluded(self.project_root)
 
     def _persist_model_config(self) -> None:
+        adversary_enabled = self._adversary_enabled_for_config()
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(
                 update={
@@ -378,6 +386,11 @@ class SentinelController:
                     "coder_intelligence": self._coder_intelligence(),
                     "supervisor_intelligence": self._supervisor_intelligence(),
                     "fast": self._fast_mode(),
+                    "start_over": self.overwrite_state,
+                    "clean": self.clean_workspace,
+                    "protected_paths": list(self.declared_grading_roots),
+                    "adversary": adversary_enabled,
+                    "max_adversary_runs": 1 if adversary_enabled else 0,
                 }
             )
         )
@@ -390,6 +403,12 @@ class SentinelController:
 
     def _fast_mode(self) -> bool:
         return bool(getattr(self, "fast", False))
+
+    def _adversary_enabled_for_config(self) -> bool:
+        enabled = getattr(self, "adversary_enabled", None)
+        if enabled is False:
+            return False
+        return True
 
     def _coder_intelligence(self) -> str | None:
         return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)

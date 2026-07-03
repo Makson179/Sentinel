@@ -14,10 +14,15 @@ from supervisor.project_config import (
     DEFAULT_MODEL,
     ProjectConfig,
     ProjectConfigError,
+    changed_project_config_fields,
+    ensure_runtime_state_initialized,
     load_project_config,
     project_config_path,
     save_project_config,
+    sync_runtime_config_fields,
 )
+from supervisor.schemas import SentinelConfig
+from supervisor.state import CONFIG, PROGRESS, StateStore
 
 
 def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
@@ -67,6 +72,79 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["protected_path"] == ["hidden"]
     assert payload["speed"] == "fast"
     assert payload["clean"] is True
+
+
+def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> None:
+    config = ProjectConfig(speed="fast", adversary=False)
+
+    ensure_runtime_state_initialized(tmp_path, config)
+
+    store = StateStore(tmp_path)
+    assert store.path(CONFIG).exists()
+    assert store.path(PROGRESS).exists()
+    runtime_config = store.get_sentinel_config()
+    assert runtime_config.project_root == str(tmp_path.resolve())
+    assert runtime_config.task_path == ""
+    assert runtime_config.fast is True
+    assert runtime_config.adversary is False
+    assert runtime_config.max_adversary_runs == 0
+
+
+def test_config_does_not_touch_existing_supervisor_state_by_default(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    existing = SentinelConfig(
+        project_root=str(tmp_path),
+        task_path="TASK.md",
+        generation=3,
+        coder_thread_id="thread",
+        coder_model="runtime-coder",
+    )
+    store.write_json_locked(CONFIG, existing)
+
+    ensure_runtime_state_initialized(tmp_path, ProjectConfig(coder_mod="config-coder"))
+
+    runtime_config = store.get_sentinel_config()
+    assert runtime_config.generation == 3
+    assert runtime_config.coder_thread_id == "thread"
+    assert runtime_config.coder_model == "runtime-coder"
+
+
+def test_config_change_patches_only_changed_runtime_fields(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.write_json_locked(
+        CONFIG,
+        SentinelConfig(
+            project_root=str(tmp_path),
+            task_path="TASK.md",
+            generation=4,
+            coder_thread_id="thread",
+            coder_model="runtime-coder",
+            supervisor_model="runtime-super",
+            fast=False,
+            clean=False,
+        ),
+    )
+
+    sync_runtime_config_fields(
+        tmp_path,
+        ProjectConfig(coder_mod="config-coder", super_mod="config-super", speed="fast", clean=True),
+        ("speed",),
+    )
+
+    runtime_config = store.get_sentinel_config()
+    assert runtime_config.generation == 4
+    assert runtime_config.coder_thread_id == "thread"
+    assert runtime_config.coder_model == "runtime-coder"
+    assert runtime_config.supervisor_model == "runtime-super"
+    assert runtime_config.fast is True
+    assert runtime_config.clean is False
+
+
+def test_changed_project_config_fields_tracks_actual_changes() -> None:
+    before = ProjectConfig(speed="usual", clean=False)
+    after = ProjectConfig(speed="fast", clean=False)
+
+    assert changed_project_config_fields(before, after) == ("speed",)
 
 
 def test_config_editor_state_expands_selects_and_advances() -> None:

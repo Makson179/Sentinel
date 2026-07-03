@@ -5,7 +5,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 PROJECT_CONFIG_DIR = ".sentinel"
@@ -14,6 +14,18 @@ DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_INTELLIGENCE = "xhigh"
 INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
 SPEED_CHOICES = ("usual", "fast")
+RUNTIME_SYNC_FIELDS = (
+    "task",
+    "coder_mod",
+    "super_mod",
+    "coder_intelligence",
+    "super_intelligence",
+    "speed",
+    "start_over",
+    "adversary",
+    "clean",
+    "protected_path",
+)
 
 
 class ProjectConfigError(RuntimeError):
@@ -95,6 +107,51 @@ def save_project_config(project_root: Path, config: ProjectConfig) -> None:
             os.unlink(tmp_name)
 
 
+def ensure_runtime_state_initialized(project_root: Path, config: ProjectConfig) -> None:
+    from supervisor.state import STATE_DIR_NAME, StateStore
+
+    state_dir = project_root.resolve() / STATE_DIR_NAME
+    if state_dir.exists():
+        return
+    store = StateStore(project_root)
+    store.initialize_sentinel(_runtime_config_from_project_config(project_root, config), mode="fresh")
+
+
+def sync_runtime_config_fields(project_root: Path, config: ProjectConfig, fields: Iterable[str]) -> None:
+    selected_fields = tuple(dict.fromkeys(field for field in fields if field in RUNTIME_SYNC_FIELDS))
+    if not selected_fields:
+        return
+
+    from pydantic import ValidationError
+
+    from supervisor.schemas import SentinelConfig
+    from supervisor.state import CONFIG, StateStore
+
+    store = StateStore(project_root)
+    raw_config: Any
+    try:
+        raw_config = store.read_json(CONFIG, {})
+    except (OSError, json.JSONDecodeError):
+        raw_config = {}
+
+    runtime_config: SentinelConfig
+    if isinstance(raw_config, dict) and raw_config:
+        try:
+            runtime_config = SentinelConfig.model_validate(raw_config)
+        except ValidationError:
+            runtime_config = _runtime_config_from_project_config(project_root, config)
+    else:
+        runtime_config = _runtime_config_from_project_config(project_root, config)
+
+    updates = _runtime_updates_for_fields(config, selected_fields)
+    if updates:
+        store.write_json_locked(CONFIG, runtime_config.model_copy(update=updates))
+
+
+def changed_project_config_fields(before: ProjectConfig, after: ProjectConfig) -> tuple[str, ...]:
+    return tuple(field for field in RUNTIME_SYNC_FIELDS if getattr(before, field) != getattr(after, field))
+
+
 def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfig:
     default = default_project_config()
     return ProjectConfig(
@@ -162,3 +219,39 @@ def _string_list(value: Any, field: str, *, path: Path) -> list[str]:
         if stripped:
             result.append(stripped)
     return result
+
+
+def _runtime_config_from_project_config(project_root: Path, config: ProjectConfig):
+    from supervisor.schemas import SentinelConfig
+
+    return SentinelConfig(
+        project_root=str(project_root.resolve()),
+        **_runtime_updates_for_fields(config, RUNTIME_SYNC_FIELDS),
+    )
+
+
+def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) -> dict[str, Any]:
+    selected = set(fields)
+    updates: dict[str, Any] = {}
+    if "task" in selected:
+        updates["task_path"] = config.task or ""
+    if selected.intersection({"coder_mod", "super_mod"}):
+        updates["model"] = config.coder_mod if config.coder_mod == config.super_mod else None
+        updates["coder_model"] = config.coder_mod
+        updates["supervisor_model"] = config.super_mod
+    if "coder_intelligence" in selected:
+        updates["coder_intelligence"] = config.coder_intelligence
+    if "super_intelligence" in selected:
+        updates["supervisor_intelligence"] = config.super_intelligence
+    if "speed" in selected:
+        updates["fast"] = config.fast
+    if "start_over" in selected:
+        updates["start_over"] = config.start_over
+    if "clean" in selected:
+        updates["clean"] = config.clean
+    if "protected_path" in selected:
+        updates["protected_paths"] = list(config.protected_path)
+    if "adversary" in selected:
+        updates["adversary"] = config.adversary
+        updates["max_adversary_runs"] = 1 if config.adversary else 0
+    return updates

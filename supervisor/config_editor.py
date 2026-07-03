@@ -13,9 +13,12 @@ from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
     SPEED_CHOICES,
     ProjectConfig,
+    changed_project_config_fields,
+    ensure_runtime_state_initialized,
     load_project_config,
     project_config_path,
     save_project_config,
+    sync_runtime_config_fields,
 )
 
 
@@ -198,6 +201,7 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         raise RuntimeError("sentinel config requires prompt_toolkit; reinstall Sentinel with project dependencies") from exc
 
     config = load_project_config(project_root, create=True)
+    ensure_runtime_state_initialized(project_root, config)
     model_choices = available_model_choices(project_root)
     path = project_config_path(project_root)
     state = EditorState()
@@ -222,9 +226,10 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         @kb.add("enter")
         def _enter(event) -> None:
             nonlocal config, state
+            previous_config = config
             config, state, action = select_current(config, state, model_choices)
             if action is None:
-                save_project_config(project_root, config)
+                _save_config_change(project_root, previous_config, config)
                 event.app.invalidate()
                 return
             pending_action["action"] = action
@@ -247,20 +252,29 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         parameter = parameter_defs(config, model_choices)[state.parameter_index]
         if action == "edit_text" and parameter.key == "task":
             raw = prompt("Task path (blank to unset): ", default=config.task or "")
+            previous_config = config
             config = replace(config, task=raw.strip() or None)
-            save_project_config(project_root, config)
+            _save_config_change(project_root, previous_config, config)
             state = advance_after_selection(state, len(parameter_defs(config, model_choices)))
         elif action == "add_protected_path":
             raw = prompt("Protected path: ")
             value = raw.strip()
             if value:
+                previous_config = config
                 config = replace(config, protected_path=tuple([*config.protected_path, value]))
-                save_project_config(project_root, config)
+                _save_config_change(project_root, previous_config, config)
             state = advance_after_selection(state, len(parameter_defs(config, model_choices)))
 
 
 def _format_bool(value: bool) -> str:
     return "true" if value else "false"
+
+
+def _save_config_change(project_root: Path, previous_config: ProjectConfig, config: ProjectConfig) -> None:
+    save_project_config(project_root, config)
+    changed_fields = changed_project_config_fields(previous_config, config)
+    if changed_fields:
+        sync_runtime_config_fields(project_root, config, changed_fields)
 
 
 def available_model_choices(project_root: Path) -> tuple[str, ...]:
