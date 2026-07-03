@@ -311,6 +311,7 @@ class SentinelController:
             await self.client.initialize()
             await self.tui.start()
             self.running = True
+            self.tui.render("SYSTEM", self._runtime_settings_summary())
             await self.preflight()
             if not self.running:
                 return
@@ -409,6 +410,27 @@ class SentinelController:
         if enabled is False:
             return False
         return True
+
+    def _runtime_settings_summary(self) -> str:
+        protected_paths = (
+            ", ".join(_workspace_display_path(self.project_root, path) for path in self.declared_grading_roots)
+            if self.declared_grading_roots
+            else "absent"
+        )
+        speed = "fast" if self._fast_mode() else "usual"
+        return (
+            "settings: "
+            f"task={_workspace_display_path(self.project_root, str(self.task_path))} "
+            f"coder-mod={self._coder_model()} "
+            f"super-mod={self._supervisor_model()} "
+            f"coder-intelligence={self._coder_intelligence()} "
+            f"super-intelligence={self._supervisor_intelligence()} "
+            f"speed={speed} "
+            f"start-over={_format_bool(self.overwrite_state)} "
+            f"clean={_format_bool(self.clean_workspace)} "
+            f"adversary={_format_bool(self._adversary_enabled_for_config())} "
+            f"protected-path={protected_paths}"
+        )
 
     def _coder_intelligence(self) -> str | None:
         return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)
@@ -6819,6 +6841,10 @@ def _workspace_display_path(project_root: Path, raw_path: str) -> str:
         return str(path.resolve().relative_to(project_root.resolve()))
     except ValueError:
         return raw_path
+
+
+def _format_bool(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def _is_internal_runtime_path(path: str, *, project_root: Path | None, task_path: Path | str | None) -> bool:

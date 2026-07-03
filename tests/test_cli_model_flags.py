@@ -174,3 +174,36 @@ def test_controller_records_runtime_config_flags(tmp_path) -> None:
     assert config.protected_paths == [str(protected_path)]
     assert config.adversary is False
     assert config.max_adversary_runs == 0
+
+
+def test_controller_runtime_settings_summary_uses_effective_values(tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    protected_path = tmp_path / "hidden"
+
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        coder_model="cli-coder",
+        supervisor_model="cli-supervisor",
+        coder_intelligence="high",
+        supervisor_intelligence="xhigh",
+        fast=True,
+        overwrite_state=False,
+        clean_workspace=False,
+        adversary_enabled=False,
+        declared_grading_roots=(protected_path,),
+    )
+
+    assert controller._runtime_settings_summary() == (
+        "settings: task=TASK.md "
+        "coder-mod=cli-coder "
+        "super-mod=cli-supervisor "
+        "coder-intelligence=high "
+        "super-intelligence=xhigh "
+        "speed=fast "
+        "start-over=false "
+        "clean=false "
+        "adversary=false "
+        "protected-path=hidden"
+    )
