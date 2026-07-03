@@ -624,6 +624,7 @@ class SentinelController:
             fallback_manager = ApprovalManager(
                 adversary_workspace_root or self.project_root,
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                adversary_mode=adversary_workspace_root is not None,
             )
             if adversary_workspace_root is None:
                 resolution = fallback_manager._deny(context, "adversary snapshot workspace is not active")
@@ -6994,7 +6995,46 @@ def _create_adversary_snapshot(project_root: Path) -> Path:
     except Exception:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
+    _init_snapshot_git(snapshot_root)
     return snapshot_root
+
+
+def _init_snapshot_git(snapshot_root: Path) -> None:
+    """Give the snapshot a functional git repo so tests/tools that shell out to git work.
+
+    Best-effort: an empty initial commit makes HEAD/status/diff usable while keeping every
+    file untracked, so recursive deletes inside the snapshot stay policy-approvable.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return
+    identity = [
+        "-c",
+        "user.email=sentinel@localhost",
+        "-c",
+        "user.name=Sentinel Snapshot",
+        "-c",
+        "commit.gpgsign=false",
+    ]
+    try:
+        subprocess.run(
+            [git, "init", "-q"],
+            cwd=snapshot_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        subprocess.run(
+            [git, *identity, "commit", "-q", "--allow-empty", "-m", "sentinel adversary snapshot baseline"],
+            cwd=snapshot_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return
 
 
 def _adversary_snapshot_ignore(directory: str, names: list[str]) -> set[str]:

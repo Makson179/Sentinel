@@ -17,7 +17,7 @@ from supervisor.prompts import build_adversary_prompt
 from supervisor.schemas import SupervisorWakePacket
 
 
-DEFAULT_ADVERSARY_TIMEOUT_SECONDS = 900.0
+DEFAULT_ADVERSARY_TIMEOUT_SECONDS = 1800.0
 
 
 class AdversaryAgentError(RuntimeError):
@@ -241,6 +241,10 @@ def _report_has_candidate_finding(report_text: str) -> bool:
 def _looks_like_report_section(line: str) -> bool:
     prefixes = (
         "attacked:",
+        "previous_findings_checked:",
+        "previous findings checked:",
+        "findings:",
+        "observations:",
         "held:",
         "not_reached:",
         "not reached:",
@@ -248,6 +252,7 @@ def _looks_like_report_section(line: str) -> bool:
         "candidate_finding:",
         "candidate finding:",
     )
-    if any(line.startswith(prefix) for prefix in prefixes):
+    normalized = line.lstrip("-* \t")
+    if any(normalized.startswith(prefix) for prefix in prefixes):
         return True
     return False

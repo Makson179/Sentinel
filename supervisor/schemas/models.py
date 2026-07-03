@@ -253,7 +253,6 @@ class SupervisorDecision(BaseModel):
     message_to_coder: str | None = None
     persistent_decision: str | None = None
     progress_update: str | None = None
-    health_delta: dict[str, Any] | None = None
     clear_handoff: bool = False
     display_message: str | None = None
     handoff: RestartHandoff | None = None
@@ -303,7 +302,6 @@ class CompletionDecisionArtifact(BaseModel):
     stale_concerns: list[str] = Field(default_factory=list)
     uncovered_edge_candidates: list[str] = Field(default_factory=list)
     actionable_gap_or_none: str | None = None
-    decision: CompletionReviewDecisionKind
 
 
 class CompletionReviewDecision(BaseModel):

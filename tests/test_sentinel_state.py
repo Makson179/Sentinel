@@ -2336,7 +2336,6 @@ async def test_completion_review_no_message_retries_with_ultra_compact_minimal_p
             "stale_concerns": [],
             "uncovered_edge_candidates": ["independent demo missing"],
             "actionable_gap_or_none": "run an independent demo",
-            "decision": "return",
         },
         "basis_event_seq": 7,
         "last_relevant_edit_seq": 5,
@@ -3161,7 +3160,6 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
                 "stale_concerns": ["old gap"],
                 "uncovered_edge_candidates": [],
                 "actionable_gap_or_none": "old gap",
-                "decision": "return",
             },
             "basis_event_seq": 10,
             "last_relevant_edit_seq": 8,
@@ -5052,3 +5050,32 @@ class _FakeTUI:
 
     async def stop(self):
         self.messages.append(("STOP", ""))
+
+
+def test_adversary_snapshot_gets_functional_git_repo(tmp_path: Path) -> None:
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    from supervisor.controller import _create_adversary_snapshot
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("print('x')\n", encoding="utf-8")
+
+    snapshot = _create_adversary_snapshot(project)
+    try:
+        assert (snapshot / "app.py").exists()
+        assert (snapshot / ".git").is_dir()
+        head = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=snapshot, capture_output=True, text=True
+        )
+        assert head.returncode == 0
+        status = _subprocess.run(
+            ["git", "status", "--short"], cwd=snapshot, capture_output=True, text=True
+        )
+        assert status.returncode == 0
+        # Files stay untracked on purpose: recursive deletes inside the snapshot must
+        # remain approvable for the adversary (tracked paths would be policy-denied).
+        assert "?? app.py" in status.stdout
+    finally:
+        _shutil.rmtree(snapshot.parent, ignore_errors=True)

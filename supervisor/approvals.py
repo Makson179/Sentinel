@@ -15,7 +15,12 @@ from supervisor.approval_triage import (
     validate_cheap_approval,
 )
 from supervisor.appserver import AppServerMessage
-from supervisor.policy import PolicyEngine, is_secret_path, normalize_path
+from supervisor.policy import (
+    PolicyEngine,
+    analyze_command,
+    is_secret_path,
+    normalize_path,
+)
 from supervisor.schemas import (
     ApprovalContext,
     ApprovalRequestType,
@@ -28,6 +33,28 @@ from supervisor.schemas import (
     SupervisorDecisionKind,
 )
 
+
+# Adversary approval profile.
+#
+# The adversary is already free inside its disposable snapshot: the codex OS sandbox
+# (workspace-write, network off) runs any contained probe — scripts, tests, local tools,
+# deletes — WITHOUT ever raising an approval request. This chain is reached only when a
+# command asks to leave the sandbox (network, write/read outside the snapshot). Approving
+# such a command runs it UNSANDBOXED, so at that point "leaving the cage" is exactly what
+# we must not rubber-stamp.
+#
+# Fail closed: allow the escalation only when EVERY risk tag is in the contained-safe set
+# below; any other tag (network, interpreter_execution/unknown_executable — which can open
+# a socket or read grading material at runtime past static analysis, see the integrity note
+# on CHEAP_REVIEW_BLOCK_TAGS — dependency/git mutation that fetch over the network, secret
+# or grading paths, workspace escape, ambiguous parse, ...) denies. A new tag added later is
+# denied by default rather than silently allowed.
+ADVERSARY_SNAPSHOT_SAFE_TAGS = {
+    "filesystem_write",
+    "destructive",
+    "permission_change",
+    "environment_mutation",
+}
 
 COMMAND_APPROVAL_METHOD = "item/commandExecution/requestApproval"
 FILE_CHANGE_APPROVAL_METHOD = "item/fileChange/requestApproval"
@@ -118,6 +145,7 @@ class ApprovalManager:
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         timeout_seconds: float = 180.0,
         cheap_review_timeout_seconds: float = 20.0,
+        adversary_mode: bool = False,
     ):
         self.workspace = workspace.resolve()
         self.policy = PolicyEngine(self.workspace, declared_grading_roots=declared_grading_roots)
@@ -125,6 +153,7 @@ class ApprovalManager:
         self.cheap_reviewer = cheap_reviewer
         self.timeout_seconds = timeout_seconds
         self.cheap_review_timeout_seconds = cheap_review_timeout_seconds
+        self.adversary_mode = adversary_mode
         self.last_cheap_review_attempt: CheapApprovalAttempt | None = None
 
     async def decide(self, context: ApprovalContext) -> ApprovalResolution:
@@ -159,7 +188,30 @@ class ApprovalManager:
             return self._allow(context, policy_decision.reason)
         if policy_decision.kind == PolicyDecisionKind.DENY:
             return self._deny(context, policy_decision.reason)
+        if self.adversary_mode:
+            return self._adversary_containment_decision(context)
         return await self._route_review_chain_or_full_supervisor(context, policy_decision)
+
+    def _adversary_containment_decision(self, context: ApprovalContext) -> ApprovalResolution:
+        """Adversary gray zone: allow only escalations that stay contained in the snapshot.
+
+        Approving an escalated command runs it outside the OS sandbox, so containment is
+        checked statically and fail-closed: the command is auto-approved only when every
+        risk tag is in ADVERSARY_SNAPSHOT_SAFE_TAGS; any other tag (network, interpreter or
+        unknown-binary execution, dependency/git fetch, secret/grading path, workspace
+        escape, ambiguous parse) denies.
+        """
+        analysis = analyze_command(self.workspace, context.command or "", context.cwd)
+        unsafe = analysis.risk_tags - ADVERSARY_SNAPSHOT_SAFE_TAGS
+        if unsafe:
+            return self._deny(
+                context,
+                "adversary snapshot policy denies leaving the sandbox: " + ", ".join(sorted(unsafe)),
+            )
+        return self._allow(
+            context,
+            "adversary command is contained in the disposable snapshot; auto-approved",
+        )
 
     def response_payload(self, context: ApprovalContext, resolution: ApprovalResolution) -> dict[str, Any]:
         method = context.server_request_method

@@ -710,3 +710,80 @@ def test_cheap_runtime_packet_is_slim(tmp_path: Path) -> None:
     assert "X" * 1000 not in prompt  # task body not present
     assert len(prompt) < 8000  # genuinely slim
     assert json.loads(prompt)["instructions"]  # carries the classifier instructions
+
+
+@pytest.mark.asyncio
+async def test_adversary_mode_allows_destructive_delete_inside_snapshot(tmp_path: Path) -> None:
+    # Contained cleanup escalates (destructive) but stays inside the snapshot → auto-approve.
+    (tmp_path / "build").mkdir()
+    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    context = command_context(tmp_path, "rm -rf build")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision == "accept"
+    assert "disposable snapshot" in resolution.reason
+
+
+@pytest.mark.asyncio
+async def test_adversary_mode_allows_in_snapshot_file_write(tmp_path: Path) -> None:
+    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    context = command_context(tmp_path, "mkdir probe_out")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision == "accept"
+
+
+@pytest.mark.asyncio
+async def test_adversary_mode_denies_network_command(tmp_path: Path) -> None:
+    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    context = command_context(tmp_path, "curl http://localhost:9999/health")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_adversary_mode_denies_interpreter_execution(tmp_path: Path) -> None:
+    # python -c could open a socket or read grading material at runtime, invisible to static
+    # analysis — must not run unsandboxed. Contained scripts run via the OS sandbox without
+    # ever reaching this chain, so this does not restrict honest in-snapshot probing.
+    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    context = command_context(
+        tmp_path, "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://x\")'"
+    )
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision in {"decline", "cancel"}
+    assert "adversary snapshot policy denies" in resolution.reason
+
+
+@pytest.mark.asyncio
+async def test_adversary_mode_denies_unknown_binary_and_dependency_install(tmp_path: Path) -> None:
+    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    for command in ("nc evil.example 443", "pip install requests"):
+        resolution = await manager.decide(command_context(tmp_path, command))
+        assert resolution.decision in {"decline", "cancel"}, command
+
+
+@pytest.mark.asyncio
+async def test_adversary_mode_denies_workspace_escape(tmp_path: Path) -> None:
+    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    context = command_context(tmp_path, "cat /etc/hosts")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_without_adversary_mode_gray_zone_still_denied_when_no_supervisor(tmp_path: Path) -> None:
+    manager = ApprovalManager(tmp_path)
+    context = command_context(tmp_path, "rm -rf build")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision in {"decline", "cancel"}

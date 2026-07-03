@@ -107,7 +107,6 @@ def test_completion_review_decision_accepts_expected_shapes() -> None:
                 "stale_concerns": [],
                 "uncovered_edge_candidates": [],
                 "actionable_gap_or_none": None,
-                "decision": "accept",
             },
             "basis_event_seq": 10,
             "last_relevant_edit_seq": 8,
@@ -158,7 +157,6 @@ def test_completion_review_decision_accepts_expected_shapes() -> None:
         stale_concerns=[],
         uncovered_edge_candidates=[],
         actionable_gap_or_none=None,
-        decision="accept",
     )
 
 
@@ -173,7 +171,6 @@ def test_completion_review_decision_accepts_minimal_return_without_full_review_a
                 "stale_concerns": [],
                 "uncovered_edge_candidates": ["stack-passed call arguments"],
                 "actionable_gap_or_none": "validate more than six call arguments",
-                "decision": "return",
             },
             "basis_event_seq": 12,
             "last_relevant_edit_seq": 10,
@@ -211,7 +208,6 @@ def test_supervisor_decision_accepts_expected_shape() -> None:
             "message_to_coder": None,
             "persistent_decision": None,
             "progress_update": None,
-            "health_delta": None,
             "clear_handoff": True,
             "display_message": None,
         }
@@ -240,7 +236,6 @@ def test_supervisor_decision_accepts_structured_restart_handoff() -> None:
             "message_to_coder": None,
             "persistent_decision": None,
             "progress_update": None,
-            "health_delta": None,
             "clear_handoff": False,
             "display_message": None,
             "handoff": handoff,
@@ -257,7 +252,6 @@ def test_supervisor_decision_accepts_structured_restart_handoff() -> None:
             "message_to_coder": None,
             "persistent_decision": None,
             "progress_update": None,
-            "health_delta": None,
             "clear_handoff": False,
             "display_message": None,
             "handoff": None,
