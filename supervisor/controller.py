@@ -357,12 +357,11 @@ class SentinelController:
             await self.client.stop()
 
     def initialize_state(self) -> None:
-        adversary_enabled = self._adversary_enabled_for_config()
         project_config = self._project_config_for_persistence()
         config = SentinelConfig(
             project_root=str(self.project_root),
             task=project_config.task,
-            task_path=str(self.task_path),
+            task_path=project_config.task or "",
             task_hash=_hash_file(self.task_path),
             coder_mod=project_config.coder_mod,
             super_mod=project_config.super_mod,
@@ -373,13 +372,13 @@ class SentinelController:
             adversary=project_config.adversary,
             clean=project_config.clean,
             protected_path=list(project_config.protected_path),
-            model=self.model,
-            coder_model=self.coder_model,
-            supervisor_model=self.supervisor_model,
-            supervisor_intelligence=self._supervisor_intelligence(),
-            fast=self._fast_mode(),
-            protected_paths=list(self.declared_grading_roots),
-            max_adversary_runs=1 if adversary_enabled else 0,
+            model=project_config.coder_mod if project_config.coder_mod == project_config.super_mod else None,
+            coder_model=project_config.coder_mod,
+            supervisor_model=project_config.super_mod,
+            supervisor_intelligence=project_config.super_intelligence,
+            fast=project_config.fast,
+            protected_paths=list(project_config.protected_path),
+            max_adversary_runs=1 if project_config.adversary else 0,
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_sentinel(config, mode=mode)
@@ -387,17 +386,17 @@ class SentinelController:
         _ensure_internal_runtime_git_excluded(self.project_root)
 
     def _persist_model_config(self) -> None:
-        adversary_enabled = self._adversary_enabled_for_config()
+        project_config = self._project_config_for_persistence()
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(
                 update={
-                    "model": self.model,
-                    "coder_model": self.coder_model,
-                    "supervisor_model": self.supervisor_model,
-                    "supervisor_intelligence": self._supervisor_intelligence(),
-                    "fast": self._fast_mode(),
-                    "protected_paths": list(self.declared_grading_roots),
-                    "max_adversary_runs": 1 if adversary_enabled else 0,
+                    "model": project_config.coder_mod if project_config.coder_mod == project_config.super_mod else None,
+                    "coder_model": project_config.coder_mod,
+                    "supervisor_model": project_config.super_mod,
+                    "supervisor_intelligence": project_config.super_intelligence,
+                    "fast": project_config.fast,
+                    "protected_paths": list(project_config.protected_path),
+                    "max_adversary_runs": 1 if project_config.adversary else 0,
                 }
             )
         )
@@ -2131,7 +2130,7 @@ class SentinelController:
 
     def _adversary_runs_remaining(self) -> bool:
         cfg = self.store.get_sentinel_config()
-        return cfg.adversary_run_count < cfg.max_adversary_runs
+        return cfg.adversary_run_count < self._effective_max_adversary_runs()
 
     def _should_run_adversary_before_complete(self, packet: SupervisorWakePacket | None) -> bool:
         if self._packet_has_fresh_adversary_report(packet):
@@ -2144,14 +2143,16 @@ class SentinelController:
         return self.store.get_sentinel_config().max_adversary_runs > 0
 
     def _reserve_adversary_run(self) -> tuple[int, int]:
+        max_adversary_runs = self._effective_max_adversary_runs()
         updated = self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"adversary_run_count": current.adversary_run_count + 1})
         )
-        return updated.adversary_run_count, updated.max_adversary_runs
+        return updated.adversary_run_count, max_adversary_runs
 
     def _record_adversary_limit_reached(self, packet: SupervisorWakePacket | None) -> None:
         cfg = self.store.get_sentinel_config()
-        reason = f"adversary run limit reached ({cfg.adversary_run_count}/{cfg.max_adversary_runs})"
+        max_adversary_runs = self._effective_max_adversary_runs()
+        reason = f"adversary run limit reached ({cfg.adversary_run_count}/{max_adversary_runs})"
         self.tui.render("ADVERSARY", f"{reason}; finalizing completion accept")
         self.store.append_text_locked(
             PROGRESS,
@@ -2164,7 +2165,7 @@ class SentinelController:
                 "generation": packet.generation if packet is not None else None,
                 "wake_sequence": packet.wake_sequence if packet is not None else None,
                 "adversary_run_count": cfg.adversary_run_count,
-                "max_adversary_runs": cfg.max_adversary_runs,
+                "max_adversary_runs": max_adversary_runs,
             }
         )
         self._append_event(
@@ -2172,6 +2173,15 @@ class SentinelController:
             "adversary/limit_reached",
             reason=reason,
         )
+
+    def _effective_max_adversary_runs(self) -> int:
+        enabled = getattr(self, "adversary_enabled", None)
+        if enabled is False:
+            return 0
+        configured_runs = self.store.get_sentinel_config().max_adversary_runs
+        if enabled is True:
+            return max(1, configured_runs)
+        return configured_runs
 
     def _fresh_adversary_report(
         self,

@@ -173,7 +173,7 @@ def test_controller_records_runtime_config_flags(tmp_path) -> None:
     config = controller.store.get_sentinel_config()
     assert config.start_over is False
     assert config.clean is True
-    assert config.protected_paths == [str(protected_path)]
+    assert config.protected_paths == ["hidden"]
     assert config.adversary is False
     assert config.max_adversary_runs == 0
 
@@ -254,10 +254,29 @@ def test_controller_runtime_overrides_do_not_rewrite_project_config_fields(tmp_p
     assert payload["adversary"] is True
     assert payload["clean"] is True
     assert payload["protected_path"] == ["hidden"]
-    assert payload["task_path"] == str(task)
-    assert payload["coder_model"] == "cli-coder"
-    assert payload["supervisor_model"] == "cli-super"
-    assert payload["supervisor_intelligence"] == "xhigh"
+    assert payload["task_path"] == "CONFIG_TASK.md"
+    assert payload["coder_model"] == "config-coder"
+    assert payload["supervisor_model"] == "config-super"
+    assert payload["supervisor_intelligence"] == "medium"
+    assert payload["fast"] is True
+    assert payload["max_adversary_runs"] == 1
+    assert payload["protected_paths"] == ["hidden"]
+
+
+def test_fast_true_override_does_not_rewrite_saved_fast_field(tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    project_config = ProjectConfig(speed="usual")
+
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        fast=True,
+        project_config=project_config,
+    )
+    controller.initialize_state()
+
+    payload = json.loads(project_config_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["speed"] == "usual"
     assert payload["fast"] is False
-    assert payload["max_adversary_runs"] == 0
-    assert payload["protected_paths"] == [str(tmp_path / "secret")]
+    assert controller._fast_mode() is True
