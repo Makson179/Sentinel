@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from supervisor.config_editor import EditorState, WidthUtils, parameter_defs, render_editor
+from supervisor.config_editor import EditorState, Theme, WidthUtils, parameter_defs, render_editor
 from supervisor.project_config import ProjectConfig
 
 
@@ -107,6 +107,10 @@ def test_width_utils_are_ansi_safe() -> None:
     assert WidthUtils.display_width(WidthUtils.truncate_right(red, 5)) == 5
     assert WidthUtils.display_width(WidthUtils.pad_right(red, 10)) == 10
     assert WidthUtils.truncate_middle("/one/two/three/four/file.json", 16) == "/one/t...le.json"
+
+
+def test_config_editor_styles_do_not_paint_backgrounds() -> None:
+    assert all("bg:" not in style for style in Theme.from_environment().styles.values())
 
 
 def test_config_editor_layout_fits_supported_widths() -> None:
