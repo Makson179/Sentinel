@@ -120,7 +120,7 @@ def test_config_editor_styles_use_dark_blue_background_palette() -> None:
     assert background_styles
     assert all("bg:#000000" not in style for style in background_styles)
     assert any("bg:#050716" in style for style in background_styles)
-    assert any("bg:#170d3f" in style for style in background_styles)
+    assert any("bg:#100832" in style for style in background_styles)
 
 
 def test_config_editor_formatted_fragments_paint_backgrounds() -> None:
@@ -137,8 +137,8 @@ def test_config_editor_formatted_fragments_paint_backgrounds() -> None:
     assert all("bg:" in style for style, text in output if text != "\n")
     assert any("#18f8ff bg:#050716" in style for style, text in output if text == "╭")
     assert any("#f060f8 bg:#050716" in style for style, text in output if text == "╮")
-    assert any("bg:#21146a" in style for style, text in output if text.strip())
     assert any("bg:#100832" in style for style, text in output if text.strip())
+    assert not any("bg:#21146a" in style for style, text in output if text.strip())
 
 
 def test_config_editor_layout_fits_supported_widths() -> None:

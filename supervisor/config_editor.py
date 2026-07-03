@@ -49,11 +49,6 @@ PANEL_BORDER_GRADIENT = (
     "#303878",
 )
 ACTIVE_ROW_BG_GRADIENT = (
-    "#21146a",
-    "#1d115c",
-    "#190f4c",
-    "#170d3f",
-    "#130a34",
     "#100832",
 )
 
@@ -167,10 +162,10 @@ class Theme:
             "green": "#40e880",
             "yellow": "#ffc018",
             "red": "#f84858",
-            "active": "#f7f1ff bg:#170d3f",
+            "active": "#f7f1ff bg:#100832",
             "active_dark": "#f7f1ff bg:#100832",
             "active_marker": "#08ffff bold",
-            "active_glow_left": "#18f8ff bg:#21146a",
+            "active_glow_left": "#18f8ff bg:#100832",
             "active_glow_right": "#f060f8 bg:#100832",
             "name": "#f0eaff",
             "border": "#383080 bg:#050716",
@@ -180,7 +175,7 @@ class Theme:
             "border_bright": "#f060f8 bg:#050716",
             "panel_border": "#303878 bg:#06091c",
             "panel_border_soft": "#182850 bg:#06091c",
-            "panel_active_border": "#18f8ff bg:#170d3f",
+            "panel_active_border": "#18f8ff bg:#100832",
             "panel": "#d8d0ea bg:#06091c",
             "panel_header": "#d8d0ea bg:#070a20",
             "panel_title": "#8078ff bold",
