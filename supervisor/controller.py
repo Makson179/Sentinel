@@ -37,6 +37,7 @@ from supervisor.coder import (
 )
 from supervisor.health import kill_restart_candidate, patch_health
 from supervisor.policy import deterministic_task_command_reason
+from supervisor.project_config import ProjectConfig
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
@@ -230,6 +231,7 @@ class SentinelController:
         use_git_diff: bool = True,
         adversary_enabled: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+        project_config: ProjectConfig | None = None,
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
@@ -250,6 +252,7 @@ class SentinelController:
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
+        self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
             cwd=self.project_root,
@@ -355,20 +358,27 @@ class SentinelController:
 
     def initialize_state(self) -> None:
         adversary_enabled = self._adversary_enabled_for_config()
+        project_config = self._project_config_for_persistence()
         config = SentinelConfig(
             project_root=str(self.project_root),
+            task=project_config.task,
             task_path=str(self.task_path),
             task_hash=_hash_file(self.task_path),
+            coder_mod=project_config.coder_mod,
+            super_mod=project_config.super_mod,
+            coder_intelligence=project_config.coder_intelligence,
+            super_intelligence=project_config.super_intelligence,
+            speed=project_config.speed,
+            start_over=project_config.start_over,
+            adversary=project_config.adversary,
+            clean=project_config.clean,
+            protected_path=list(project_config.protected_path),
             model=self.model,
             coder_model=self.coder_model,
             supervisor_model=self.supervisor_model,
-            coder_intelligence=self._coder_intelligence(),
             supervisor_intelligence=self._supervisor_intelligence(),
             fast=self._fast_mode(),
-            start_over=self.overwrite_state,
-            clean=self.clean_workspace,
             protected_paths=list(self.declared_grading_roots),
-            adversary=adversary_enabled,
             max_adversary_runs=1 if adversary_enabled else 0,
         )
         mode = "fresh" if self.overwrite_state else "resume"
@@ -384,13 +394,9 @@ class SentinelController:
                     "model": self.model,
                     "coder_model": self.coder_model,
                     "supervisor_model": self.supervisor_model,
-                    "coder_intelligence": self._coder_intelligence(),
                     "supervisor_intelligence": self._supervisor_intelligence(),
                     "fast": self._fast_mode(),
-                    "start_over": self.overwrite_state,
-                    "clean": self.clean_workspace,
                     "protected_paths": list(self.declared_grading_roots),
-                    "adversary": adversary_enabled,
                     "max_adversary_runs": 1 if adversary_enabled else 0,
                 }
             )
@@ -410,6 +416,23 @@ class SentinelController:
         if enabled is False:
             return False
         return True
+
+    def _project_config_for_persistence(self) -> ProjectConfig:
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return config
+        return ProjectConfig(
+            task=_workspace_display_path(self.project_root, str(self.task_path)),
+            coder_mod=self._coder_model() or DEFAULT_MODEL,
+            super_mod=self._supervisor_model() or DEFAULT_MODEL,
+            coder_intelligence=self._coder_intelligence() or DEFAULT_INTELLIGENCE,
+            super_intelligence=self._supervisor_intelligence() or DEFAULT_INTELLIGENCE,
+            speed="fast" if self._fast_mode() else "usual",
+            start_over=self.overwrite_state,
+            adversary=self._adversary_enabled_for_config(),
+            clean=self.clean_workspace,
+            protected_path=tuple(_workspace_display_path(self.project_root, path) for path in self.declared_grading_roots),
+        )
 
     def _runtime_settings_summary(self) -> str:
         protected_paths = (

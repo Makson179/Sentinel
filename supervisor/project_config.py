@@ -179,7 +179,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         clean=_bool(payload.get("clean", default.clean), "clean", path=path),
         protected_path=tuple(
             _string_list(
-                _first_present(payload, ("protected_path", "protected_paths"), default.protected_path),
+                _first_present(payload, ("protected_path", "protected_paths"), default.protected_path, skip_none=True),
                 "protected_paths",
                 path=path,
             )
@@ -219,7 +219,7 @@ def _choice(value: Any, field: str, choices: tuple[str, ...], *, path: Path) -> 
 
 
 def _speed_from_payload(payload: dict[str, Any], default: str, *, path: Path) -> str:
-    if "speed" in payload:
+    if payload.get("speed") is not None:
         return _choice(payload["speed"], "speed", SPEED_CHOICES, path=path)
     if "fast" in payload:
         return "fast" if _bool(payload["fast"], "fast", path=path) else "usual"
@@ -269,22 +269,28 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     selected = set(fields)
     updates: dict[str, Any] = {}
     if "task" in selected:
+        updates["task"] = config.task
         updates["task_path"] = config.task or ""
     if selected.intersection({"coder_mod", "super_mod"}):
+        updates["coder_mod"] = config.coder_mod
+        updates["super_mod"] = config.super_mod
         updates["model"] = config.coder_mod if config.coder_mod == config.super_mod else None
         updates["coder_model"] = config.coder_mod
         updates["supervisor_model"] = config.super_mod
     if "coder_intelligence" in selected:
         updates["coder_intelligence"] = config.coder_intelligence
     if "super_intelligence" in selected:
+        updates["super_intelligence"] = config.super_intelligence
         updates["supervisor_intelligence"] = config.super_intelligence
     if "speed" in selected:
+        updates["speed"] = config.speed
         updates["fast"] = config.fast
     if "start_over" in selected:
         updates["start_over"] = config.start_over
     if "clean" in selected:
         updates["clean"] = config.clean
     if "protected_path" in selected:
+        updates["protected_path"] = list(config.protected_path)
         updates["protected_paths"] = list(config.protected_path)
     if "adversary" in selected:
         updates["adversary"] = config.adversary

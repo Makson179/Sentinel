@@ -70,12 +70,13 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     )
 
     payload = json.loads(project_config_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["task"] == "TASK.md"
     assert payload["task_path"] == "TASK.md"
+    assert payload["protected_path"] == ["hidden"]
     assert payload["protected_paths"] == ["hidden"]
+    assert payload["speed"] == "fast"
     assert payload["fast"] is True
     assert payload["clean"] is True
-    assert "protected_path" not in payload
-    assert "speed" not in payload
 
 
 def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:

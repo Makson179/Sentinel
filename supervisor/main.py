@@ -324,6 +324,7 @@ async def _run_sentinel(
         declared_grading_roots=protected_paths,
         clean_workspace=clean,
         adversary_enabled=adversary,
+        project_config=load_project_config(Path.cwd(), create=False),
     )
     await controller.run()
     status = controller.store.get_sentinel_config().status

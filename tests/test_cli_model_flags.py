@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+
 from click.testing import CliRunner
 
 from supervisor.controller import DEFAULT_MODEL, SentinelController
 from supervisor.main import _resolve_model_flags, _resolve_run_settings, cli
-from supervisor.project_config import DEFAULT_INTELLIGENCE, ProjectConfig
+from supervisor.project_config import DEFAULT_INTELLIGENCE, ProjectConfig, project_config_path
 
 
 def test_model_flags_default_to_gpt_55() -> None:
@@ -207,3 +209,55 @@ def test_controller_runtime_settings_summary_uses_effective_values(tmp_path) -> 
         "adversary=false "
         "protected-path=hidden"
     )
+
+
+def test_controller_runtime_overrides_do_not_rewrite_project_config_fields(tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    project_config = ProjectConfig(
+        task="CONFIG_TASK.md",
+        coder_mod="config-coder",
+        super_mod="config-super",
+        coder_intelligence="low",
+        super_intelligence="medium",
+        speed="fast",
+        start_over=True,
+        adversary=True,
+        clean=True,
+        protected_path=("hidden",),
+    )
+
+    controller = SentinelController(
+        tmp_path,
+        task_path=task,
+        coder_model="cli-coder",
+        supervisor_model="cli-super",
+        coder_intelligence="high",
+        supervisor_intelligence="xhigh",
+        fast=False,
+        overwrite_state=False,
+        clean_workspace=False,
+        adversary_enabled=False,
+        declared_grading_roots=(tmp_path / "secret",),
+        project_config=project_config,
+    )
+    controller.initialize_state()
+
+    payload = json.loads(project_config_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["task"] == "CONFIG_TASK.md"
+    assert payload["coder_mod"] == "config-coder"
+    assert payload["super_mod"] == "config-super"
+    assert payload["coder_intelligence"] == "low"
+    assert payload["super_intelligence"] == "medium"
+    assert payload["speed"] == "fast"
+    assert payload["start_over"] is True
+    assert payload["adversary"] is True
+    assert payload["clean"] is True
+    assert payload["protected_path"] == ["hidden"]
+    assert payload["task_path"] == str(task)
+    assert payload["coder_model"] == "cli-coder"
+    assert payload["supervisor_model"] == "cli-super"
+    assert payload["supervisor_intelligence"] == "xhigh"
+    assert payload["fast"] is False
+    assert payload["max_adversary_runs"] == 0
+    assert payload["protected_paths"] == [str(tmp_path / "secret")]
