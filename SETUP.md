@@ -213,7 +213,7 @@ Start from fresh Sentinel state:
 sentinel --task TASK.md --start-over
 ```
 
-Sentinel creates `.sentinel/config.json` on first run with project defaults:
+Sentinel creates `.supervisor/config.json` on first run with project defaults:
 both models `gpt-5.5`, both intelligence settings `xhigh`, `start-over=true`,
 `adversary=true`, `clean=false`, and no saved task/protected paths.
 
@@ -240,7 +240,7 @@ sentinel --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
 `--coder-mod` and `--super-mod` must be provided together. To use the same model
 for both roles, pass the same value to both flags. Boolean run flags accept
 explicit values, for example `--start-over=false` or `--adversary=false`, and
-CLI values override `.sentinel/config.json` for only the current run.
+CLI values override `.supervisor/config.json` for only the current run.
 
 Clean a disposable task directory before starting:
 

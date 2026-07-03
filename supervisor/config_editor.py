@@ -14,10 +14,8 @@ from supervisor.project_config import (
     SPEED_CHOICES,
     ProjectConfig,
     changed_project_config_fields,
-    ensure_runtime_state_initialized,
     load_project_config,
     project_config_path,
-    save_project_config,
     sync_runtime_config_fields,
 )
 
@@ -201,7 +199,6 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         raise RuntimeError("sentinel config requires prompt_toolkit; reinstall Sentinel with project dependencies") from exc
 
     config = load_project_config(project_root, create=True)
-    ensure_runtime_state_initialized(project_root, config)
     model_choices = available_model_choices(project_root)
     path = project_config_path(project_root)
     state = EditorState()
@@ -245,7 +242,6 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         app = Application(layout=Layout(Window(content=control, wrap_lines=False)), key_bindings=kb, full_screen=True)
         app.run()
         if pending_action["exit"]:
-            save_project_config(project_root, config)
             return config
 
         action = pending_action["action"]
@@ -271,7 +267,6 @@ def _format_bool(value: bool) -> str:
 
 
 def _save_config_change(project_root: Path, previous_config: ProjectConfig, config: ProjectConfig) -> None:
-    save_project_config(project_root, config)
     changed_fields = changed_project_config_fields(previous_config, config)
     if changed_fields:
         sync_runtime_config_fields(project_root, config, changed_fields)

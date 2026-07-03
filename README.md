@@ -72,7 +72,7 @@ Task selection rules:
 
 ## Model Selection
 
-On first run, Sentinel creates `.sentinel/config.json` with project defaults:
+On first run, Sentinel creates `.supervisor/config.json` with project defaults:
 `gpt-5.5` for both coder and supervisor, `xhigh` intelligence for both roles,
 `start-over=true`, `adversary=true`, and `clean=false`.
 

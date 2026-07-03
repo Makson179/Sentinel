@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 
-PROJECT_CONFIG_DIR = ".sentinel"
-PROJECT_CONFIG_FILE = "config.json"
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_INTELLIGENCE = "xhigh"
 INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
@@ -69,7 +65,9 @@ def default_project_config() -> ProjectConfig:
 
 
 def project_config_path(project_root: Path) -> Path:
-    return project_root.resolve() / PROJECT_CONFIG_DIR / PROJECT_CONFIG_FILE
+    from supervisor.state import CONFIG, STATE_DIR_NAME
+
+    return project_root.resolve() / STATE_DIR_NAME / CONFIG
 
 
 def load_project_config(project_root: Path, *, create: bool = True) -> ProjectConfig:
@@ -77,7 +75,7 @@ def load_project_config(project_root: Path, *, create: bool = True) -> ProjectCo
     if not path.exists():
         config = default_project_config()
         if create:
-            save_project_config(project_root, config)
+            ensure_runtime_state_initialized(project_root, config)
         return config
 
     try:
@@ -92,26 +90,18 @@ def load_project_config(project_root: Path, *, create: bool = True) -> ProjectCo
 
 
 def save_project_config(project_root: Path, config: ProjectConfig) -> None:
-    path = project_config_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(config.to_json_data(), indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    ensure_runtime_state_initialized(project_root, config)
+    sync_runtime_config_fields(project_root, config, RUNTIME_SYNC_FIELDS)
 
 
 def ensure_runtime_state_initialized(project_root: Path, config: ProjectConfig) -> None:
-    from supervisor.state import STATE_DIR_NAME, StateStore
+    from supervisor.state import CONFIG, STATE_DIR_NAME, StateStore
 
     state_dir = project_root.resolve() / STATE_DIR_NAME
     if state_dir.exists():
+        config_path = state_dir / CONFIG
+        if not config_path.exists():
+            StateStore(project_root).write_json_locked(CONFIG, _runtime_config_from_project_config(project_root, config))
         return
     store = StateStore(project_root)
     store.initialize_sentinel(_runtime_config_from_project_config(project_root, config), mode="fresh")
@@ -155,27 +145,53 @@ def changed_project_config_fields(before: ProjectConfig, after: ProjectConfig) -
 def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfig:
     default = default_project_config()
     return ProjectConfig(
-        task=_optional_string(payload.get("task", default.task), "task", path=path),
-        coder_mod=_required_string(payload.get("coder_mod", default.coder_mod), "coder_mod", path=path),
-        super_mod=_required_string(payload.get("super_mod", default.super_mod), "super_mod", path=path),
+        task=_optional_string(_first_present(payload, ("task", "task_path"), default.task, skip_none=True), "task_path", path=path),
+        coder_mod=_required_string(
+            _first_present(payload, ("coder_mod", "coder_model", "model"), default.coder_mod, skip_none=True),
+            "coder_model",
+            path=path,
+        ),
+        super_mod=_required_string(
+            _first_present(payload, ("super_mod", "supervisor_model", "model"), default.super_mod, skip_none=True),
+            "supervisor_model",
+            path=path,
+        ),
         coder_intelligence=_choice(
-            payload.get("coder_intelligence", default.coder_intelligence),
+            _first_present(payload, ("coder_intelligence",), default.coder_intelligence, skip_none=True),
             "coder_intelligence",
             INTELLIGENCE_CHOICES,
             path=path,
         ),
         super_intelligence=_choice(
-            payload.get("super_intelligence", default.super_intelligence),
-            "super_intelligence",
+            _first_present(
+                payload,
+                ("super_intelligence", "supervisor_intelligence"),
+                default.super_intelligence,
+                skip_none=True,
+            ),
+            "supervisor_intelligence",
             INTELLIGENCE_CHOICES,
             path=path,
         ),
-        speed=_choice(payload.get("speed", default.speed), "speed", SPEED_CHOICES, path=path),
+        speed=_speed_from_payload(payload, default.speed, path=path),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
-        adversary=_bool(payload.get("adversary", default.adversary), "adversary", path=path),
+        adversary=_adversary_from_payload(payload, default.adversary, path=path),
         clean=_bool(payload.get("clean", default.clean), "clean", path=path),
-        protected_path=tuple(_string_list(payload.get("protected_path", default.protected_path), "protected_path", path=path)),
+        protected_path=tuple(
+            _string_list(
+                _first_present(payload, ("protected_path", "protected_paths"), default.protected_path),
+                "protected_paths",
+                path=path,
+            )
+        ),
     )
+
+
+def _first_present(payload: dict[str, Any], keys: tuple[str, ...], default: Any, *, skip_none: bool = False) -> Any:
+    for key in keys:
+        if key in payload and (not skip_none or payload[key] is not None):
+            return payload[key]
+    return default
 
 
 def _optional_string(value: Any, field: str, *, path: Path) -> str | None:
@@ -200,6 +216,25 @@ def _choice(value: Any, field: str, choices: tuple[str, ...], *, path: Path) -> 
             return normalized
     expected = ", ".join(choices)
     raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be one of: {expected}")
+
+
+def _speed_from_payload(payload: dict[str, Any], default: str, *, path: Path) -> str:
+    if "speed" in payload:
+        return _choice(payload["speed"], "speed", SPEED_CHOICES, path=path)
+    if "fast" in payload:
+        return "fast" if _bool(payload["fast"], "fast", path=path) else "usual"
+    return default
+
+
+def _adversary_from_payload(payload: dict[str, Any], default: bool, *, path: Path) -> bool:
+    if "adversary" in payload:
+        return _bool(payload["adversary"], "adversary", path=path)
+    if "max_adversary_runs" in payload:
+        value = payload["max_adversary_runs"]
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value > 0
+        raise ProjectConfigError(f"invalid Sentinel config at {path}: max_adversary_runs must be an integer")
+    return default
 
 
 def _bool(value: Any, field: str, *, path: Path) -> bool:

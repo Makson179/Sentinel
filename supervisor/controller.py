@@ -6108,11 +6108,7 @@ def _ensure_internal_runtime_git_excluded(project_root: Path) -> None:
         info_dir.mkdir(parents=True, exist_ok=True)
         current = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
         entries = {line.strip() for line in current.splitlines()}
-        additions = [
-            entry
-            for entry in (".supervisor/", ".supervisor", ".sentinel/", ".sentinel")
-            if entry not in entries
-        ]
+        additions = [entry for entry in (".supervisor/", ".supervisor") if entry not in entries]
         if additions:
             suffix = "" if current.endswith("\n") or not current else "\n"
             exclude_path.write_text(current + suffix + "\n".join(additions) + "\n", encoding="utf-8")
@@ -6831,7 +6827,7 @@ def _is_internal_runtime_path(path: str, *, project_root: Path | None, task_path
         return False
     if normalized == ".git-init.log":
         return True
-    if normalized in {".supervisor", ".sentinel"} or normalized.startswith((".supervisor/", ".sentinel/")):
+    if normalized == ".supervisor" or normalized.startswith(".supervisor/"):
         return True
     task_relative = _task_relative_workspace_path(project_root=project_root, task_path=task_path)
     return bool(task_relative and normalized == task_relative)

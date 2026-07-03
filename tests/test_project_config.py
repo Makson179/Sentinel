@@ -38,6 +38,8 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.task is None
     assert config.protected_path == ()
     assert project_config_path(tmp_path).exists()
+    assert project_config_path(tmp_path) == tmp_path.resolve() / ".supervisor" / "config.json"
+    assert not (tmp_path / ".sentinel").exists()
 
 
 def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
@@ -68,10 +70,46 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     )
 
     payload = json.loads(project_config_path(tmp_path).read_text(encoding="utf-8"))
-    assert payload["task"] == "TASK.md"
-    assert payload["protected_path"] == ["hidden"]
-    assert payload["speed"] == "fast"
+    assert payload["task_path"] == "TASK.md"
+    assert payload["protected_paths"] == ["hidden"]
+    assert payload["fast"] is True
     assert payload["clean"] is True
+    assert "protected_path" not in payload
+    assert "speed" not in payload
+
+
+def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.write_json_locked(
+        CONFIG,
+        SentinelConfig(
+            project_root=str(tmp_path),
+            task_path="TASK.md",
+            coder_model="gpt-coder",
+            supervisor_model="gpt-supervisor",
+            coder_intelligence="low",
+            supervisor_intelligence="high",
+            fast=True,
+            start_over=False,
+            clean=True,
+            protected_paths=["hidden"],
+            adversary=False,
+            max_adversary_runs=0,
+        ),
+    )
+
+    config = load_project_config(tmp_path)
+
+    assert config.task == "TASK.md"
+    assert config.coder_mod == "gpt-coder"
+    assert config.super_mod == "gpt-supervisor"
+    assert config.coder_intelligence == "low"
+    assert config.super_intelligence == "high"
+    assert config.speed == "fast"
+    assert config.start_over is False
+    assert config.clean is True
+    assert config.protected_path == ("hidden",)
+    assert config.adversary is False
 
 
 def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> None:
