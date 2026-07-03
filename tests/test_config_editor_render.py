@@ -109,8 +109,23 @@ def test_width_utils_are_ansi_safe() -> None:
     assert WidthUtils.truncate_middle("/one/two/three/four/file.json", 16) == "/one/t...le.json"
 
 
-def test_config_editor_styles_do_not_paint_backgrounds() -> None:
-    assert all("bg:" not in style for style in Theme.from_environment().styles.values())
+def test_config_editor_styles_paint_only_black_backgrounds() -> None:
+    assert all(style.count("bg:") == 1 for style in Theme.from_environment().styles.values())
+    assert all("bg:#000000" in style for style in Theme.from_environment().styles.values())
+
+
+def test_config_editor_formatted_fragments_paint_black_backgrounds() -> None:
+    output = render_editor(
+        ProjectConfig(),
+        EditorState(),
+        Path("/tmp/project/.supervisor/config.json"),
+        width=80,
+        height=12,
+        formatted=True,
+    )
+
+    assert not isinstance(output, str)
+    assert all("bg:#000000" in style for style, text in output if text != "\n")
 
 
 def test_config_editor_layout_fits_supported_widths() -> None:

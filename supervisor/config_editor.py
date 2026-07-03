@@ -118,33 +118,35 @@ class Theme:
             "on",
         }
         symbols = Symbols.ascii() if ascii_enabled else Symbols.default()
+        background = "bg:#000000"
+        styles = {
+            "root": "#ddd7eb",
+            "surface": "#ddd7eb",
+            "header": "#f3dcff bold",
+            "header_title": "#ff5cf0 bold",
+            "logo": "#50e8ff bold",
+            "badge": "#bfb6dc",
+            "ok": "#67e8a5 bold",
+            "exit": "#d8cdf4",
+            "muted": "#8175a5",
+            "cyan": "#42e8ff",
+            "violet": "#9b77ff",
+            "magenta": "#ff58eb",
+            "green": "#4cff94",
+            "yellow": "#ffc247",
+            "red": "#ff5d7e",
+            "active": "#f7f1ff",
+            "active_marker": "#6ff3ff bold",
+            "name": "#f0eaff",
+            "border": "#38265c",
+            "border_bright": "#b84dff",
+            "panel": "#d8d0ea",
+            "panel_title": "#b388ff bold",
+            "tree": "#73639d",
+        }
         return cls(
             symbols=symbols,
-            styles={
-                "root": "#ddd7eb",
-                "surface": "#ddd7eb",
-                "header": "#f3dcff bold",
-                "header_title": "#ff5cf0 bold",
-                "logo": "#50e8ff bold",
-                "badge": "#bfb6dc",
-                "ok": "#67e8a5 bold",
-                "exit": "#d8cdf4",
-                "muted": "#8175a5",
-                "cyan": "#42e8ff",
-                "violet": "#9b77ff",
-                "magenta": "#ff58eb",
-                "green": "#4cff94",
-                "yellow": "#ffc247",
-                "red": "#ff5d7e",
-                "active": "#f7f1ff",
-                "active_marker": "#6ff3ff bold",
-                "name": "#f0eaff",
-                "border": "#38265c",
-                "border_bright": "#b84dff",
-                "panel": "#d8d0ea",
-                "panel_title": "#b388ff bold",
-                "tree": "#73639d",
-            },
+            styles={key: f"{value} {background}" for key, value in styles.items()},
         )
 
     def style(self, *keys: str) -> str:
@@ -1011,6 +1013,7 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import Window
+        from prompt_toolkit.styles import Style
     except ImportError as exc:
         raise RuntimeError("sentinel config requires prompt_toolkit; reinstall Sentinel with project dependencies") from exc
 
@@ -1063,7 +1066,12 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
             pending_action["exit"] = True
             event.app.exit()
 
-        app = Application(layout=Layout(Window(content=control, wrap_lines=False)), key_bindings=kb, full_screen=True)
+        app = Application(
+            layout=Layout(Window(content=control, wrap_lines=False)),
+            key_bindings=kb,
+            full_screen=True,
+            style=Style.from_dict({"": "bg:#000000"}),
+        )
         app.run()
         if pending_action["exit"]:
             return config
