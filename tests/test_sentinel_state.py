@@ -206,6 +206,10 @@ def test_coder_fast_mode_sets_codex_service_tier(tmp_path: Path) -> None:
     assert coder_turn_params("thread", "work", tmp_path, fast=True)["serviceTier"] == CODEX_FAST_SERVICE_TIER
 
 
+def test_coder_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
+    assert coder_turn_params("thread", "work", tmp_path, intelligence="xhigh")["effort"] == "xhigh"
+
+
 def test_git_status_path_parser_handles_missing_second_status_column() -> None:
     assert _path_from_git_status_line(" M public/src/admin/manage/users.js") == "public/src/admin/manage/users.js"
     assert _path_from_git_status_line("M  public/language/en-GB/admin/manage/users.json") == "public/language/en-GB/admin/manage/users.json"
@@ -2194,6 +2198,47 @@ async def test_supervisor_fast_mode_sets_codex_service_tier(tmp_path: Path) -> N
     assert decision.decision == SupervisorDecisionKind.NOOP
     assert client.thread_params["serviceTier"] == CODEX_FAST_SERVICE_TIER
     assert client.turn_params["serviceTier"] == CODEX_FAST_SERVICE_TIER
+
+
+async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.turn_params = None
+
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "supervisor-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.turn_params = params
+            return {
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": json.dumps({"decision": "noop", "reason": "routine progress"}),
+                        }
+                    ],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(client, store, task, intelligence="high")  # type: ignore[arg-type]
+    packet = agent.build_packet(wake_sequence=7, current_summary="runtime check")
+
+    decision = await agent.decide(packet)
+
+    assert decision.decision == SupervisorDecisionKind.NOOP
+    assert client.turn_params["effort"] == "high"
 
 
 async def test_completion_review_agent_overrides_stale_model_wake_sequence(tmp_path: Path) -> None:

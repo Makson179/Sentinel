@@ -13,13 +13,15 @@ before item B in a command, item A has a smaller line number here.
 `--help` - show command help.
 `-h` - short form of `--help`.
 `--task TASK.md` - choose the markdown task file explicitly.
-`--model MODEL` - choose the Codex model for the run.
 `--coder-mod MODEL` - choose the Codex model for coder turns; must be used with `--super-mod`.
 `--super-mod MODEL` - choose the Codex model for supervisor turns; must be used with `--coder-mod`.
-`--start-over` - reset `.supervisor` state and start fresh.
-`--clean` - delete workspace files except the selected task file before starting; use only in disposable folders.
-`--adversary` - run the adversarial tester before final completion.
+`--coder-intelligence VALUE` - choose coder reasoning effort.
+`--super-intelligence VALUE` - choose supervisor reasoning effort.
+`--start-over[=true|false]` - reset `.supervisor` state and start fresh.
+`--clean[=true|false]` - delete workspace files except the selected task file before starting; use only in disposable folders.
+`--adversary[=true|false]` - run the adversarial tester before final completion.
 `--protected-path PATH` - mark a hidden or grading path as protected; repeat this option for multiple paths.
+`config` - open the interactive project config editor.
 
 Examples:
 
@@ -27,7 +29,8 @@ Examples:
 sentinel doctor
 sentinel --version
 sentinel update
-sentinel --task TASK.md --model gpt-5 --start-over
+sentinel config
+sentinel --task TASK.md --coder-mod gpt-5 --super-mod gpt-5 --start-over
 sentinel --task TASK.md --coder-mod gpt-5.5 --super-mod gpt-5.5
 SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
 ```

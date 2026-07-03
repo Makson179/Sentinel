@@ -140,6 +140,7 @@ class PolicyDecision(BaseModel):
 
 class SentinelConfig(BaseModel):
     project_root: str
+    task: str | None = None
     task_path: str
     task_hash: str | None = None
     codex_version: str | None = None
@@ -153,10 +154,21 @@ class SentinelConfig(BaseModel):
     last_applied_supervisor_sequence: int = 0
     pending_server_request_ids: list[int | str] = Field(default_factory=list)
     status: SentinelStatus = SentinelStatus.STARTING
+    coder_mod: str | None = None
+    super_mod: str | None = None
+    super_intelligence: str | None = None
+    speed: str | None = None
+    protected_path: list[str] | None = None
     model: str | None = None
     coder_model: str | None = None
     supervisor_model: str | None = None
+    coder_intelligence: str | None = None
+    supervisor_intelligence: str | None = None
     fast: bool = False
+    start_over: bool = False
+    clean: bool = False
+    protected_paths: list[str] = Field(default_factory=list)
+    adversary: bool = True
     max_no_marker_idle_nudges: int = 2
     max_completion_returns_per_generation: int = 10
     max_adversary_runs: int = 1

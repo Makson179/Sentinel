@@ -28,9 +28,16 @@ from supervisor.approval_triage import (
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
-from supervisor.coder import CODER_SANDBOX_DANGER_FULL_ACCESS, CoderSession, coder_sandbox_mode, coder_thread_params
+from supervisor.coder import (
+    CODER_SANDBOX_DANGER_FULL_ACCESS,
+    DEFAULT_INTELLIGENCE,
+    CoderSession,
+    coder_sandbox_mode,
+    coder_thread_params,
+)
 from supervisor.health import kill_restart_candidate, patch_health
 from supervisor.policy import deterministic_task_command_reason
+from supervisor.project_config import ProjectConfig
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
@@ -216,12 +223,15 @@ class SentinelController:
         model: str | None = None,
         coder_model: str | None = None,
         supervisor_model: str | None = None,
+        coder_intelligence: str | None = DEFAULT_INTELLIGENCE,
+        supervisor_intelligence: str | None = DEFAULT_INTELLIGENCE,
         fast: bool = False,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
         use_git_diff: bool = True,
         adversary_enabled: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+        project_config: ProjectConfig | None = None,
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
@@ -234,11 +244,15 @@ class SentinelController:
             supervisor_model=supervisor_model,
         )
         self.model = self.coder_model if self.coder_model == self.supervisor_model else None
+        self.coder_intelligence = coder_intelligence
+        self.supervisor_intelligence = supervisor_intelligence
         self.fast = fast
         self.overwrite_state = overwrite_state
+        self.clean_workspace = clean_workspace
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
+        self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
             cwd=self.project_root,
@@ -300,6 +314,7 @@ class SentinelController:
             await self.client.initialize()
             await self.tui.start()
             self.running = True
+            self.tui.render("SYSTEM", self._runtime_settings_summary())
             await self.preflight()
             if not self.running:
                 return
@@ -309,6 +324,7 @@ class SentinelController:
                 self.task_path,
                 model=self._supervisor_model(),
                 fast=self._fast_mode(),
+                intelligence=self._supervisor_intelligence(),
             )
             self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
             self.approvals = ApprovalManager(
@@ -325,6 +341,7 @@ class SentinelController:
                 self.task_path,
                 model=self._coder_model(),
                 fast=self._fast_mode(),
+                intelligence=self._coder_intelligence(),
             )
             await self.coder.start_thread()
             await self.coder.start_initial_turn()
@@ -340,14 +357,28 @@ class SentinelController:
             await self.client.stop()
 
     def initialize_state(self) -> None:
+        project_config = self._project_config_for_persistence()
         config = SentinelConfig(
             project_root=str(self.project_root),
-            task_path=str(self.task_path),
+            task=project_config.task,
+            task_path=project_config.task or "",
             task_hash=_hash_file(self.task_path),
-            model=self.model,
-            coder_model=self.coder_model,
-            supervisor_model=self.supervisor_model,
-            fast=self._fast_mode(),
+            coder_mod=project_config.coder_mod,
+            super_mod=project_config.super_mod,
+            coder_intelligence=project_config.coder_intelligence,
+            super_intelligence=project_config.super_intelligence,
+            speed=project_config.speed,
+            start_over=project_config.start_over,
+            adversary=project_config.adversary,
+            clean=project_config.clean,
+            protected_path=list(project_config.protected_path),
+            model=project_config.coder_mod if project_config.coder_mod == project_config.super_mod else None,
+            coder_model=project_config.coder_mod,
+            supervisor_model=project_config.super_mod,
+            supervisor_intelligence=project_config.super_intelligence,
+            fast=project_config.fast,
+            protected_paths=list(project_config.protected_path),
+            max_adversary_runs=1 if project_config.adversary else 0,
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_sentinel(config, mode=mode)
@@ -355,13 +386,17 @@ class SentinelController:
         _ensure_internal_runtime_git_excluded(self.project_root)
 
     def _persist_model_config(self) -> None:
+        project_config = self._project_config_for_persistence()
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(
                 update={
-                    "model": self.model,
-                    "coder_model": self.coder_model,
-                    "supervisor_model": self.supervisor_model,
-                    "fast": self._fast_mode(),
+                    "model": project_config.coder_mod if project_config.coder_mod == project_config.super_mod else None,
+                    "coder_model": project_config.coder_mod,
+                    "supervisor_model": project_config.super_mod,
+                    "supervisor_intelligence": project_config.super_intelligence,
+                    "fast": project_config.fast,
+                    "protected_paths": list(project_config.protected_path),
+                    "max_adversary_runs": 1 if project_config.adversary else 0,
                 }
             )
         )
@@ -374,6 +409,56 @@ class SentinelController:
 
     def _fast_mode(self) -> bool:
         return bool(getattr(self, "fast", False))
+
+    def _adversary_enabled_for_config(self) -> bool:
+        enabled = getattr(self, "adversary_enabled", None)
+        if enabled is False:
+            return False
+        return True
+
+    def _project_config_for_persistence(self) -> ProjectConfig:
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return config
+        return ProjectConfig(
+            task=_workspace_display_path(self.project_root, str(self.task_path)),
+            coder_mod=self._coder_model() or DEFAULT_MODEL,
+            super_mod=self._supervisor_model() or DEFAULT_MODEL,
+            coder_intelligence=self._coder_intelligence() or DEFAULT_INTELLIGENCE,
+            super_intelligence=self._supervisor_intelligence() or DEFAULT_INTELLIGENCE,
+            speed="fast" if self._fast_mode() else "usual",
+            start_over=self.overwrite_state,
+            adversary=self._adversary_enabled_for_config(),
+            clean=self.clean_workspace,
+            protected_path=tuple(_workspace_display_path(self.project_root, path) for path in self.declared_grading_roots),
+        )
+
+    def _runtime_settings_summary(self) -> str:
+        protected_paths = (
+            ", ".join(_workspace_display_path(self.project_root, path) for path in self.declared_grading_roots)
+            if self.declared_grading_roots
+            else "absent"
+        )
+        speed = "fast" if self._fast_mode() else "usual"
+        return (
+            "settings: "
+            f"task={_workspace_display_path(self.project_root, str(self.task_path))} "
+            f"coder-mod={self._coder_model()} "
+            f"super-mod={self._supervisor_model()} "
+            f"coder-intelligence={self._coder_intelligence()} "
+            f"super-intelligence={self._supervisor_intelligence()} "
+            f"speed={speed} "
+            f"start-over={_format_bool(self.overwrite_state)} "
+            f"clean={_format_bool(self.clean_workspace)} "
+            f"adversary={_format_bool(self._adversary_enabled_for_config())} "
+            f"protected-path={protected_paths}"
+        )
+
+    def _coder_intelligence(self) -> str | None:
+        return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)
+
+    def _supervisor_intelligence(self) -> str | None:
+        return getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE)
 
     def _adversary_model(self) -> str:
         return ADVERSARY_MODEL
@@ -2046,7 +2131,7 @@ class SentinelController:
 
     def _adversary_runs_remaining(self) -> bool:
         cfg = self.store.get_sentinel_config()
-        return cfg.adversary_run_count < cfg.max_adversary_runs
+        return cfg.adversary_run_count < self._effective_max_adversary_runs()
 
     def _should_run_adversary_before_complete(self, packet: SupervisorWakePacket | None) -> bool:
         if self._packet_has_fresh_adversary_report(packet):
@@ -2059,14 +2144,16 @@ class SentinelController:
         return self.store.get_sentinel_config().max_adversary_runs > 0
 
     def _reserve_adversary_run(self) -> tuple[int, int]:
+        max_adversary_runs = self._effective_max_adversary_runs()
         updated = self.store.update_sentinel_config(
             lambda current: current.model_copy(update={"adversary_run_count": current.adversary_run_count + 1})
         )
-        return updated.adversary_run_count, updated.max_adversary_runs
+        return updated.adversary_run_count, max_adversary_runs
 
     def _record_adversary_limit_reached(self, packet: SupervisorWakePacket | None) -> None:
         cfg = self.store.get_sentinel_config()
-        reason = f"adversary run limit reached ({cfg.adversary_run_count}/{cfg.max_adversary_runs})"
+        max_adversary_runs = self._effective_max_adversary_runs()
+        reason = f"adversary run limit reached ({cfg.adversary_run_count}/{max_adversary_runs})"
         self.tui.render("ADVERSARY", f"{reason}; finalizing completion accept")
         self.store.append_text_locked(
             PROGRESS,
@@ -2079,7 +2166,7 @@ class SentinelController:
                 "generation": packet.generation if packet is not None else None,
                 "wake_sequence": packet.wake_sequence if packet is not None else None,
                 "adversary_run_count": cfg.adversary_run_count,
-                "max_adversary_runs": cfg.max_adversary_runs,
+                "max_adversary_runs": max_adversary_runs,
             }
         )
         self._append_event(
@@ -2087,6 +2174,15 @@ class SentinelController:
             "adversary/limit_reached",
             reason=reason,
         )
+
+    def _effective_max_adversary_runs(self) -> int:
+        enabled = getattr(self, "adversary_enabled", None)
+        if enabled is False:
+            return 0
+        configured_runs = self.store.get_sentinel_config().max_adversary_runs
+        if enabled is True:
+            return max(1, configured_runs)
+        return configured_runs
 
     def _fresh_adversary_report(
         self,
@@ -2970,6 +3066,8 @@ class SentinelController:
             for rel in required:
                 if not _schema_file_exists(out_dir, rel):
                     raise RuntimeError(f"app-server schema missing required file: {rel}")
+            if not _turn_start_schema_supports_effort(out_dir):
+                raise RuntimeError("app-server schema missing required turn effort field for Sentinel intelligence settings")
             digest = hashlib.sha256()
             for path in sorted(out_dir.rglob("*.json")):
                 digest.update(str(path.relative_to(out_dir)).encode("utf-8"))
@@ -2986,6 +3084,7 @@ class SentinelController:
             self.task_path,
             model=self._supervisor_model(),
             fast=self._fast_mode(),
+            intelligence=self._supervisor_intelligence(),
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -6634,6 +6733,20 @@ def _schema_file_exists(out_dir: Path, name: str) -> bool:
     return (out_dir / name).exists() or (out_dir / "v2" / name).exists()
 
 
+def _turn_start_schema_supports_effort(out_dir: Path) -> bool:
+    for path in (out_dir / "TurnStartParams.json", out_dir / "v2" / "TurnStartParams.json"):
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        properties = payload.get("properties")
+        if isinstance(properties, dict) and "effort" in properties:
+            return True
+    return False
+
+
 def _run_probe(args: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     try:
         completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
@@ -6762,6 +6875,10 @@ def _workspace_display_path(project_root: Path, raw_path: str) -> str:
         return str(path.resolve().relative_to(project_root.resolve()))
     except ValueError:
         return raw_path
+
+
+def _format_bool(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def _is_internal_runtime_path(path: str, *, project_root: Path | None, task_path: Path | str | None) -> bool:

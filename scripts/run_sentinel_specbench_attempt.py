@@ -546,7 +546,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-root", type=Path, required=True, help="Directory for all run outputs.")
     parser.add_argument("--sentinel-src", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--sentinel-bin", type=Path, help="Sentinel CLI to run. Defaults to sentinel-src/.venv/bin/sentinel, or .venv/Scripts/sentinel.exe on Windows.")
-    parser.add_argument("--model", help="Optional model passed through to both coder and supervisor.")
     parser.add_argument("--coder-mod", help="Optional coder model passed through to the Sentinel CLI. Requires --super-mod.")
     parser.add_argument("--super-mod", help="Optional supervisor model passed through to the Sentinel CLI. Requires --coder-mod.")
     parser.add_argument("--difficulty-level", type=int, default=1, help="Visible public-test difficulty level. Default: 1.")
@@ -567,8 +566,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_model_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if args.model and (args.coder_mod or args.super_mod):
-        parser.error("--model cannot be combined with --coder-mod or --super-mod")
     if bool(args.coder_mod) != bool(args.super_mod):
         parser.error("--coder-mod and --super-mod must be used together")
 
@@ -823,8 +820,6 @@ def run_sentinel(args: argparse.Namespace, paths: RunPaths, sentinel_src: Path) 
     for protected_path in task_info.get("declared_grading_paths") or []:
         if isinstance(protected_path, str) and protected_path.strip():
             cmd.extend(["--protected-path", protected_path])
-    if args.model:
-        cmd.extend(["--model", args.model])
     if args.coder_mod and args.super_mod:
         cmd.extend(["--coder-mod", args.coder_mod, "--super-mod", args.super_mod])
     cmd.extend(args.supervisor_args)

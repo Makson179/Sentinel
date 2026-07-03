@@ -9,6 +9,7 @@ import pytest
 
 from supervisor import update_check
 from supervisor.controller import DEFAULT_MODEL
+from supervisor.project_config import DEFAULT_INTELLIGENCE
 from supervisor.main import _format_version_report, _startup_update_gate, _update_and_reexec, cli
 
 
@@ -209,15 +210,38 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     calls: list[tuple[object, ...]] = []
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main.sys.platform", platform_name)
     monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
     monkeypatch.setattr("builtins.input", lambda prompt: "c")
     monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
 
     async def fake_run_sentinel(
-        task_path, coder_model, supervisor_model, fast, start_over, protected_paths, clean, adversary
+        task_path,
+        coder_model,
+        supervisor_model,
+        coder_intelligence,
+        supervisor_intelligence,
+        fast,
+        start_over,
+        protected_paths,
+        clean,
+        adversary,
     ):
-        calls.append((task_path, coder_model, supervisor_model, fast, start_over, protected_paths, clean, adversary))
+        calls.append(
+            (
+                task_path,
+                coder_model,
+                supervisor_model,
+                coder_intelligence,
+                supervisor_intelligence,
+                fast,
+                start_over,
+                protected_paths,
+                clean,
+                adversary,
+            )
+        )
         return 0
 
     def fake_run_async_cleanly(coro):
@@ -234,19 +258,56 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
     )
 
     assert result is None
-    assert calls == [(task, DEFAULT_MODEL, DEFAULT_MODEL, False, True, (), False, False), ("runtime-started",)]
+    assert calls == [
+        (
+            task,
+            DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            DEFAULT_INTELLIGENCE,
+            DEFAULT_INTELLIGENCE,
+            False,
+            True,
+            (),
+            False,
+            True,
+        ),
+        ("runtime-started",),
+    ]
 
 
 def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     calls: list[tuple[object, ...]] = []
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
     async def fake_run_sentinel(
-        task_path, coder_model, supervisor_model, fast, start_over, protected_paths, clean, adversary
+        task_path,
+        coder_model,
+        supervisor_model,
+        coder_intelligence,
+        supervisor_intelligence,
+        fast,
+        start_over,
+        protected_paths,
+        clean,
+        adversary,
     ):
-        calls.append((task_path, coder_model, supervisor_model, fast, start_over, protected_paths, clean, adversary))
+        calls.append(
+            (
+                task_path,
+                coder_model,
+                supervisor_model,
+                coder_intelligence,
+                supervisor_intelligence,
+                fast,
+                start_over,
+                protected_paths,
+                clean,
+                adversary,
+            )
+        )
         return 0
 
     def fake_run_async_cleanly(coro):
@@ -262,4 +323,55 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
     )
 
     assert result is None
-    assert calls == [(task, DEFAULT_MODEL, DEFAULT_MODEL, True, False, (), False, False)]
+    assert calls == [
+        (
+            task,
+            DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            DEFAULT_INTELLIGENCE,
+            DEFAULT_INTELLIGENCE,
+            True,
+            True,
+            (),
+            False,
+            True,
+        )
+    ]
+
+
+def test_cli_boolean_false_overrides_project_config(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
+
+    async def fake_run_sentinel(
+        task_path,
+        coder_model,
+        supervisor_model,
+        coder_intelligence,
+        supervisor_intelligence,
+        fast,
+        start_over,
+        protected_paths,
+        clean,
+        adversary,
+    ):
+        calls.append((fast, start_over, clean, adversary))
+        return 0
+
+    def fake_run_async_cleanly(coro):
+        assert asyncio.run(coro) == 0
+
+    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
+
+    result = cli.main(
+        args=["--task", str(task), "--start-over=false", "--adversary=false", "--clean=false", "--fast=false"],
+        prog_name="sentinel",
+        standalone_mode=False,
+    )
+
+    assert result is None
+    assert calls == [(False, False, False, False)]

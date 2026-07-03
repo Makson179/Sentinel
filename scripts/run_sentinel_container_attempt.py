@@ -196,7 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-version", help="Version of @openai/codex to install. Defaults to local codex --version.")
     parser.add_argument("--auth-dir", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
-    parser.add_argument("--model", help="Optional model passed to both coder and supervisor.")
+    parser.add_argument("--model", help="Optional model for --agent-mode raw-codex. Supervisor mode uses --coder-mod and --super-mod.")
     parser.add_argument("--coder-mod", help="Optional coder model passed to supervisor mode. Requires --super-mod.")
     parser.add_argument("--super-mod", help="Optional supervisor model passed to supervisor mode. Requires --coder-mod.")
     parser.add_argument(
@@ -233,12 +233,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide --instance-json or --task-id")
     if args.supervisor_args and args.supervisor_args[0] == "--":
         args.supervisor_args = args.supervisor_args[1:]
-    if args.model and (args.coder_mod or args.super_mod):
-        parser.error("--model cannot be combined with --coder-mod or --super-mod")
-    if bool(args.coder_mod) != bool(args.super_mod):
-        parser.error("--coder-mod and --super-mod must be used together")
+    if args.agent_mode == "supervisor" and args.model:
+        parser.error("--model is only valid with --agent-mode raw-codex; use --coder-mod and --super-mod")
     if args.agent_mode == "raw-codex" and (args.coder_mod or args.super_mod):
         parser.error("--coder-mod and --super-mod are only valid with --agent-mode supervisor")
+    if bool(args.coder_mod) != bool(args.super_mod):
+        parser.error("--coder-mod and --super-mod must be used together")
     if args.agent_mode == "raw-codex" and args.raw_prompt_file is None:
         parser.error("--raw-prompt-file is required with --agent-mode raw-codex")
     if args.agent_mode == "raw-codex" and args.supervisor_args:
@@ -998,7 +998,6 @@ def agent_invocation_script(
         )
         return (
             "/opt/sentinel-venv/bin/sentinel --task TASK.md --start-over "
-            f"{('--model ' + sh_single(model)) if model else ''} "
             f"{role_model_args}"
             f"{' '.join(sh_single(arg) for arg in extra_supervisor_args)}"
         ).strip()

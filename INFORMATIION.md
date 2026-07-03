@@ -32,7 +32,7 @@ pipx install "git+https://github.com/Makson179/Sentinel.git"
 sentinel doctor
 sentinel --version
 sentinel update
-sentinel --task TASK.md --model gpt-5 --start-over
+sentinel --task TASK.md --coder-mod gpt-5 --super-mod gpt-5 --start-over
 sentinel --task TASK.md --coder-mod gpt-5.5 --super-mod gpt-5.5
 SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
 ```

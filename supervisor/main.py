@@ -3,30 +3,73 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Coroutine
 
 import click
 
+from supervisor.config_editor import run_config_editor
 from supervisor import doctor, update_check
 from supervisor.controller import DEFAULT_MODEL, SentinelController
+from supervisor.project_config import (
+    INTELLIGENCE_CHOICES,
+    ProjectConfig,
+    ProjectConfigError,
+    load_project_config,
+    project_config_path,
+)
 from supervisor.schemas import SentinelStatus
 from supervisor.task_select import TaskSelectionError
 
 
+OPTIONAL_BOOL_FLAGS = {"--fast", "--start-over", "--clean", "--adversary"}
+
+
+class SentinelClickGroup(click.Group):
+    def main(self, args: list[str] | tuple[str, ...] | None = None, **extra: Any) -> Any:
+        normalized_args = _normalize_optional_bool_args(list(args) if args is not None else sys.argv[1:])
+        return super().main(args=normalized_args, **extra)
+
+
 @click.group(
     name="sentinel",
+    cls=SentinelClickGroup,
     invoke_without_command=True,
     no_args_is_help=False,
     subcommand_metavar="[COMMAND] [ARGS]...",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 @click.option("--task", "task_path", type=click.Path(exists=False, dir_okay=False, path_type=Path))
-@click.option("--model", default=None, help=f"Model to use for both coder and supervisor turns. Default: {DEFAULT_MODEL}.")
 @click.option("--coder-mod", "coder_model", default=None, help="Model to use for coder turns. Must be used with --super-mod.")
 @click.option("--super-mod", "supervisor_model", default=None, help="Model to use for supervisor turns. Must be used with --coder-mod.")
-@click.option("--fast", is_flag=True, help="Use Codex Fast service tier for both coder and supervisor turns.")
-@click.option("--start-over", is_flag=True, help="Reinitialize .supervisor state files.")
+@click.option(
+    "--coder-intelligence",
+    default=None,
+    type=click.Choice(INTELLIGENCE_CHOICES),
+    help="Reasoning effort for coder turns.",
+)
+@click.option(
+    "--super-intelligence",
+    "supervisor_intelligence",
+    default=None,
+    type=click.Choice(INTELLIGENCE_CHOICES),
+    help="Reasoning effort for supervisor turns.",
+)
+@click.option(
+    "--fast",
+    default=None,
+    type=click.BOOL,
+    metavar="[true|false]",
+    help="Use Codex Fast service tier for both coder and supervisor turns. Bare --fast means true.",
+)
+@click.option(
+    "--start-over",
+    default=None,
+    type=click.BOOL,
+    metavar="[true|false]",
+    help="Reinitialize .supervisor state files. Bare --start-over means true.",
+)
 @click.option(
     "--protected-path",
     "protected_paths",
@@ -36,12 +79,16 @@ from supervisor.task_select import TaskSelectionError
 )
 @click.option(
     "--clean",
-    is_flag=True,
+    default=None,
+    type=click.BOOL,
+    metavar="[true|false]",
     help="Delete everything in the current folder except the selected task file before starting.",
 )
 @click.option(
     "--adversary",
-    is_flag=True,
+    default=None,
+    type=click.BOOL,
+    metavar="[true|false]",
     help="Run the adversarial tester before final completion.",
 )
 @click.option(
@@ -56,36 +103,50 @@ from supervisor.task_select import TaskSelectionError
 def cli(
     ctx: click.Context,
     task_path: Path | None,
-    model: str | None,
     coder_model: str | None,
     supervisor_model: str | None,
-    fast: bool,
-    start_over: bool,
+    coder_intelligence: str | None,
+    supervisor_intelligence: str | None,
+    fast: bool | None,
+    start_over: bool | None,
     protected_paths: tuple[Path, ...],
-    clean: bool,
-    adversary: bool,
+    clean: bool | None,
+    adversary: bool | None,
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
     _startup_update_gate()
     try:
-        selected_coder_model, selected_supervisor_model = _resolve_model_flags(
-            model=model,
+        project_config = load_project_config(Path.cwd(), create=True)
+        run_settings = _resolve_run_settings(
+            project_config=project_config,
+            task_path=task_path,
             coder_model=coder_model,
             supervisor_model=supervisor_model,
+            coder_intelligence=coder_intelligence,
+            supervisor_intelligence=supervisor_intelligence,
+            fast=fast,
+            start_over=start_over,
+            protected_paths=protected_paths,
+            clean=clean,
+            adversary=adversary,
         )
         _run_async_cleanly(
             _run_sentinel(
-                task_path,
-                selected_coder_model,
-                selected_supervisor_model,
-                fast,
-                start_over,
-                protected_paths,
-                clean,
-                adversary,
+                run_settings.task_path,
+                run_settings.coder_model,
+                run_settings.supervisor_model,
+                run_settings.coder_intelligence,
+                run_settings.supervisor_intelligence,
+                run_settings.fast,
+                run_settings.start_over,
+                run_settings.protected_paths,
+                run_settings.clean,
+                run_settings.adversary,
             )
         )
+    except ProjectConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     except TaskSelectionError as exc:
         raise click.ClickException(str(exc)) from exc
     except RuntimeError as exc:
@@ -117,6 +178,17 @@ def update_command() -> None:
 @cli.command("doctor")
 def doctor_command() -> None:
     raise click.exceptions.Exit(doctor.run_doctor())
+
+
+@cli.command("config")
+def config_command() -> None:
+    try:
+        config = run_config_editor(Path.cwd())
+    except (ProjectConfigError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Saved Sentinel config: {project_config_path(Path.cwd())}")
+    click.echo(f"coder-mod: {config.coder_mod}")
+    click.echo(f"super-mod: {config.super_mod}")
 
 
 def _version_callback(ctx: click.Context, value: bool) -> None:
@@ -232,6 +304,8 @@ async def _run_sentinel(
     task_path: Path | None,
     coder_model: str,
     supervisor_model: str,
+    coder_intelligence: str,
+    supervisor_intelligence: str,
     fast: bool,
     start_over: bool,
     protected_paths: tuple[Path, ...],
@@ -243,11 +317,14 @@ async def _run_sentinel(
         task_path=task_path,
         coder_model=coder_model,
         supervisor_model=supervisor_model,
+        coder_intelligence=coder_intelligence,
+        supervisor_intelligence=supervisor_intelligence,
         fast=fast,
         overwrite_state=start_over,
         declared_grading_roots=protected_paths,
         clean_workspace=clean,
-        adversary_enabled=True if adversary else None,
+        adversary_enabled=adversary,
+        project_config=load_project_config(Path.cwd(), create=False),
     )
     await controller.run()
     status = controller.store.get_sentinel_config().status
@@ -258,19 +335,79 @@ async def _run_sentinel(
 
 def _resolve_model_flags(
     *,
-    model: str | None,
     coder_model: str | None,
     supervisor_model: str | None,
+    default_coder_model: str = DEFAULT_MODEL,
+    default_supervisor_model: str = DEFAULT_MODEL,
 ) -> tuple[str, str]:
-    if model and (coder_model or supervisor_model):
-        raise RuntimeError("--model cannot be combined with --coder-mod or --super-mod")
     if bool(coder_model) != bool(supervisor_model):
         raise RuntimeError("--coder-mod and --super-mod must be used together")
-    if model:
-        return model, model
     if coder_model and supervisor_model:
         return coder_model, supervisor_model
-    return DEFAULT_MODEL, DEFAULT_MODEL
+    return default_coder_model, default_supervisor_model
+
+
+@dataclass(frozen=True)
+class RunSettings:
+    task_path: Path | None
+    coder_model: str
+    supervisor_model: str
+    coder_intelligence: str
+    supervisor_intelligence: str
+    fast: bool
+    start_over: bool
+    protected_paths: tuple[Path, ...]
+    clean: bool
+    adversary: bool
+
+
+def _resolve_run_settings(
+    *,
+    project_config: ProjectConfig,
+    task_path: Path | None,
+    coder_model: str | None,
+    supervisor_model: str | None,
+    coder_intelligence: str | None,
+    supervisor_intelligence: str | None,
+    fast: bool | None,
+    start_over: bool | None,
+    protected_paths: tuple[Path, ...],
+    clean: bool | None,
+    adversary: bool | None,
+) -> RunSettings:
+    selected_coder_model, selected_supervisor_model = _resolve_model_flags(
+        coder_model=coder_model,
+        supervisor_model=supervisor_model,
+        default_coder_model=project_config.coder_mod,
+        default_supervisor_model=project_config.super_mod,
+    )
+    selected_task = task_path if task_path is not None else Path(project_config.task) if project_config.task else None
+    selected_protected_paths = protected_paths or tuple(Path(path) for path in project_config.protected_path)
+    return RunSettings(
+        task_path=selected_task,
+        coder_model=selected_coder_model,
+        supervisor_model=selected_supervisor_model,
+        coder_intelligence=coder_intelligence or project_config.coder_intelligence,
+        supervisor_intelligence=supervisor_intelligence or project_config.super_intelligence,
+        fast=project_config.fast if fast is None else fast,
+        start_over=project_config.start_over if start_over is None else start_over,
+        protected_paths=selected_protected_paths,
+        clean=project_config.clean if clean is None else clean,
+        adversary=project_config.adversary if adversary is None else adversary,
+    )
+
+
+def _normalize_optional_bool_args(args: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for index, arg in enumerate(args):
+        if arg in OPTIONAL_BOOL_FLAGS:
+            next_arg = args[index + 1] if index + 1 < len(args) else None
+            normalized.append(arg)
+            if next_arg is None or next_arg.startswith("-"):
+                normalized.append("true")
+            continue
+        normalized.append(arg)
+    return normalized
 
 
 if __name__ == "__main__":
