@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from supervisor.config_editor import EditorState, move_down, parameter_defs, select_current
+from supervisor.config_editor import EditorState, available_model_choices, move_down, parameter_defs, select_current
 from supervisor.main import cli
 from supervisor.project_config import (
     DEFAULT_INTELLIGENCE,
@@ -101,6 +101,49 @@ def test_config_editor_choice_can_update_boolean() -> None:
     assert action is None
     assert config.clean is True
     assert state.parameter_index == clean_index + 1
+
+
+def test_config_editor_model_choices_come_from_available_models() -> None:
+    config = ProjectConfig(coder_mod="gpt-5.4", super_mod="gpt-5.3-codex-spark")
+    params = parameter_defs(config, model_choices=("gpt-5.4-mini", "gpt-5.4"))
+    coder_param = next(param for param in params if param.key == "coder_mod")
+    super_param = next(param for param in params if param.key == "super_mod")
+
+    assert [option.label for option in coder_param.options] == [
+        "gpt-5.5",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.3-codex-spark",
+    ]
+    assert [option.label for option in super_param.options] == [
+        "gpt-5.5",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.3-codex-spark",
+    ]
+    assert all(option.action is None for option in coder_param.options)
+
+
+def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("supervisor.config_editor._available_models_from_app_server", lambda project_root: ())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".codex" / "models_cache.json"
+    cache.parent.mkdir()
+    cache.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "gpt-5.4", "visibility": "list"},
+                    {"slug": "gpt-5.5", "visibility": "list"},
+                    {"slug": "hidden-model", "visibility": "hidden"},
+                    {"slug": "gpt-5.3-codex-spark", "visibility": "list"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert available_model_choices(tmp_path) == ("gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark")
 
 
 def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
