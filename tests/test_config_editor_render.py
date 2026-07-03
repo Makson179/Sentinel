@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from supervisor.config_editor import EditorState, WidthUtils, parameter_defs, render_editor
 from supervisor.project_config import ProjectConfig
+
+
+@pytest.fixture(autouse=True)
+def _default_unicode_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SENTINEL_CONFIG_ASCII", raising=False)
 
 
 def _render(
@@ -28,15 +35,15 @@ def _render(
 
 
 def test_config_editor_render_marks_active_row() -> None:
-    output = _render(height=8)
+    output = _render(height=12)
 
-    assert any(line.startswith(" > > task:") for line in output.splitlines())
+    assert any("││ › ▸ ☑  task" in line for line in output.splitlines())
 
 
 def test_config_editor_render_marks_collapsed_expandable_fields() -> None:
-    output = _render(height=10)
+    output = _render(height=12)
 
-    assert any("   > coder-mod:" in line for line in output.splitlines())
+    assert any("││   ▸ ◇  coder-mod" in line for line in output.splitlines())
 
 
 def test_config_editor_render_shows_expanded_field_options() -> None:
@@ -44,9 +51,9 @@ def test_config_editor_render_shows_expanded_field_options() -> None:
     params = parameter_defs(config)
     speed_index = [param.key for param in params].index("speed")
 
-    output = _render(config, EditorState(parameter_index=speed_index, expanded_index=speed_index), height=14)
+    output = _render(config, EditorState(parameter_index=speed_index, expanded_index=speed_index), height=16)
 
-    assert any(" v speed:" in line for line in output.splitlines())
+    assert any("▾ ⚡  speed" in line for line in output.splitlines())
     assert "usual" in output
     assert "fast" in output
 
@@ -58,7 +65,7 @@ def test_config_editor_render_marks_active_selected_option() -> None:
 
     output = _render(config, EditorState(parameter_index=speed_index, expanded_index=speed_index, option_index=1), height=14)
 
-    assert any(">   * fast" in line for line in output.splitlines())
+    assert any("›   └─ ●  fast" in line for line in output.splitlines())
 
 
 def test_config_editor_render_uses_dynamic_model_options() -> None:
@@ -71,7 +78,7 @@ def test_config_editor_render_uses_dynamic_model_options() -> None:
         EditorState(parameter_index=coder_index, expanded_index=coder_index),
         model_choices=("alpha-model", "beta-model"),
         width=100,
-        height=16,
+        height=18,
     )
 
     assert "alpha-model" in output
@@ -84,7 +91,7 @@ def test_config_editor_render_middle_truncates_long_paths() -> None:
     path = Path("/tmp/" + "/".join(f"segment-{index}" for index in range(20)) + "/.supervisor/config.json")
 
     output = _render(path=path, width=80, height=8)
-    path_line = output.splitlines()[1]
+    path_line = output.splitlines()[3]
 
     assert "Path:" in path_line
     assert "..." in path_line
@@ -108,18 +115,20 @@ def test_config_editor_layout_fits_supported_widths() -> None:
         lines = output.splitlines()
 
         assert len(lines) == 12
-        assert lines[0].startswith(" Sentinel project config")
-        assert lines[1].startswith(" Path:")
-        assert lines[2].startswith(" Arrows move.")
-        assert "JSON" in lines[-1]
+        assert lines[0].startswith("╭")
+        assert "Sentinel project config" in lines[1]
+        assert "Path:" in lines[3]
+        assert "Arrows move." in lines[5]
+        assert "JSON" in lines[-2]
+        assert lines[-1].startswith("╰")
         assert all(WidthUtils.display_width(line) == width for line in lines)
 
 
 def test_config_editor_side_panel_visibility_tracks_width() -> None:
-    assert "Details" not in _render(width=80, height=12)
-    assert "Details" not in _render(width=100, height=12)
-    assert "Details" in _render(width=120, height=12)
-    assert "Details" in _render(width=160, height=12)
+    assert "LEGEND" not in _render(width=80, height=12)
+    assert "LEGEND" not in _render(width=100, height=12)
+    assert "LEGEND" in _render(width=120, height=12)
+    assert "LEGEND" in _render(width=160, height=12)
 
 
 def test_config_editor_keeps_active_option_visible_with_limited_height() -> None:
@@ -131,31 +140,46 @@ def test_config_editor_keeps_active_option_visible_with_limited_height() -> None
         config,
         EditorState(parameter_index=protected_index, expanded_index=protected_index, option_index=1),
         width=80,
-        height=8,
+        height=12,
     )
 
-    assert " Sentinel project config" in output.splitlines()[0]
-    assert output.splitlines()[1].startswith(" Path:")
-    assert output.splitlines()[2].startswith(" Arrows move.")
-    assert any(">     add path" in line for line in output.splitlines())
-    assert "JSON" in output.splitlines()[-1]
+    assert "Sentinel project config" in output.splitlines()[1]
+    assert "Path:" in output.splitlines()[3]
+    assert "Arrows move." in output.splitlines()[5]
+    assert any("›   └─    add path" in line for line in output.splitlines())
+    assert "JSON" in output.splitlines()[-2]
 
 
-def test_config_editor_uses_ascii_borders_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("SENTINEL_CONFIG_UNICODE", raising=False)
+def test_config_editor_uses_unicode_borders_by_default() -> None:
+    output = _render(width=120, height=12)
+
+    assert output.startswith("╭")
+    assert "│" in output
+    assert "───" in output
+    assert "◇  Sentinel project config" in output
+
+
+def test_config_editor_ascii_borders_are_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SENTINEL_CONFIG_ASCII", "1")
 
     output = _render(width=120, height=12)
 
     assert "+---" in output
-    assert " | " in output
+    assert "|" in output
     assert "│" not in output
 
 
-def test_config_editor_unicode_borders_are_opt_in(monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_CONFIG_UNICODE", "1")
+def test_config_editor_default_design_matches_reference_structure() -> None:
+    config = ProjectConfig(speed="fast", start_over=False)
+    params = parameter_defs(config)
+    super_index = [param.key for param in params].index("super_mod")
 
-    output = _render(width=120, height=12)
+    output = _render(config, EditorState(parameter_index=super_index, expanded_index=super_index), width=120, height=24)
 
-    assert "│" in output
-    assert "───" in output
-    assert "> > task:" in output
+    assert "CONFIG LOADED" in output
+    assert "LEGEND" in output
+    assert "STATUS" in output
+    assert "TIPS" in output
+    assert "› ▾ ☆  super-mod" in output
+    assert "⚡  speed                fast" in output
+    assert "↻  start-over           false" in output
