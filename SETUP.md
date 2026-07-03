@@ -213,10 +213,14 @@ Start from fresh Sentinel state:
 sentinel --task TASK.md --start-over
 ```
 
-Use a specific model for both coder and supervisor turns:
+Sentinel creates `.sentinel/config.json` on first run with project defaults:
+both models `gpt-5.5`, both intelligence settings `xhigh`, `start-over=true`,
+`adversary=true`, `clean=false`, and no saved task/protected paths.
+
+Edit project defaults interactively:
 
 ```bash
-sentinel --task TASK.md --model <model-name>
+sentinel config
 ```
 
 By default, both roles use `gpt-5.5`. Use `gpt-5.5` for the 5.5 model; model
@@ -227,14 +231,16 @@ before the coder starts and writes the reason to `.supervisor/FINAL_REPORT.md`.
 The adversarial tester always uses `gpt-5.5`, independent of the coder and
 supervisor model choices.
 
-Use different models for coder and supervisor turns:
+Choose models for coder and supervisor turns:
 
 ```bash
-supervisor --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
+sentinel --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
 ```
 
-`--coder-mod` and `--super-mod` must be provided together. Do not combine them
-with `--model`.
+`--coder-mod` and `--super-mod` must be provided together. To use the same model
+for both roles, pass the same value to both flags. Boolean run flags accept
+explicit values, for example `--start-over=false` or `--adversary=false`, and
+CLI values override `.sentinel/config.json` for only the current run.
 
 Clean a disposable task directory before starting:
 

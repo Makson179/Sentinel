@@ -20,6 +20,7 @@ CODER_SANDBOX_ENV = "SENTINEL_CODER_SANDBOX"
 CODER_SANDBOX_READ_ONLY = "read-only"
 CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
 CODEX_FAST_SERVICE_TIER = "priority"
+DEFAULT_INTELLIGENCE = "xhigh"
 
 
 def coder_sandbox_mode() -> str:
@@ -49,6 +50,12 @@ def codex_service_tier(*, fast: bool) -> str | None:
     return CODEX_FAST_SERVICE_TIER if fast else None
 
 
+def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict[str, Any]:
+    if intelligence:
+        params["effort"] = intelligence
+    return params
+
+
 def coder_thread_params(project_root: Path, *, model: str | None = None, fast: bool = False) -> dict[str, Any]:
     params: dict[str, Any] = {
         "cwd": str(project_root),
@@ -73,6 +80,7 @@ def coder_turn_params(
     *,
     model: str | None = None,
     fast: bool = False,
+    intelligence: str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "threadId": thread_id,
@@ -86,7 +94,7 @@ def coder_turn_params(
     }
     if model:
         params["model"] = model
-    return params
+    return apply_intelligence(params, intelligence)
 
 
 @dataclass
@@ -97,6 +105,7 @@ class CoderSession:
     task_path: Path
     model: str | None = None
     fast: bool = False
+    intelligence: str | None = DEFAULT_INTELLIGENCE
     thread_id: str | None = None
     active_turn_id: str | None = None
     coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
@@ -123,7 +132,14 @@ class CoderSession:
     async def start_turn(self, message: str) -> str:
         thread_id = self.thread_id or await self.start_thread()
         response = await self.client.turn_start(
-            coder_turn_params(thread_id, message, self.project_root, model=self.model, fast=self.fast),
+            coder_turn_params(
+                thread_id,
+                message,
+                self.project_root,
+                model=self.model,
+                fast=self.fast,
+                intelligence=self.intelligence,
+            ),
             timeout=self.coder_rpc_timeout_seconds,
         )
         turn = response.get("turn", {})

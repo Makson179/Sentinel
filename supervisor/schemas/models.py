@@ -156,6 +156,8 @@ class SentinelConfig(BaseModel):
     model: str | None = None
     coder_model: str | None = None
     supervisor_model: str | None = None
+    coder_intelligence: str | None = None
+    supervisor_intelligence: str | None = None
     fast: bool = False
     max_no_marker_idle_nudges: int = 2
     max_completion_returns_per_generation: int = 10

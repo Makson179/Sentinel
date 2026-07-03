@@ -28,7 +28,13 @@ from supervisor.approval_triage import (
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
-from supervisor.coder import CODER_SANDBOX_DANGER_FULL_ACCESS, CoderSession, coder_sandbox_mode, coder_thread_params
+from supervisor.coder import (
+    CODER_SANDBOX_DANGER_FULL_ACCESS,
+    DEFAULT_INTELLIGENCE,
+    CoderSession,
+    coder_sandbox_mode,
+    coder_thread_params,
+)
 from supervisor.health import kill_restart_candidate, patch_health
 from supervisor.policy import deterministic_task_command_reason
 from supervisor.schemas import (
@@ -216,6 +222,8 @@ class SentinelController:
         model: str | None = None,
         coder_model: str | None = None,
         supervisor_model: str | None = None,
+        coder_intelligence: str | None = DEFAULT_INTELLIGENCE,
+        supervisor_intelligence: str | None = DEFAULT_INTELLIGENCE,
         fast: bool = False,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
@@ -234,6 +242,8 @@ class SentinelController:
             supervisor_model=supervisor_model,
         )
         self.model = self.coder_model if self.coder_model == self.supervisor_model else None
+        self.coder_intelligence = coder_intelligence
+        self.supervisor_intelligence = supervisor_intelligence
         self.fast = fast
         self.overwrite_state = overwrite_state
         self.use_git_diff = use_git_diff
@@ -309,6 +319,7 @@ class SentinelController:
                 self.task_path,
                 model=self._supervisor_model(),
                 fast=self._fast_mode(),
+                intelligence=self._supervisor_intelligence(),
             )
             self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
             self.approvals = ApprovalManager(
@@ -325,6 +336,7 @@ class SentinelController:
                 self.task_path,
                 model=self._coder_model(),
                 fast=self._fast_mode(),
+                intelligence=self._coder_intelligence(),
             )
             await self.coder.start_thread()
             await self.coder.start_initial_turn()
@@ -347,6 +359,8 @@ class SentinelController:
             model=self.model,
             coder_model=self.coder_model,
             supervisor_model=self.supervisor_model,
+            coder_intelligence=self._coder_intelligence(),
+            supervisor_intelligence=self._supervisor_intelligence(),
             fast=self._fast_mode(),
         )
         mode = "fresh" if self.overwrite_state else "resume"
@@ -361,6 +375,8 @@ class SentinelController:
                     "model": self.model,
                     "coder_model": self.coder_model,
                     "supervisor_model": self.supervisor_model,
+                    "coder_intelligence": self._coder_intelligence(),
+                    "supervisor_intelligence": self._supervisor_intelligence(),
                     "fast": self._fast_mode(),
                 }
             )
@@ -374,6 +390,12 @@ class SentinelController:
 
     def _fast_mode(self) -> bool:
         return bool(getattr(self, "fast", False))
+
+    def _coder_intelligence(self) -> str | None:
+        return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)
+
+    def _supervisor_intelligence(self) -> str | None:
+        return getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE)
 
     def _adversary_model(self) -> str:
         return ADVERSARY_MODEL
@@ -2969,6 +2991,8 @@ class SentinelController:
             for rel in required:
                 if not _schema_file_exists(out_dir, rel):
                     raise RuntimeError(f"app-server schema missing required file: {rel}")
+            if not _turn_start_schema_supports_effort(out_dir):
+                raise RuntimeError("app-server schema missing required turn effort field for Sentinel intelligence settings")
             digest = hashlib.sha256()
             for path in sorted(out_dir.rglob("*.json")):
                 digest.update(str(path.relative_to(out_dir)).encode("utf-8"))
@@ -2985,6 +3009,7 @@ class SentinelController:
             self.task_path,
             model=self._supervisor_model(),
             fast=self._fast_mode(),
+            intelligence=self._supervisor_intelligence(),
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -6064,7 +6089,11 @@ def _ensure_internal_runtime_git_excluded(project_root: Path) -> None:
         info_dir.mkdir(parents=True, exist_ok=True)
         current = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
         entries = {line.strip() for line in current.splitlines()}
-        additions = [entry for entry in (".supervisor/", ".supervisor") if entry not in entries]
+        additions = [
+            entry
+            for entry in (".supervisor/", ".supervisor", ".sentinel/", ".sentinel")
+            if entry not in entries
+        ]
         if additions:
             suffix = "" if current.endswith("\n") or not current else "\n"
             exclude_path.write_text(current + suffix + "\n".join(additions) + "\n", encoding="utf-8")
@@ -6633,6 +6662,20 @@ def _schema_file_exists(out_dir: Path, name: str) -> bool:
     return (out_dir / name).exists() or (out_dir / "v2" / name).exists()
 
 
+def _turn_start_schema_supports_effort(out_dir: Path) -> bool:
+    for path in (out_dir / "TurnStartParams.json", out_dir / "v2" / "TurnStartParams.json"):
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        properties = payload.get("properties")
+        if isinstance(properties, dict) and "effort" in properties:
+            return True
+    return False
+
+
 def _run_probe(args: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     try:
         completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
@@ -6769,7 +6812,7 @@ def _is_internal_runtime_path(path: str, *, project_root: Path | None, task_path
         return False
     if normalized == ".git-init.log":
         return True
-    if normalized == ".supervisor" or normalized.startswith(".supervisor/"):
+    if normalized in {".supervisor", ".sentinel"} or normalized.startswith((".supervisor/", ".sentinel/")):
         return True
     task_relative = _task_relative_workspace_path(project_root=project_root, task_path=task_path)
     return bool(task_relative and normalized == task_relative)

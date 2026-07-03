@@ -72,27 +72,28 @@ Task selection rules:
 
 ## Model Selection
 
-By default, Sentinel uses `gpt-5.5` for both the coder and the full
-supervisor.
+On first run, Sentinel creates `.sentinel/config.json` with project defaults:
+`gpt-5.5` for both coder and supervisor, `xhigh` intelligence for both roles,
+`start-over=true`, `adversary=true`, and `clean=false`.
 
-Use the same model for both roles:
-
-```bash
-supervisor --task TASK.md --model gpt-5.5
-```
-
-Use different models for coder and supervisor:
+Edit those defaults interactively:
 
 ```bash
-supervisor --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
+sentinel config
 ```
 
-`--coder-mod` and `--super-mod` must be provided together. `--model` cannot be
-combined with either of them.
+Choose models for coder and supervisor:
 
-Add `--fast` to use the Codex Fast service tier for both coder and full
-supervisor turns. Without `--fast`, Sentinel explicitly clears the service tier
-for both roles instead of inheriting a fast tier from user Codex config.
+```bash
+sentinel --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
+```
+
+`--coder-mod` and `--super-mod` must be provided together. To use the same
+model for both roles, pass the same value to both flags.
+
+Add `--fast` or `--fast=true` to use the Codex Fast service tier for both coder
+and full supervisor turns. Use `--fast=false` to override a fast project config
+for one run.
 
 Model names are Codex/OpenAI model slugs accepted by the installed Codex
 app-server and the authenticated account. Use `gpt-5.5` for the default 5.5
@@ -100,8 +101,8 @@ model. Other usable values are the model slugs exposed to your account by
 Codex; Sentinel passes them through unchanged and does not maintain a separate
 hard-coded allow-list.
 
-The adversarial tester always uses `gpt-5.5`, independent of `--model`,
-`--coder-mod`, or `--super-mod`.
+The adversarial tester always uses `gpt-5.5`, independent of `--coder-mod` or
+`--super-mod`.
 
 Supported values:
 
