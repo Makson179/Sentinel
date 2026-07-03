@@ -38,11 +38,14 @@ def _render(
 def test_config_editor_render_marks_active_row() -> None:
     output = _render(height=12)
 
+    assert "SENTINEL PROJECT CONFIG" in output
+    assert "SETTING" in output
+    assert "VALUE" in output
     assert any("││ › ▸ ☑  task" in line for line in output.splitlines())
 
 
 def test_config_editor_render_marks_collapsed_expandable_fields() -> None:
-    output = _render(height=12)
+    output = _render(height=14)
 
     assert any("││   ▸ ◇  coder-mod" in line for line in output.splitlines())
 
@@ -66,7 +69,7 @@ def test_config_editor_render_marks_active_selected_option() -> None:
 
     output = _render(config, EditorState(parameter_index=speed_index, expanded_index=speed_index, option_index=1), height=14)
 
-    assert re.search(r"›\s+└─ ●  fast", output)
+    assert re.search(r"›\s+└─ ✦  fast", output)
 
 
 def test_config_editor_render_uses_dynamic_model_options() -> None:
@@ -115,7 +118,8 @@ def test_config_editor_styles_use_dark_blue_background_palette() -> None:
 
     assert background_styles
     assert all("bg:#000000" not in style for style in background_styles)
-    assert any("bg:#050617" in style for style in background_styles)
+    assert any("bg:#080818" in style for style in background_styles)
+    assert any("bg:#140c38" in style for style in background_styles)
 
 
 def test_config_editor_formatted_fragments_paint_backgrounds() -> None:
@@ -139,19 +143,24 @@ def test_config_editor_layout_fits_supported_widths() -> None:
 
         assert len(lines) == 12
         assert lines[0].startswith("╭")
-        assert "Sentinel project config" in lines[1]
+        assert "SENTINEL PROJECT CONFIG" in lines[1]
+        assert "CONFIG LOADED" in lines[1]
+        assert "ESC" in lines[1]
         assert "Path:" in lines[3]
         assert "Arrows move." in lines[5]
+        assert "SETTING" in output
+        assert "VALUE" in output
         assert "JSON" in lines[-2]
+        assert "Enter to save" in lines[-2]
         assert lines[-1].startswith("╰")
         assert all(WidthUtils.display_width(line) == width for line in lines)
 
 
 def test_config_editor_side_panel_visibility_tracks_width() -> None:
-    assert "LEGEND" not in _render(width=80, height=12)
-    assert "LEGEND" not in _render(width=100, height=12)
-    assert "LEGEND" in _render(width=120, height=12)
-    assert "LEGEND" in _render(width=160, height=12)
+    assert "NAVIGATION" not in _render(width=80, height=12)
+    assert "NAVIGATION" not in _render(width=100, height=12)
+    assert "NAVIGATION" in _render(width=120, height=12)
+    assert "NAVIGATION" in _render(width=160, height=12)
 
 
 def test_config_editor_keeps_active_option_visible_with_limited_height() -> None:
@@ -166,7 +175,7 @@ def test_config_editor_keeps_active_option_visible_with_limited_height() -> None
         height=12,
     )
 
-    assert "Sentinel project config" in output.splitlines()[1]
+    assert "SENTINEL PROJECT CONFIG" in output.splitlines()[1]
     assert "Path:" in output.splitlines()[3]
     assert "Arrows move." in output.splitlines()[5]
     assert re.search(r"›\s+└─    add path", output)
@@ -179,7 +188,7 @@ def test_config_editor_uses_unicode_borders_by_default() -> None:
     assert output.startswith("╭")
     assert "│" in output
     assert "───" in output
-    assert "◇  Sentinel project config" in output
+    assert "◇ SENTINEL PROJECT CONFIG" in output
 
 
 def test_config_editor_ascii_borders_are_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -200,7 +209,12 @@ def test_config_editor_default_design_matches_reference_structure() -> None:
     output = _render(config, EditorState(parameter_index=super_index, expanded_index=super_index), width=120, height=24)
 
     assert "CONFIG LOADED" in output
-    assert "LEGEND" in output
+    assert "NAVIGATION" in output
+    assert "^ up" in output
+    assert "v down" in output
+    assert "› select" in output
+    assert "↵ enter" in output
+    assert "esc back / exit" in output
     assert "STATUS" in output
     assert "TIPS" in output
     assert "› ▾ ☆  super-mod" in output
