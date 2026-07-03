@@ -32,6 +32,22 @@ FormattedRender = list[StyledFragment]
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ELLIPSIS = "..."
+OUTER_BORDER_GRADIENT = (
+    "#18f8ff",
+    "#10d0ff",
+    "#1888ff",
+    "#383080",
+    "#8078ff",
+    "#b860ff",
+    "#f060f8",
+)
+PANEL_BORDER_GRADIENT = (
+    "#182850",
+    "#243068",
+    "#303878",
+    "#383080",
+    "#303878",
+)
 
 
 @dataclass(frozen=True)
@@ -119,19 +135,19 @@ class Theme:
         }
         symbols = Symbols.ascii() if ascii_enabled else Symbols.default()
         styles = {
-            "root": "#ddd7eb bg:#080818",
-            "surface": "#ddd7eb bg:#080c20",
-            "header": "#f3dcff bold bg:#080c24",
+            "root": "#ddd7eb bg:#050716",
+            "surface": "#ddd7eb bg:#050716",
+            "header": "#f3dcff bold bg:#06081a",
             "header_title": "#f860ff bold",
             "logo": "#08ffff bold",
-            "badge": "#d8d0ea bg:#101838",
+            "badge": "#a990ff bg:#090c22",
             "badge_border": "#30245c bg:#080820",
-            "chip": "#40e880 bold bg:#101838",
-            "keycap": "#f4eaff bg:#080820",
-            "footer": "#d8d0ea bg:#080c20",
-            "json_badge": "#f060f8 bold bg:#101838",
-            "icon_badge": "#08ffff bold bg:#101838",
-            "save_badge": "#f060f8 bg:#101838",
+            "chip": "#40e880 bold bg:#090c22",
+            "keycap": "#08ffff bg:#080820",
+            "footer": "#d8d0ea bg:#06091c",
+            "json_badge": "#08ffff bold bg:#090c22",
+            "icon_badge": "#08ffff bold bg:#0b1030",
+            "save_badge": "#08ffff bg:#090c22",
             "ok": "#40e880 bold",
             "exit": "#d8cdf4",
             "muted": "#8175a5",
@@ -143,19 +159,20 @@ class Theme:
             "green": "#40e880",
             "yellow": "#ffc018",
             "red": "#f84858",
-            "active": "#f7f1ff bg:#140c38",
-            "active_dark": "#f7f1ff bg:#100838",
+            "active": "#f7f1ff bg:#170d3f",
+            "active_dark": "#f7f1ff bg:#100832",
             "active_marker": "#08ffff bold",
             "name": "#f0eaff",
-            "border": "#383080 bg:#080818",
-            "border_soft": "#182850 bg:#080818",
-            "border_left": "#18f8ff bg:#080818",
-            "border_right": "#f060f8 bg:#080818",
-            "border_bright": "#f060f8 bg:#080818",
-            "panel_border": "#383080 bg:#080c24",
-            "panel_border_soft": "#283060 bg:#080c24",
-            "panel_active_border": "#18f8ff bg:#140c38",
-            "panel": "#d8d0ea bg:#080c24",
+            "border": "#383080 bg:#050716",
+            "border_soft": "#182850 bg:#050716",
+            "border_left": "#18f8ff bg:#050716",
+            "border_right": "#f060f8 bg:#050716",
+            "border_bright": "#f060f8 bg:#050716",
+            "panel_border": "#303878 bg:#06091c",
+            "panel_border_soft": "#182850 bg:#06091c",
+            "panel_active_border": "#18f8ff bg:#170d3f",
+            "panel": "#d8d0ea bg:#06091c",
+            "panel_header": "#d8d0ea bg:#070a20",
             "panel_title": "#8078ff bold",
             "table_header": "#8078ff bold",
             "tree": "#7050c0",
@@ -576,10 +593,10 @@ class ConfigList:
     def _table_header(label_width: int, theme: Theme) -> FragmentLine:
         marker_width = 9
         return [
-            (theme.style("panel"), " " * marker_width),
-            (_merge_styles(theme.style("panel"), theme.style("table_header")), WidthUtils.pad_right("SETTING", label_width)),
-            (theme.style("panel"), "  "),
-            (_merge_styles(theme.style("panel"), theme.style("table_header")), "VALUE"),
+            (theme.style("panel_header"), " " * marker_width),
+            (_merge_styles(theme.style("panel_header"), theme.style("table_header")), WidthUtils.pad_right("SETTING", label_width)),
+            (theme.style("panel_header"), "  "),
+            (_merge_styles(theme.style("panel_header"), theme.style("table_header")), "VALUE"),
         ]
 
     @staticmethod
@@ -796,19 +813,30 @@ def _inline_badge(text: str, theme: Theme, style_key: str) -> FragmentLine:
 
 
 def _horizontal_border_segments(symbol: str, width: int, theme: Theme) -> FragmentLine:
+    return _gradient_segments(symbol, width, OUTER_BORDER_GRADIENT, "#050716")
+
+
+def _gradient_segments(symbol: str, width: int, colors: tuple[str, ...], bg: str) -> FragmentLine:
     if width <= 0:
         return []
-    left_width = width // 4
-    right_width = width // 4
-    middle_width = width - left_width - right_width
     fragments: FragmentLine = []
-    if left_width:
-        fragments.append((theme.style("border_left"), symbol * left_width))
-    if middle_width:
-        fragments.append((theme.style("border"), symbol * middle_width))
-    if right_width:
-        fragments.append((theme.style("border_right"), symbol * right_width))
+    current_color: str | None = None
+    current_text: list[str] = []
+    for index in range(width):
+        color_index = min(len(colors) - 1, index * len(colors) // width)
+        color = colors[color_index]
+        if color != current_color and current_text:
+            fragments.append((_color_style(cast(str, current_color), bg), "".join(current_text)))
+            current_text = []
+        current_color = color
+        current_text.append(symbol)
+    if current_text and current_color is not None:
+        fragments.append((_color_style(current_color, bg), "".join(current_text)))
     return fragments
+
+
+def _color_style(fg: str, bg: str) -> str:
+    return f"{fg} bg:{bg}"
 
 
 def _combine_body_line(left: FragmentLine, right: FragmentLine, layout: LayoutSpec, theme: Theme) -> FragmentLine:
@@ -827,14 +855,19 @@ def _panel_border(width: int, theme: Theme, *, top: bool) -> FragmentLine:
     inner_width = max(0, width - 2)
     return [
         (theme.style("panel_border"), left),
-        (theme.style("panel_border_soft"), symbols.horizontal * inner_width),
+        *_gradient_segments(symbols.horizontal, inner_width, PANEL_BORDER_GRADIENT, "#06091c"),
         (theme.style("panel_border"), right),
     ]
 
 
 def _panel_row(fragments: FragmentLine, inner_width: int, theme: Theme) -> FragmentLine:
     active = _line_has_style(fragments, theme.style("active"))
-    fill_style = theme.style("active") if active else theme.style("panel")
+    if active:
+        fill_style = theme.style("active")
+    elif _line_has_style(fragments, theme.style("panel_header")):
+        fill_style = theme.style("panel_header")
+    else:
+        fill_style = theme.style("panel")
     edge_style = theme.style("panel_active_border") if active else theme.style("panel_border")
     return [
         (edge_style, theme.symbols.vertical),
