@@ -118,14 +118,19 @@ class Theme:
             "on",
         }
         symbols = Symbols.ascii() if ascii_enabled else Symbols.default()
-        background = "bg:#000000"
         styles = {
-            "root": "#ddd7eb",
-            "surface": "#ddd7eb",
-            "header": "#f3dcff bold",
+            "root": "#ddd7eb bg:#050617",
+            "surface": "#ddd7eb bg:#08091f",
+            "header": "#f3dcff bold bg:#0b0b24",
             "header_title": "#ff5cf0 bold",
             "logo": "#50e8ff bold",
-            "badge": "#bfb6dc",
+            "badge": "#bfb6dc bg:#171437",
+            "chip": "#67e8a5 bold bg:#101a2d",
+            "keycap": "#f4eaff bg:#16142f",
+            "footer": "#d8d0ea bg:#090a21",
+            "json_badge": "#9b7dff bold bg:#18103b",
+            "icon_badge": "#c46cff bold bg:#171033",
+            "save_badge": "#bb83ff bg:#14102f",
             "ok": "#67e8a5 bold",
             "exit": "#d8cdf4",
             "muted": "#8175a5",
@@ -135,18 +140,20 @@ class Theme:
             "green": "#4cff94",
             "yellow": "#ffc247",
             "red": "#ff5d7e",
-            "active": "#f7f1ff",
+            "active": "#f7f1ff bg:#1d143f",
             "active_marker": "#6ff3ff bold",
             "name": "#f0eaff",
-            "border": "#38265c",
-            "border_bright": "#b84dff",
-            "panel": "#d8d0ea",
+            "border": "#2d2448 bg:#08091f",
+            "border_soft": "#181731 bg:#090b23",
+            "border_bright": "#d34dff bg:#08091f",
+            "panel_border": "#302650 bg:#090b23",
+            "panel": "#d8d0ea bg:#090b23",
             "panel_title": "#b388ff bold",
             "tree": "#73639d",
         }
         return cls(
             symbols=symbols,
-            styles={key: f"{value} {background}" for key, value in styles.items()},
+            styles=styles,
         )
 
     def style(self, *keys: str) -> str:
@@ -401,24 +408,25 @@ class Header:
     def render(path: Path, layout: LayoutSpec, theme: Theme) -> FragmentLine:
         left: FragmentLine = [
             (theme.style("header"), " "),
-            (theme.style("logo"), _logo_symbol(theme)),
+            (_merge_styles(theme.style("header"), theme.style("logo")), _logo_symbol(theme)),
             (theme.style("header"), "  "),
-            (theme.style("header_title"), "Sentinel project config"),
+            (_merge_styles(theme.style("header"), theme.style("header_title")), "Sentinel project config"),
             (theme.style("header"), "   "),
             (theme.style("badge"), f" {path.name} "),
             (theme.style("header"), "  "),
         ]
         if layout.content_width < 90:
             right: FragmentLine = [
-                (theme.style("ok"), f"{theme.symbols.bullet} LOADED"),
-                (theme.style("exit"), "  ESC/q "),
+                (_merge_styles(theme.style("chip"), theme.style("ok")), f" {theme.symbols.bullet} LOADED "),
+                (theme.style("header"), " "),
+                (_merge_styles(theme.style("keycap"), theme.style("exit")), " ESC/q "),
             ]
         else:
             right = [
-                (theme.style("badge"), " "),
-                (theme.style("ok"), f"{theme.symbols.bullet} CONFIG LOADED"),
-                (theme.style("badge"), "   "),
-                (theme.style("exit"), "ESC / q to exit "),
+                (_merge_styles(theme.style("chip"), theme.style("ok")), f" {theme.symbols.bullet} CONFIG LOADED "),
+                (theme.style("header"), "   "),
+                (_merge_styles(theme.style("keycap"), theme.style("exit")), " ESC "),
+                (_merge_styles(theme.style("header"), theme.style("exit")), " / q to exit "),
             ]
         return _frame_line(
             _line_with_right(left, right, layout.content_width, theme, fill_style=theme.style("header")),
@@ -437,8 +445,8 @@ class PathBar:
         return _frame_line(
             _fit_fragments(
                 [
-                    (theme.style("violet"), label),
-                    (theme.style("cyan"), value),
+                    (_merge_styles(theme.style("surface"), theme.style("violet")), label),
+                    (_merge_styles(theme.style("surface"), theme.style("cyan")), value),
                 ],
                 layout.content_width,
                 theme,
@@ -455,7 +463,7 @@ class HelpLine:
     def render(layout: LayoutSpec, theme: Theme) -> FragmentLine:
         return _frame_line(
             _fit_fragments(
-                [(theme.style("muted"), "    Arrows move. Enter expands or saves. Esc/q exits.")],
+                [(_merge_styles(theme.style("surface"), theme.style("muted")), "    Arrows move. Enter expands or saves. Esc/q exits.")],
                 layout.content_width,
                 theme,
                 fill_style=theme.style("surface"),
@@ -478,24 +486,24 @@ class FooterStatus:
         action = _primary_action_hint(state)
         nested_count = _visible_option_count(parameters, state)
         left: FragmentLine = [
-            (theme.style("badge"), f" {_code_symbol(theme)} "),
-            (theme.style("surface"), "  "),
-            (theme.style("badge"), " JSON "),
-            (theme.style("surface"), "  "),
-            (theme.style("muted"), f"{len(parameters)} keys"),
-            (theme.style("surface"), f"  {theme.symbols.bullet}  "),
-            (theme.style("muted"), f"{nested_count} nested"),
-            (theme.style("surface"), "  "),
+            (theme.style("icon_badge"), f" {_code_symbol(theme)} "),
+            (theme.style("footer"), "  "),
+            (theme.style("json_badge"), " JSON "),
+            (theme.style("footer"), "  "),
+            (_merge_styles(theme.style("footer"), theme.style("muted")), f"{len(parameters)} keys"),
+            (_merge_styles(theme.style("footer"), theme.style("muted")), f"  {theme.symbols.bullet}  "),
+            (_merge_styles(theme.style("footer"), theme.style("muted")), f"{nested_count} nested"),
+            (theme.style("footer"), "  "),
         ]
         right: FragmentLine = [
-            (theme.style("badge"), f" {_save_symbol(theme)} "),
-            (theme.style("exit"), f" {action} "),
+            (theme.style("save_badge"), f" {_save_symbol(theme)} "),
+            (_merge_styles(theme.style("save_badge"), theme.style("exit")), f" {action} "),
         ]
         return _frame_line(
-            _line_with_right(left, right, layout.content_width, theme, fill_style=theme.style("surface")),
+            _line_with_right(left, right, layout.content_width, theme, fill_style=theme.style("footer")),
             layout,
             theme,
-            fill_style=theme.style("surface"),
+            fill_style=theme.style("footer"),
         )
 
 
@@ -594,7 +602,7 @@ class ConfigList:
         return [
             (active_style, " "),
             (_merge_styles(active_style, theme.style("active_marker" if active else "muted")), active_marker),
-            (active_style, "   "),
+            (active_style, "       "),
             (_merge_styles(active_style, theme.style("tree")), _option_branch(parameter, option, theme)),
             (active_style, " "),
             (_merge_styles(active_style, theme.style("green" if selected_marker.strip() else "muted")), selected_marker),
@@ -769,30 +777,31 @@ def _panel_border(width: int, theme: Theme, *, top: bool) -> FragmentLine:
     right = symbols.top_right if top else symbols.bottom_right
     inner_width = max(0, width - 2)
     return [
-        (theme.style("border"), left),
-        (theme.style("border"), symbols.horizontal * inner_width),
-        (theme.style("border"), right),
+        (theme.style("panel_border"), left),
+        (theme.style("panel_border"), symbols.horizontal * inner_width),
+        (theme.style("panel_border"), right),
     ]
 
 
 def _panel_row(fragments: FragmentLine, inner_width: int, theme: Theme) -> FragmentLine:
+    fill_style = theme.style("active") if _line_has_style(fragments, theme.style("active")) else theme.style("panel")
     return [
-        (theme.style("border"), theme.symbols.vertical),
-        *_fit_fragments(fragments, inner_width, theme, fill_style=theme.style("panel")),
-        (theme.style("border"), theme.symbols.vertical),
+        (theme.style("panel_border"), theme.symbols.vertical),
+        *_fit_fragments(fragments, inner_width, theme, fill_style=fill_style),
+        (theme.style("panel_border"), theme.symbols.vertical),
     ]
 
 
 def _side_text(text: str, theme: Theme, *, style_key: str) -> FragmentLine:
     return [
         (theme.style("panel"), "  "),
-        (theme.style(style_key), text),
+        (_merge_styles(theme.style("panel"), theme.style(style_key)), text),
     ]
 
 
 def _side_divider(width: int, theme: Theme) -> FragmentLine:
     return [
-        (theme.style("border"), theme.symbols.horizontal * max(0, width - 2)),
+        (theme.style("panel_border"), theme.symbols.horizontal * max(0, width - 2)),
     ]
 
 
@@ -816,7 +825,7 @@ def _truncate_fragments(fragments: FragmentLine, width: int, theme: Theme) -> Fr
         return []
     placeholder_width = WidthUtils.display_width(ELLIPSIS)
     if width <= placeholder_width:
-        return [(theme.style("muted"), WidthUtils.take_start(ELLIPSIS, width))]
+        return [(_merge_styles(theme.style("surface"), theme.style("muted")), WidthUtils.take_start(ELLIPSIS, width))]
     limit = width - placeholder_width
     used = 0
     result: FragmentLine = []
@@ -828,7 +837,7 @@ def _truncate_fragments(fragments: FragmentLine, width: int, theme: Theme) -> Fr
         if clipped:
             result.append((style, clipped))
             used += WidthUtils.display_width(clipped)
-    result.append((theme.style("muted"), ELLIPSIS))
+    result.append((_merge_styles(theme.style("surface"), theme.style("muted")), ELLIPSIS))
     return _fit_fragments(result, width, theme)
 
 
@@ -838,6 +847,10 @@ def _fragment_width(fragments: FragmentLine) -> int:
 
 def _plain_line(fragments: FragmentLine) -> str:
     return "".join(text for _, text in fragments)
+
+
+def _line_has_style(fragments: FragmentLine, style_key: str) -> bool:
+    return any(style_key in style for style, _ in fragments)
 
 
 def _join_fragment_lines(lines: list[FragmentLine]) -> FormattedRender:
@@ -851,7 +864,7 @@ def _join_fragment_lines(lines: list[FragmentLine]) -> FormattedRender:
 
 def _label_width(parameters: tuple[EditorParameter, ...], width: int) -> int:
     widest = max((WidthUtils.display_width(parameter.label) + 1 for parameter in parameters), default=8)
-    return min(max(18, widest), max(18, width // 3))
+    return min(max(28, widest), max(24, width // 2))
 
 
 def _visible_option_count(parameters: tuple[EditorParameter, ...], state: EditorState) -> int:
@@ -950,11 +963,11 @@ def _panel_line(text: str, width: int, theme: Theme, *, style_key: str = "muted"
     inner_width = max(0, width - 4)
     clipped = WidthUtils.pad_right(text, inner_width)
     return [
-        (theme.style("border"), symbols.vertical),
+        (theme.style("panel_border"), symbols.vertical),
         (theme.style("panel"), " "),
-        (theme.style(style_key), clipped),
+        (_merge_styles(theme.style("panel"), theme.style(style_key)), clipped),
         (theme.style("panel"), " "),
-        (theme.style("border"), symbols.vertical),
+        (theme.style("panel_border"), symbols.vertical),
     ]
 
 
@@ -1070,7 +1083,7 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
             layout=Layout(Window(content=control, wrap_lines=False)),
             key_bindings=kb,
             full_screen=True,
-            style=Style.from_dict({"": "bg:#000000"}),
+            style=Style.from_dict({"": "bg:#050617"}),
         )
         app.run()
         if pending_action["exit"]:

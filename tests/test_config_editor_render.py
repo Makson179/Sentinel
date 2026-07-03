@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -65,7 +66,7 @@ def test_config_editor_render_marks_active_selected_option() -> None:
 
     output = _render(config, EditorState(parameter_index=speed_index, expanded_index=speed_index, option_index=1), height=14)
 
-    assert any("›   └─ ●  fast" in line for line in output.splitlines())
+    assert re.search(r"›\s+└─ ●  fast", output)
 
 
 def test_config_editor_render_uses_dynamic_model_options() -> None:
@@ -109,12 +110,15 @@ def test_width_utils_are_ansi_safe() -> None:
     assert WidthUtils.truncate_middle("/one/two/three/four/file.json", 16) == "/one/t...le.json"
 
 
-def test_config_editor_styles_paint_only_black_backgrounds() -> None:
-    assert all(style.count("bg:") == 1 for style in Theme.from_environment().styles.values())
-    assert all("bg:#000000" in style for style in Theme.from_environment().styles.values())
+def test_config_editor_styles_use_dark_blue_background_palette() -> None:
+    background_styles = [style for style in Theme.from_environment().styles.values() if "bg:" in style]
+
+    assert background_styles
+    assert all("bg:#000000" not in style for style in background_styles)
+    assert any("bg:#050617" in style for style in background_styles)
 
 
-def test_config_editor_formatted_fragments_paint_black_backgrounds() -> None:
+def test_config_editor_formatted_fragments_paint_backgrounds() -> None:
     output = render_editor(
         ProjectConfig(),
         EditorState(),
@@ -125,7 +129,7 @@ def test_config_editor_formatted_fragments_paint_black_backgrounds() -> None:
     )
 
     assert not isinstance(output, str)
-    assert all("bg:#000000" in style for style, text in output if text != "\n")
+    assert all("bg:" in style for style, text in output if text != "\n")
 
 
 def test_config_editor_layout_fits_supported_widths() -> None:
@@ -165,7 +169,7 @@ def test_config_editor_keeps_active_option_visible_with_limited_height() -> None
     assert "Sentinel project config" in output.splitlines()[1]
     assert "Path:" in output.splitlines()[3]
     assert "Arrows move." in output.splitlines()[5]
-    assert any("›   └─    add path" in line for line in output.splitlines())
+    assert re.search(r"›\s+└─    add path", output)
     assert "JSON" in output.splitlines()[-2]
 
 
@@ -200,5 +204,5 @@ def test_config_editor_default_design_matches_reference_structure() -> None:
     assert "STATUS" in output
     assert "TIPS" in output
     assert "› ▾ ☆  super-mod" in output
-    assert "⚡  speed                fast" in output
-    assert "↻  start-over           false" in output
+    assert re.search(r"⚡  speed\s+fast", output)
+    assert re.search(r"↻  start-over\s+false", output)
