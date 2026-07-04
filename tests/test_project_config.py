@@ -272,3 +272,35 @@ def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert result.exit_code == 0
     assert "Saved Sentinel config:" in result.output
     assert "coder-mod: gpt-coder" in result.output
+
+
+def _write_config_payload(tmp_path: Path, payload: str) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+
+def test_max_adversary_runs_parsed_from_payload(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"max_adversary_runs": 3}')
+    config = load_project_config(tmp_path, create=False)
+    assert config.adversary is True
+    assert config.adversary_runs == 3
+
+
+def test_max_adversary_runs_zero_disables_adversary(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"max_adversary_runs": 0}')
+    config = load_project_config(tmp_path, create=False)
+    assert config.adversary is False
+    assert config.adversary_runs == 0
+
+
+def test_max_adversary_runs_rejects_invalid_values(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"max_adversary_runs": -1}')
+    with pytest.raises(ProjectConfigError):
+        load_project_config(tmp_path, create=False)
+
+
+def test_to_json_data_round_trips_adversary_runs(tmp_path) -> None:
+    config = ProjectConfig(adversary_runs=2)
+    data = config.to_json_data()
+    assert data["max_adversary_runs"] == 2

@@ -92,6 +92,13 @@ class SentinelClickGroup(click.Group):
     help="Run the adversarial tester before final completion.",
 )
 @click.option(
+    "--adversary-runs",
+    default=None,
+    type=click.IntRange(min=0),
+    metavar="N",
+    help="Maximum adversarial tester passes before final completion (default 1; 0 disables).",
+)
+@click.option(
     "--version",
     "-V",
     is_flag=True,
@@ -112,6 +119,7 @@ def cli(
     protected_paths: tuple[Path, ...],
     clean: bool | None,
     adversary: bool | None,
+    adversary_runs: int | None,
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -130,6 +138,7 @@ def cli(
             protected_paths=protected_paths,
             clean=clean,
             adversary=adversary,
+            adversary_runs=adversary_runs,
         )
         _run_async_cleanly(
             _run_sentinel(
@@ -143,6 +152,7 @@ def cli(
                 run_settings.protected_paths,
                 run_settings.clean,
                 run_settings.adversary,
+                run_settings.adversary_runs,
             )
         )
     except ProjectConfigError as exc:
@@ -311,6 +321,7 @@ async def _run_sentinel(
     protected_paths: tuple[Path, ...],
     clean: bool,
     adversary: bool,
+    adversary_runs: int,
 ) -> int:
     controller = SentinelController(
         Path.cwd(),
@@ -324,6 +335,7 @@ async def _run_sentinel(
         declared_grading_roots=protected_paths,
         clean_workspace=clean,
         adversary_enabled=adversary,
+        adversary_runs=adversary_runs,
         project_config=load_project_config(Path.cwd(), create=False),
     )
     await controller.run()
@@ -359,6 +371,7 @@ class RunSettings:
     protected_paths: tuple[Path, ...]
     clean: bool
     adversary: bool
+    adversary_runs: int
 
 
 def _resolve_run_settings(
@@ -374,6 +387,7 @@ def _resolve_run_settings(
     protected_paths: tuple[Path, ...],
     clean: bool | None,
     adversary: bool | None,
+    adversary_runs: int | None = None,
 ) -> RunSettings:
     selected_coder_model, selected_supervisor_model = _resolve_model_flags(
         coder_model=coder_model,
@@ -393,7 +407,13 @@ def _resolve_run_settings(
         start_over=project_config.start_over if start_over is None else start_over,
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
-        adversary=project_config.adversary if adversary is None else adversary,
+        # An explicit --adversary wins; otherwise an explicit --adversary-runs implies on/off (0 = off).
+        adversary=(
+            adversary
+            if adversary is not None
+            else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
+        ),
+        adversary_runs=project_config.adversary_runs if adversary_runs is None else adversary_runs,
     )
 
 

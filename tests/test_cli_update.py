@@ -227,6 +227,7 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
         protected_paths,
         clean,
         adversary,
+        adversary_runs,
     ):
         calls.append(
             (
@@ -293,6 +294,7 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
         protected_paths,
         clean,
         adversary,
+        adversary_runs,
     ):
         calls.append(
             (
@@ -357,6 +359,7 @@ def test_cli_boolean_false_overrides_project_config(monkeypatch: pytest.MonkeyPa
         protected_paths,
         clean,
         adversary,
+        adversary_runs,
     ):
         calls.append((fast, start_over, clean, adversary))
         return 0

@@ -280,3 +280,45 @@ def test_fast_true_override_does_not_rewrite_saved_fast_field(tmp_path) -> None:
     assert payload["speed"] == "usual"
     assert payload["fast"] is False
     assert controller._fast_mode() is True
+
+
+def _resolve(project_config: ProjectConfig, **overrides):
+    kwargs = dict(
+        project_config=project_config,
+        task_path=None,
+        coder_model=None,
+        supervisor_model=None,
+        coder_intelligence=None,
+        supervisor_intelligence=None,
+        fast=None,
+        start_over=None,
+        protected_paths=(),
+        clean=None,
+        adversary=None,
+    )
+    kwargs.update(overrides)
+    return _resolve_run_settings(**kwargs)
+
+
+def test_adversary_runs_defaults_to_project_config() -> None:
+    settings = _resolve(ProjectConfig())
+    assert settings.adversary is True
+    assert settings.adversary_runs == 1
+
+
+def test_adversary_runs_cli_override_implies_enabled() -> None:
+    settings = _resolve(ProjectConfig(adversary=False), adversary_runs=3)
+    assert settings.adversary is True
+    assert settings.adversary_runs == 3
+
+
+def test_adversary_runs_zero_implies_disabled() -> None:
+    settings = _resolve(ProjectConfig(), adversary_runs=0)
+    assert settings.adversary is False
+    assert settings.adversary_runs == 0
+
+
+def test_explicit_adversary_flag_wins_over_runs() -> None:
+    settings = _resolve(ProjectConfig(), adversary=False, adversary_runs=2)
+    assert settings.adversary is False
+    assert settings.adversary_runs == 2

@@ -235,6 +235,7 @@ class SentinelController:
         clean_workspace: bool = False,
         use_git_diff: bool = True,
         adversary_enabled: bool | None = None,
+        adversary_runs: int | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
     ):
@@ -256,6 +257,7 @@ class SentinelController:
         self.clean_workspace = clean_workspace
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
+        self.adversary_runs = adversary_runs
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
@@ -392,7 +394,7 @@ class SentinelController:
             supervisor_intelligence=project_config.super_intelligence,
             fast=project_config.fast,
             protected_paths=list(project_config.protected_path),
-            max_adversary_runs=1 if project_config.adversary else 0,
+            max_adversary_runs=self._configured_adversary_runs(project_config),
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_sentinel(config, mode=mode)
@@ -410,7 +412,7 @@ class SentinelController:
                     "supervisor_intelligence": project_config.super_intelligence,
                     "fast": project_config.fast,
                     "protected_paths": list(project_config.protected_path),
-                    "max_adversary_runs": 1 if project_config.adversary else 0,
+                    "max_adversary_runs": self._configured_adversary_runs(project_config),
                 }
             )
         )
@@ -429,6 +431,12 @@ class SentinelController:
         if enabled is False:
             return False
         return True
+
+    def _configured_adversary_runs(self, project_config: ProjectConfig) -> int:
+        """Adversary pass budget persisted to the run config. Mirrors the project file only —
+        CLI overrides (adversary_enabled / adversary_runs) stay runtime-scoped and are applied
+        in _effective_max_adversary_runs, matching how the other run settings behave."""
+        return max(0, project_config.adversary_runs) if project_config.adversary else 0
 
     def _project_config_for_persistence(self) -> ProjectConfig:
         config = getattr(self, "project_config", None)
@@ -2254,7 +2262,8 @@ class SentinelController:
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return 0
-        configured_runs = self.store.get_sentinel_config().max_adversary_runs
+        override = getattr(self, "adversary_runs", None)
+        configured_runs = self.store.get_sentinel_config().max_adversary_runs if override is None else override
         if enabled is True:
             return max(1, configured_runs)
         return configured_runs

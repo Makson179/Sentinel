@@ -5124,3 +5124,29 @@ def test_adversary_snapshot_gets_functional_git_repo(tmp_path: Path) -> None:
         assert "?? app.py" in status.stdout
     finally:
         _shutil.rmtree(snapshot.parent, ignore_errors=True)
+
+
+def test_effective_max_adversary_runs_cli_override(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        overwrite=True,
+    )
+    controller = SentinelController.__new__(SentinelController)
+    controller.store = store
+
+    # No overrides: falls back to the persisted config (default 1).
+    controller.adversary_enabled = None
+    assert controller._effective_max_adversary_runs() == 1
+
+    # CLI --adversary true --adversary-runs 3: budget honored without touching persisted config.
+    controller.adversary_enabled = True
+    controller.adversary_runs = 3
+    assert controller._effective_max_adversary_runs() == 3
+    assert store.get_sentinel_config().max_adversary_runs == 1
+
+    # CLI --adversary false wins regardless of budget.
+    controller.adversary_enabled = False
+    assert controller._effective_max_adversary_runs() == 0

@@ -19,6 +19,7 @@ RUNTIME_SYNC_FIELDS = (
     "speed",
     "start_over",
     "adversary",
+    "adversary_runs",
     "clean",
     "protected_path",
 )
@@ -38,6 +39,7 @@ class ProjectConfig:
     speed: str = "usual"
     start_over: bool = True
     adversary: bool = True
+    adversary_runs: int = 1
     clean: bool = False
     protected_path: tuple[str, ...] = ()
 
@@ -55,6 +57,7 @@ class ProjectConfig:
             "speed": self.speed,
             "start_over": self.start_over,
             "adversary": self.adversary,
+            "max_adversary_runs": self.adversary_runs,
             "clean": self.clean,
             "protected_path": list(self.protected_path),
         }
@@ -176,6 +179,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         speed=_speed_from_payload(payload, default.speed, path=path),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
         adversary=_adversary_from_payload(payload, default.adversary, path=path),
+        adversary_runs=_adversary_runs_from_payload(payload, default.adversary_runs, path=path),
         clean=_bool(payload.get("clean", default.clean), "clean", path=path),
         protected_path=tuple(
             _string_list(
@@ -230,11 +234,20 @@ def _adversary_from_payload(payload: dict[str, Any], default: bool, *, path: Pat
     if "adversary" in payload:
         return _bool(payload["adversary"], "adversary", path=path)
     if "max_adversary_runs" in payload:
-        value = payload["max_adversary_runs"]
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value > 0
-        raise ProjectConfigError(f"invalid Sentinel config at {path}: max_adversary_runs must be an integer")
+        return _adversary_runs_value(payload["max_adversary_runs"], path=path) > 0
     return default
+
+
+def _adversary_runs_from_payload(payload: dict[str, Any], default: int, *, path: Path) -> int:
+    if "max_adversary_runs" in payload:
+        return _adversary_runs_value(payload["max_adversary_runs"], path=path)
+    return default
+
+
+def _adversary_runs_value(value: Any, *, path: Path) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ProjectConfigError(f"invalid Sentinel config at {path}: max_adversary_runs must be a non-negative integer")
 
 
 def _bool(value: Any, field: str, *, path: Path) -> bool:
@@ -292,7 +305,7 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "protected_path" in selected:
         updates["protected_path"] = list(config.protected_path)
         updates["protected_paths"] = list(config.protected_path)
-    if "adversary" in selected:
+    if selected.intersection({"adversary", "adversary_runs"}):
         updates["adversary"] = config.adversary
-        updates["max_adversary_runs"] = 1 if config.adversary else 0
+        updates["max_adversary_runs"] = config.adversary_runs if config.adversary else 0
     return updates
