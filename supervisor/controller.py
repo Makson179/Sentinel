@@ -45,6 +45,7 @@ from supervisor.schemas import (
     ApprovalRequestType,
     AdversaryReport,
     ApprovalWakeContext,
+    BehaviorSurfaceItem,
     BreadthRiskSummary,
     CheapApprovalDecision,
     CheapRuntimeDecision,
@@ -113,6 +114,10 @@ CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
 # (reset on any successful supervisor decision), so a recovered provider keeps working.
 COMPLETION_NO_MESSAGE_MAX_RETRIES = 6
 NO_MESSAGE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 120.0, 120.0)
+# A completion-review turn that times out must not kill the whole run: retry once on a fresh
+# review thread (the timed-out turn is abandoned with the closed session) before the existing
+# fatal provider_failure path. Consecutive semantics: reset on any successful decision.
+COMPLETION_TIMEOUT_MAX_RETRIES = 1
 # Observation-only breadth-risk hints for reviewer context. These terms must
 # never drive an accept gate, mandatory demo, or forced code change; required
 # behavior is derived from task_contents and repository contract instead.
@@ -293,6 +298,15 @@ class SentinelController:
         self.provider_failure_recovery_counts: dict[str, int] = {}
         self.no_marker_idle_nudge_count = 0
         self.validation_runtime_state: dict[str, dict[str, Any]] = {}
+        # Cross-review knowledge: the behavior surface accumulated by completion reviews of
+        # this run plus the previous reviewer's unverified suspicions. Kept in memory on the
+        # controller (not on disk in the coder-writable workspace): an in-run restart keeps this
+        # same object, which is the only survival we need, and an in-memory store cannot be
+        # forged by coder-authored test code or corrupted into a parse/type crash.
+        self._completion_knowledge_state: dict[str, list[Any]] = {
+            "behavior_surface": [],
+            "uncovered_edge_candidates": [],
+        }
         self.completion_review_return_sequence: int | None = None
         self.completion_review_return_validation_sequence: int | None = None
         self._pending_completion_gate_rejection: dict[str, Any] | None = None
@@ -1652,6 +1666,10 @@ class SentinelController:
                 changed_files=changed_files,
                 latest_change_sequence=latest_change_sequence,
             )
+            completion_details["behavior_surface"] = self._behavior_surface_items()
+            completion_details["prior_uncovered_edge_candidates"] = list(
+                self._completion_knowledge()["uncovered_edge_candidates"]
+            )
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
             current_summary=summary,
@@ -1720,6 +1738,13 @@ class SentinelController:
                 )
                 if recovered:
                     return
+            if completion_review and failure_kind == "tool_timeout":
+                recovered = await self._handle_completion_review_timeout_failure(
+                    message=message,
+                    summary=summary,
+                )
+                if recovered:
+                    return
             if not completion_review and getattr(self, "_supervisor_dirty", False):
                 patch_health(
                     self.store,
@@ -1745,6 +1770,55 @@ class SentinelController:
             await self.apply_completion_decision(decision, packet_thread_id=packet.coder_thread_id, packet=packet)
         else:
             await self.apply_supervisor_decision(decision, packet_thread_id=packet.coder_thread_id)
+
+    async def _handle_completion_review_timeout_failure(self, *, message: str, summary: str) -> bool:
+        """One fresh-thread retry when a completion-review turn times out.
+
+        A timed-out review turn used to finalize the whole run as provider_failure, discarding
+        hours of coder work over a single slow review. Close the review session (abandoning the
+        hung turn) and re-enter the review loop once; on a consecutive second timeout, fall
+        through to the existing fatal path. The counter resets on any successful decision.
+        """
+        counts = getattr(self, "provider_failure_recovery_counts", None)
+        if counts is None:
+            counts = {}
+            self.provider_failure_recovery_counts = counts
+        key = "completion_review_tool_timeout"
+        attempts = int(counts.get(key) or 0)
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "provider_failure_recovery",
+                "kind": "tool_timeout",
+                "scope": "completion_review",
+                "attempts_before": attempts,
+                "message": message,
+            }
+        )
+        budget = getattr(self, "_completion_timeout_max_retries", COMPLETION_TIMEOUT_MAX_RETRIES)
+        if attempts >= budget:
+            return False
+        counts[key] = attempts + 1
+        if self.supervisor is not None and hasattr(self.supervisor, "close_completion_review"):
+            await self.supervisor.close_completion_review()
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Provider recovery: completion review turn timed out; retrying once on a fresh review "
+            f"thread (attempt {attempts + 1}/{budget}).\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "provider/completion_timeout_retry",
+            decision="retry",
+            reason=message,
+        )
+        self._supervisor_dirty = True
+        self._supervisor_next_summary = (
+            "Retry completion review on a fresh thread after the previous review turn timed out. "
+            f"Previous review summary: {summary}"
+        )
+        self._supervisor_next_completion_review = True
+        return True
 
     async def _handle_supervisor_no_message_failure(
         self,
@@ -1932,6 +2006,7 @@ class SentinelController:
         )
         self._append_completion_anchor_log(decision, packet=packet)
         self._record_supervisor_decision_metric(use_case="completion", decision=decision.decision.value)
+        self._record_completion_knowledge(decision)
         if decision.decision == CompletionReviewDecisionKind.ACCEPT:
             gate_result = await self._completion_accept_gate(decision, packet=packet)
             if not gate_result.passed:
@@ -2874,6 +2949,40 @@ class SentinelController:
         if not parts:
             return None
         return _bounded_text("\n\n".join(parts), limit=limit)
+
+    # --- cross-review knowledge: accumulated behavior surface + carried suspicions ---
+
+    def _completion_knowledge(self) -> dict[str, list[Any]]:
+        # In-memory only (see __init__): survives in-run restarts because the controller object
+        # is reused, and is never sourced from the coder-writable workspace. Lazily initialized
+        # so controllers built via __new__ in tests still work.
+        state = getattr(self, "_completion_knowledge_state", None)
+        if state is None:
+            state = {"behavior_surface": [], "uncovered_edge_candidates": []}
+            self._completion_knowledge_state = state
+        return state
+
+    def _behavior_surface_items(self) -> list[BehaviorSurfaceItem]:
+        items: list[BehaviorSurfaceItem] = []
+        for entry in self._completion_knowledge()["behavior_surface"]:
+            try:
+                items.append(BehaviorSurfaceItem.model_validate(entry))
+            except Exception:
+                continue
+        return items
+
+    def _record_completion_knowledge(self, decision: CompletionReviewDecision) -> None:
+        """Merge the reviewer-returned surface (merge-only: entries are never removed) into the
+        in-memory knowledge and carry its unverified suspicions to the next review."""
+        knowledge = self._completion_knowledge()
+        merged, changed = _merge_behavior_surface_items(knowledge["behavior_surface"], decision.behavior_surface)
+        if changed:
+            knowledge["behavior_surface"] = merged
+        artifact = decision.decision_artifact
+        if artifact is not None:
+            candidates = [item for item in artifact.uncovered_edge_candidates if isinstance(item, str) and item.strip()]
+            if candidates != knowledge["uncovered_edge_candidates"]:
+                knowledge["uncovered_edge_candidates"] = candidates
 
     async def completion_packet_details(
         self,
@@ -4278,6 +4387,41 @@ def _appears_to_claim_readiness(text: str) -> bool:
         "validation:",
     )
     return any(phrase in lowered for phrase in phrases)
+
+
+def _normalized_surface_key(category: str) -> str:
+    return re.sub(r"\s+", " ", category).strip().lower()
+
+
+def _merge_behavior_surface_items(
+    existing: list[dict[str, Any]],
+    updates: list[BehaviorSurfaceItem],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Upsert reviewer-returned surface entries into the stored list.
+
+    Entries are never removed: a reviewer that judges an entry not actually required marks it
+    status=out_of_scope with a note instead, so the audit trail of what was considered stays
+    visible to later reviews.
+    """
+    merged: list[dict[str, Any]] = [
+        dict(item) for item in existing if isinstance(item, dict) and str(item.get("category") or "").strip()
+    ]
+    index = {_normalized_surface_key(str(item.get("category") or "")): pos for pos, item in enumerate(merged)}
+    changed = False
+    for item in updates:
+        category = (item.category or "").strip()
+        if not category:
+            continue
+        key = _normalized_surface_key(category)
+        pos = index.get(key)
+        if pos is None:
+            merged.append({"category": category, "status": item.status, "note": item.note})
+            index[key] = len(merged) - 1
+            changed = True
+        elif merged[pos].get("status") != item.status or merged[pos].get("note") != item.note:
+            merged[pos] = {**merged[pos], "status": item.status, "note": item.note}
+            changed = True
+    return merged, changed
 
 
 def _completion_returns_this_generation(controller: Any, generation: int) -> int:

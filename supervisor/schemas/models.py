@@ -316,6 +316,16 @@ class CompletionDecisionArtifact(BaseModel):
     actionable_gap_or_none: str | None = None
 
 
+class BehaviorSurfaceItem(BaseModel):
+    """One accumulated behavior-surface entry carried across completion reviews of a run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+    status: Literal["required", "out_of_scope"] = "required"
+    note: str | None = None
+
+
 class CompletionReviewDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -332,6 +342,7 @@ class CompletionReviewDecision(BaseModel):
     claim_evidence_mismatches: list[str] = Field(default_factory=list)
     packet_or_access_limitations: list[str] = Field(default_factory=list)
     changed_test_risks: list[str] = Field(default_factory=list)
+    behavior_surface: list[BehaviorSurfaceItem] = Field(default_factory=list)
     message_to_coder: str | None
     persistent_decision: str | None
     progress_update: str | None
@@ -735,6 +746,8 @@ class SupervisorWakePacket(BaseModel):
     completion_review_thread_id: str | None = None
     pending_accept_gate_rejection: dict[str, Any] | None = None
     adversary_report: AdversaryReport | None = None
+    behavior_surface: list[BehaviorSurfaceItem] = Field(default_factory=list)
+    prior_uncovered_edge_candidates: list[str] = Field(default_factory=list)
 
 
 class FinalReport(BaseModel):

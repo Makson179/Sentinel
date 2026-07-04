@@ -15,6 +15,7 @@ from supervisor.schemas import (
     AdversaryReport,
     ApprovalContext,
     ApprovalWakeContext,
+    BehaviorSurfaceItem,
     BreadthRiskSummary,
     ChangedFile,
     ChangedFileContext,
@@ -44,7 +45,10 @@ from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 
 
 DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 180.0
-DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 900.0
+# Completion review reads the whole (growing) workspace at high effort; late-round reviews on
+# large tasks were observed needing >900s (a 711k-token read died at the old cap and killed a
+# 4.5h run). Keep this above the coder RPC budget, not below it.
+DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 2400.0
 # Prompt-size budgets (characters). Compaction triggers above the target so the
 # assembled wake packet never approaches the model context window (~4 chars/token).
 # Both runtime and completion wakes go through a budget; runtime is kept small so it
@@ -475,6 +479,8 @@ class StatelessSupervisorAgent:
         completion_review_thread_id: str | None = None,
         pending_accept_gate_rejection: dict[str, Any] | None = None,
         adversary_report: AdversaryReport | None = None,
+        behavior_surface: list[BehaviorSurfaceItem] | None = None,
+        prior_uncovered_edge_candidates: list[str] | None = None,
     ) -> SupervisorWakePacket:
         cfg = self.store.get_sentinel_config()
         health = self.store.get_health()
@@ -530,6 +536,8 @@ class StatelessSupervisorAgent:
             completion_review_thread_id=completion_review_thread_id,
             pending_accept_gate_rejection=pending_accept_gate_rejection,
             adversary_report=adversary_report,
+            behavior_surface=behavior_surface or [],
+            prior_uncovered_edge_candidates=prior_uncovered_edge_candidates or [],
         )
 
     def _thread_params(self) -> dict[str, Any]:
