@@ -736,20 +736,20 @@ async def test_adversary_mode_allows_in_snapshot_file_write(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_adversary_mode_denies_network_command(tmp_path: Path) -> None:
+async def test_adversary_mode_network_command_fails_closed_without_supervisor(tmp_path: Path) -> None:
     manager = ApprovalManager(tmp_path, adversary_mode=True)
     context = command_context(tmp_path, "curl http://localhost:9999/health")
 
     resolution = await manager.decide(context)
 
     assert resolution.decision in {"decline", "cancel"}
+    assert "requires supervisor judgment" in resolution.reason
 
 
 @pytest.mark.asyncio
-async def test_adversary_mode_denies_interpreter_execution(tmp_path: Path) -> None:
+async def test_adversary_mode_interpreter_execution_fails_closed_without_supervisor(tmp_path: Path) -> None:
     # python -c could open a socket or read grading material at runtime, invisible to static
-    # analysis — must not run unsandboxed. Contained scripts run via the OS sandbox without
-    # ever reaching this chain, so this does not restrict honest in-snapshot probing.
+    # analysis — situational, so it needs the supervisor; with none wired it fails closed.
     manager = ApprovalManager(tmp_path, adversary_mode=True)
     context = command_context(
         tmp_path, "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://x\")'"
@@ -758,11 +758,11 @@ async def test_adversary_mode_denies_interpreter_execution(tmp_path: Path) -> No
     resolution = await manager.decide(context)
 
     assert resolution.decision in {"decline", "cancel"}
-    assert "adversary snapshot policy denies" in resolution.reason
+    assert "requires supervisor judgment" in resolution.reason
 
 
 @pytest.mark.asyncio
-async def test_adversary_mode_denies_unknown_binary_and_dependency_install(tmp_path: Path) -> None:
+async def test_adversary_mode_denies_unknown_binary_and_dependency_install_without_supervisor(tmp_path: Path) -> None:
     manager = ApprovalManager(tmp_path, adversary_mode=True)
     for command in ("nc evil.example 443", "pip install requests"):
         resolution = await manager.decide(command_context(tmp_path, command))
@@ -770,13 +770,75 @@ async def test_adversary_mode_denies_unknown_binary_and_dependency_install(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_adversary_mode_denies_workspace_escape(tmp_path: Path) -> None:
+async def test_adversary_mode_denies_workspace_escape_without_supervisor(tmp_path: Path) -> None:
     manager = ApprovalManager(tmp_path, adversary_mode=True)
     context = command_context(tmp_path, "cat /etc/hosts")
 
     resolution = await manager.decide(context)
 
     assert resolution.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_adversary_gray_zone_routes_to_full_supervisor(tmp_path: Path) -> None:
+    # The same command can be legitimate under one task and cheating under another, so the
+    # gray zone is judged situationally by the full supervisor instead of a static deny.
+    supervisor = FakeFullSupervisor()
+    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    context = command_context(
+        tmp_path, "'/Applications/Browser.app/Contents/MacOS/Browser' --headless index.html"
+    )
+
+    resolution = await manager.decide(context)
+
+    assert supervisor.calls == 1
+    assert "adversary snapshot escalation" in supervisor.reasons[0]
+    assert resolution.decision == "accept"
+
+
+@pytest.mark.asyncio
+async def test_adversary_gray_zone_supervisor_deny_declines(tmp_path: Path) -> None:
+    supervisor = FakeFullSupervisor(
+        decision=SupervisorDecision(
+            decision=SupervisorDecisionKind.DENY,
+            approval_decision=ApprovalDecisionKind.DECLINE,
+            reason="no task grounding for network access",
+        )
+    )
+    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    context = command_context(tmp_path, "curl https://example.com/data")
+
+    resolution = await manager.decide(context)
+
+    assert supervisor.calls == 1
+    assert resolution.decision == "decline"
+
+
+@pytest.mark.asyncio
+async def test_adversary_gray_zone_supervisor_error_fails_closed(tmp_path: Path) -> None:
+    supervisor = FakeFullSupervisor(exc=RuntimeError("boom"))
+    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    context = command_context(tmp_path, "curl https://example.com/data")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_adversary_secret_path_denied_without_consulting_supervisor(tmp_path: Path) -> None:
+    # Grading/secret material can never be legitimized by task context; the supervisor is
+    # not even consulted.
+    (tmp_path / ".env").write_text("KEY=1", encoding="utf-8")
+    supervisor = FakeFullSupervisor()
+    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    context = command_context(tmp_path, "cat .env")
+
+    resolution = await manager.decide(context)
+
+    assert resolution.decision in {"decline", "cancel"}
+    assert supervisor.calls == 0
+    assert "adversary snapshot policy denies" in resolution.reason
 
 
 @pytest.mark.asyncio

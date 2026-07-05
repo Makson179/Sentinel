@@ -32,6 +32,17 @@ class AdversaryRunResult:
     candidate_finding: bool
 
 
+def _denied_probes_retry_note(denied: list[str]) -> str:
+    lines = "\n".join(f"- {item}" for item in denied)
+    return (
+        "Retry note: your previous attempt ended without producing a report after command approval denials. "
+        "The following requests were denied:\n"
+        f"{lines}\n"
+        "Do not request these again and do not work around the denials; treat those areas as unreachable, "
+        "record them under not_reached, and complete the report using probes that run inside the snapshot sandbox."
+    )
+
+
 class AdversaryAgent:
     def __init__(
         self,
@@ -42,6 +53,7 @@ class AdversaryAgent:
         timeout_seconds: float = DEFAULT_ADVERSARY_TIMEOUT_SECONDS,
         on_thread_start: Callable[[str], None] | None = None,
         on_thread_done: Callable[[str], None] | None = None,
+        denied_probes: Callable[[], list[str]] | None = None,
     ):
         self.client = client
         self.project_root = project_root.resolve()
@@ -49,6 +61,7 @@ class AdversaryAgent:
         self.timeout_seconds = timeout_seconds
         self.on_thread_start = on_thread_start
         self.on_thread_done = on_thread_done
+        self.denied_probes = denied_probes
 
     async def run(
         self,
@@ -62,8 +75,17 @@ class AdversaryAgent:
         )
         last_error: str | None = None
         for attempt in range(2):
+            attempt_prompt = prompt
+            if attempt:
+                # An approval denial can abort the whole turn before the agent gets a
+                # chance to record the area as not_reached, so a blind retry would just
+                # replay the same request and die the same way. Tell the fresh thread
+                # what was already refused so it routes around it and still reports.
+                denied = list(self.denied_probes()) if self.denied_probes else []
+                if denied:
+                    attempt_prompt = prompt + "\n\n" + _denied_probes_retry_note(denied)
             try:
-                return await self._run_once(prompt)
+                return await self._run_once(attempt_prompt)
             except AdversaryAgentError as exc:
                 last_error = str(exc)
                 if "did not produce an agent message" not in last_error or attempt == 1:

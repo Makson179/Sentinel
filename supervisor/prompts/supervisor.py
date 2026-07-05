@@ -48,8 +48,10 @@ def build_adversary_prompt(
             _adversary_prompt_text(),
             (
                 "Operational constraints for this run: start from this prompt only. If previous_adversary_report is "
-                "present, use it only as regression context before searching for new issues. Web/network use is "
-                "disabled. Do not read hidden/private/id_private "
+                "present, use it only as regression context before searching for new issues. Actions that leave the "
+                "sandbox (network access, host executables, anything outside the snapshot) go through the approval "
+                "flow and are judged against the task: request one only when the task itself requires that access, "
+                "never for independent research or convenience. Do not read hidden/private/id_private "
                 "grading material or runtime history. You are running in a disposable snapshot of the submitted "
                 "workspace, not the canonical workspace. You may create or edit disposable probe files inside this "
                 "snapshot and /tmp, but do not request writes outside the snapshot. Return only the report requested "
@@ -139,7 +141,10 @@ def _stateless_supervisor_section_names(packet: SupervisorWakePacket) -> list[st
     if packet.handoff is not None:
         names.append("handoff")
     if packet.approval_context is not None or packet.triggering_server_request_id is not None:
-        names.append("approval")
+        if packet.approval_context is not None and packet.approval_context.origin == "adversary_snapshot":
+            names.append("adversary_approval")
+        else:
+            names.append("approval")
     if _include_action_review(packet):
         names.append("action_review")
     if packet.human_message is not None:

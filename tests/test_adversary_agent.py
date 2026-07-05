@@ -93,7 +93,8 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     }
     prompt_payload = json.loads(client.turn_params[0]["input"][0]["text"])
     assert prompt_payload["task_contents"].startswith("# Task")
-    assert "Web/network use is disabled" in prompt_payload["instructions"][1]
+    assert "judged against the task" in prompt_payload["instructions"][1]
+    assert "only when the task itself requires that access" in prompt_payload["instructions"][1]
     assert "disposable snapshot" in prompt_payload["instructions"][1]
     assert "accepted_completion_review" not in prompt_payload
     assert first.candidate_finding is False
@@ -180,6 +181,52 @@ async def test_adversary_agent_retries_once_after_no_message(tmp_path: Path) -> 
     assert "overall: held" in result.report_text
     assert client.thread_ids == ["adv-thread-1", "adv-thread-2"]
     assert client.archived == ["adv-thread-1", "adv-thread-2"]
+
+
+async def test_adversary_agent_retry_carries_denied_probes_note(tmp_path: Path) -> None:
+    # A denial can abort the whole turn before the agent records not_reached; the retry
+    # must tell the fresh thread what was refused so it does not replay the same request.
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_ids: list[str] = []
+            self.prompts: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            thread_id = f"adv-thread-{len(self.thread_ids) + 1}"
+            self.thread_ids.append(thread_id)
+            return {"thread": {"id": thread_id}}
+
+        async def turn_start(self, params, *, timeout):
+            self.prompts.append(params["input"][0]["text"])
+            if params["threadId"] == "adv-thread-1":
+                return {"turn": {"id": "adv-turn-1", "status": "completed", "items": []}}
+            return {
+                "turn": {
+                    "id": "adv-turn-2",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "attacked: retry\nfindings: none\noverall: held"}],
+                }
+            }
+
+        async def thread_turns_list(self, thread_id, *, limit, items_view, timeout):
+            return {"data": [{"id": "adv-turn-1", "items": []}]}
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    client = FakeClient()
+    denied = ["some-host-binary --flag file.html (denied: needs supervisor judgment)"]
+    result = await AdversaryAgent(
+        client,  # type: ignore[arg-type]
+        tmp_path,
+        timeout_seconds=1,
+        denied_probes=lambda: list(denied),
+    ).run(_packet(tmp_path))
+
+    assert result.thread_id == "adv-thread-2"
+    assert "Retry note" not in client.prompts[0]
+    assert "some-host-binary --flag file.html" in client.prompts[1]
+    assert "record them under not_reached" in client.prompts[1]
 
 
 def test_adversary_candidate_finding_parser_handles_multiline_findings() -> None:

@@ -29,6 +29,7 @@ from supervisor.controller import (
     _validation_from_action,
     _validation_freshness_summary,
 )
+from supervisor.adversary_agent import AdversaryAgentError
 from supervisor.approvals import normalize_approval_request
 from supervisor.appserver import APP_SERVER_CODER_RPC_TIMEOUT_SECONDS, AppServerError, AppServerMessage, AppServerTimeoutError
 from supervisor.coder import CODEX_FAST_SERVICE_TIER, CoderSession, coder_thread_params, coder_turn_params
@@ -2857,6 +2858,65 @@ async def test_adversary_run_limit_skips_additional_run_and_finalizes(
     assert any(event["event_type"] == "adversary/limit_reached" for event in events)
 
 
+async def test_adversary_infra_failure_completes_with_recorded_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An adversary that cannot run is a tester-availability problem, not evidence against
+    # the accepted work: the run must finalize the accept with the gap recorded loudly,
+    # not die as infrastructure-invalid.
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.model = None
+    controller.running = False
+    controller._pending_adversary_report = None
+    controller._active_adversary_thread_id = None
+    controller._active_adversary_workspace_root = None
+
+    class FailingAdversary:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            raise AdversaryAgentError("adversary did not produce an agent message")
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", FailingAdversary)
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert coder.messages == []
+    accepted = controller._accepted_adversary_report
+    assert accepted is not None
+    assert accepted.status == "error"
+    assert "did not produce an agent message" in accepted.report_text
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Adversarial tester could not run" in progress
+    assert "adversary coverage recorded as missing" in progress
+    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    assert any(event["event_type"] == "adversary/unavailable" for event in events)
+    assert any(event["event_type"] == "completion/accept" for event in events)
+    final_report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "status=error" in final_report
+    assert "provider_failure" not in final_report.lower()
+
+
 async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
@@ -4450,6 +4510,10 @@ async def test_adversary_file_change_request_is_denied_without_steering_coder(tm
     assert controller.coder.messages == []
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Adversary approval denied without steering coder" in progress
+    # The denial is remembered so an adversary retry can be told what was refused.
+    assert len(controller._adversary_denied_commands) == 1
+    assert str(tmp_path / "src" / "app.py") in controller._adversary_denied_commands[0]
+    assert "(denied:" in controller._adversary_denied_commands[0]
 
 
 async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) -> None:

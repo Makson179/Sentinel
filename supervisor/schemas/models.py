@@ -400,6 +400,10 @@ class ApprovalWakeContext(BaseModel):
     proposed_execpolicy_amendment: list[str] | None = None
     proposed_network_policy_amendments: list[Any] | None = None
     reason: str | None = None
+    # Which agent raised the approval: the coder working in the canonical workspace, or
+    # the adversarial tester escalating out of its disposable snapshot. Selects the
+    # approval framing section in the supervisor prompt.
+    origin: Literal["coder", "adversary_snapshot"] = "coder"
 
 
 class TriggeringAction(BaseModel):

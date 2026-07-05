@@ -737,6 +737,7 @@ class SentinelController:
             adversary_workspace_root = getattr(self, "_active_adversary_workspace_root", None)
             fallback_manager = ApprovalManager(
                 adversary_workspace_root or self.project_root,
+                supervisor=self,
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
                 adversary_mode=adversary_workspace_root is not None,
             )
@@ -765,6 +766,13 @@ class SentinelController:
             self.store.append_text_locked(DECISIONS, f"- {resolution.persistent_decision}\n")
         if is_denial:
             if is_adversary_request:
+                denied_command = (context.command or context.grant_root or context.request_type.value or "").strip()
+                if len(denied_command) > 200:
+                    denied_command = denied_command[:197] + "..."
+                denied_list = getattr(self, "_adversary_denied_commands", None)
+                if denied_list is None:
+                    denied_list = self._adversary_denied_commands = []
+                denied_list.append(f"{denied_command} (denied: {resolution.reason})")
                 self.store.append_text_locked(
                     PROGRESS,
                     f"- Adversary approval denied without steering coder: {resolution.reason}\n",
@@ -803,7 +811,8 @@ class SentinelController:
         self._reconcile_intervention_accounting()
         cfg = self.store.get_sentinel_config()
         wake_sequence = cfg.last_event_sequence + 1
-        approval_context = _approval_wake_context(context, reason)
+        origin = "adversary_snapshot" if self._is_adversary_approval_context(context) else "coder"
+        approval_context = _approval_wake_context(context, reason, origin=origin)
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
             current_summary=f"Approval request needs judgment: {reason}",
@@ -811,7 +820,11 @@ class SentinelController:
             triggering_server_request_id=context.server_request_id,
             approval_context=approval_context,
             pending_approvals=[
-                _approval_wake_context(pending, reason if pending.server_request_id == context.server_request_id else None)
+                _approval_wake_context(
+                    pending,
+                    reason if pending.server_request_id == context.server_request_id else None,
+                    origin="adversary_snapshot" if self._is_adversary_approval_context(pending) else "coder",
+                )
                 for pending in self.pending_approvals.values()
             ],
             last_coder_message=self.last_coder_message,
@@ -1150,6 +1163,7 @@ class SentinelController:
         self._pending_adversary_report = None
         self._active_adversary_thread_id = None
         self._active_adversary_workspace_root = None
+        self._adversary_denied_commands: list[str] = []
         self.validation_runtime_state = {}
         patch_health(
             self.store,
@@ -2108,9 +2122,10 @@ class SentinelController:
     ) -> None:
         cfg = self.store.get_sentinel_config()
         if packet is None:
-            await self.finalize(
-                "infra-invalid: adversary requires a completion packet before final complete",
-                status=SentinelStatus.PROVIDER_FAILURE,
+            await self._complete_after_adversary_unavailable(
+                decision,
+                packet=None,
+                error_summary="completion packet missing for the adversary run",
             )
             return
         adversary_run_count, max_adversary_runs = self._reserve_adversary_run()
@@ -2129,18 +2144,21 @@ class SentinelController:
         try:
             snapshot_root = _create_adversary_snapshot(self.project_root)
         except Exception as exc:
-            await self.finalize(
-                f"infra-invalid: adversary snapshot setup failed before complete: {exc.__class__.__name__}: {exc}",
-                status=SentinelStatus.PROVIDER_FAILURE,
+            await self._complete_after_adversary_unavailable(
+                decision,
+                packet=packet,
+                error_summary=f"snapshot setup failed: {exc.__class__.__name__}: {exc}",
             )
             return
         self._active_adversary_workspace_root = snapshot_root
+        self._adversary_denied_commands = []
         agent = AdversaryAgent(
             self.client,
             snapshot_root,
             model=self._adversary_model(),
             on_thread_start=self._mark_adversary_thread_started,
             on_thread_done=self._mark_adversary_thread_done,
+            denied_probes=lambda: list(getattr(self, "_adversary_denied_commands", [])),
         )
         try:
             result = await agent.run(packet, previous_adversary_report=previous_report_payload)
@@ -2156,9 +2174,10 @@ class SentinelController:
                     "error": str(exc),
                 }
             )
-            await self.finalize(
-                f"infra-invalid: adversary provider/tool failure before complete: {exc}",
-                status=SentinelStatus.PROVIDER_FAILURE,
+            await self._complete_after_adversary_unavailable(
+                decision,
+                packet=packet,
+                error_summary=str(exc),
             )
             return
         finally:
@@ -2201,34 +2220,10 @@ class SentinelController:
                 PROGRESS,
                 "- Adversarial tester completed without a candidate finding; finalizing prior completion accept.\n",
             )
-            if decision.persistent_decision:
-                self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
-            if decision.progress_update:
-                self.store.append_text_locked(PROGRESS, f"- {decision.progress_update}\n")
-                patch_health(
-                    self.store,
-                    HealthDelta(generation=cfg.generation, last_progress_sequence=cfg.last_event_sequence),
-                )
-            if decision.clear_handoff:
-                self.store.write_text_locked(HANDOFF, "")
-            if decision.display_message:
-                self.tui.render("SUPERVISOR", decision.display_message)
-            self._append_event(
-                AppEventSource.SUPERVISOR,
-                "completion/accept",
-                decision="accept",
-                reason=decision.reason,
-            )
-            self.completion_reviewer_rerun_count = 0
-            self.completion_decision_staleness_rerun_count = 0
-            self.completion_return_freshness_rerun_count = 0
-            self._pending_completion_gate_rejection = None
-            self._accepted_completion_decision = decision
-            self._accepted_adversary_report = report
-            await self.finalize(
-                f"accepted by completion_review after clean adversary report: {decision.reason or 'task complete'}",
-                status=SentinelStatus.COMPLETE,
-                completion_review_accepted=True,
+            await self._finalize_accepted_completion(
+                decision,
+                adversary_report=report,
+                result=f"accepted by completion_review after clean adversary report: {decision.reason or 'task complete'}",
             )
             return
         self.store.append_text_locked(
@@ -2245,6 +2240,90 @@ class SentinelController:
             "Adversarial tester report is available. Rerun completion_review; weigh the report as input, "
             "return only for a real reproduced required-behavior defect, otherwise accept.",
             completion_review=True,
+        )
+
+    async def _finalize_accepted_completion(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        adversary_report: AdversaryReport | None,
+        result: str,
+    ) -> None:
+        cfg = self.store.get_sentinel_config()
+        if decision.persistent_decision:
+            self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
+        if decision.progress_update:
+            self.store.append_text_locked(PROGRESS, f"- {decision.progress_update}\n")
+            patch_health(
+                self.store,
+                HealthDelta(generation=cfg.generation, last_progress_sequence=cfg.last_event_sequence),
+            )
+        if decision.clear_handoff:
+            self.store.write_text_locked(HANDOFF, "")
+        if decision.display_message:
+            self.tui.render("SUPERVISOR", decision.display_message)
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "completion/accept",
+            decision="accept",
+            reason=decision.reason,
+        )
+        self.completion_reviewer_rerun_count = 0
+        self.completion_decision_staleness_rerun_count = 0
+        self.completion_return_freshness_rerun_count = 0
+        self._pending_completion_gate_rejection = None
+        self._accepted_completion_decision = decision
+        self._accepted_adversary_report = adversary_report
+        await self.finalize(
+            result,
+            status=SentinelStatus.COMPLETE,
+            completion_review_accepted=True,
+        )
+
+    async def _complete_after_adversary_unavailable(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        packet: SupervisorWakePacket | None,
+        error_summary: str,
+    ) -> None:
+        """The completion review accepted and only the adversary could not run.
+
+        That is a tester-availability problem, not evidence against the accepted work:
+        finalize the accept with the missing adversary coverage recorded loudly (same
+        terminal shape as adversary-disabled or limit-reached) instead of declaring the
+        whole run infrastructure-invalid and discarding a reviewed, accepted solution.
+        """
+        cfg = self.store.get_sentinel_config()
+        report = AdversaryReport(
+            status="error",
+            candidate_finding=False,
+            report_text=f"adversary did not run: {error_summary}",
+            generation=packet.generation if packet is not None else cfg.generation,
+            completion_wake_sequence=decision.wake_sequence,
+            latest_relevant_change_sequence=packet.latest_relevant_change_sequence if packet is not None else None,
+            validation_sequence=_latest_validation_sequence(packet.validations) if packet is not None else None,
+            workspace_state_id=_workspace_state_id(self.project_root),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.tui.render(
+            "ADVERSARY",
+            f"adversarial tester could not run ({error_summary}); finalizing completion accept",
+        )
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Adversarial tester could not run ({error_summary}); finalizing prior completion accept "
+            "with adversary coverage recorded as missing.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "adversary/unavailable",
+            reason=error_summary,
+        )
+        await self._finalize_accepted_completion(
+            decision,
+            adversary_report=report,
+            result=f"accepted by completion_review; adversary tester could not run: {error_summary}",
         )
 
     def _adversary_runs_remaining(self) -> bool:
@@ -3447,7 +3526,12 @@ class SentinelController:
         )
 
 
-def _approval_wake_context(context: ApprovalContext, reason: str | None = None) -> ApprovalWakeContext:
+def _approval_wake_context(
+    context: ApprovalContext,
+    reason: str | None = None,
+    *,
+    origin: str = "coder",
+) -> ApprovalWakeContext:
     return ApprovalWakeContext(
         request_type=context.request_type.value,
         server_request_id=context.server_request_id,
@@ -3462,6 +3546,7 @@ def _approval_wake_context(context: ApprovalContext, reason: str | None = None) 
         proposed_execpolicy_amendment=context.proposed_execpolicy_amendment,
         proposed_network_policy_amendments=context.proposed_network_policy_amendments,
         reason=reason,
+        origin=origin,
     )
 
 

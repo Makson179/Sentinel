@@ -16,6 +16,7 @@ from supervisor.prompts import (
     build_stateless_supervisor_prompt,
 )
 from supervisor.schemas.models import (
+    ApprovalWakeContext,
     HumanMessage,
     CheapApprovalDecision,
     CompletionDecisionArtifact,
@@ -322,6 +323,24 @@ def test_stateless_prompt_assembles_blocks_from_packet() -> None:
     assert "approval" in payload["prompt_sections"]
     assert "handoff" in payload["prompt_sections"]
     assert "action_review" not in payload["prompt_sections"]
+
+    adversary_approval = base.model_copy(
+        update={
+            "triggering_server_request_id": 11,
+            "approval_context": ApprovalWakeContext(
+                request_type="command",
+                server_request_id=11,
+                method="item/commandExecution/requestApproval",
+                command="curl https://example.com",
+                origin="adversary_snapshot",
+            ),
+        }
+    )
+    payload = json.loads(build_stateless_supervisor_prompt(adversary_approval))
+    assert "adversary_approval" in payload["prompt_sections"]
+    assert "approval" not in payload["prompt_sections"]
+    adversary_section = payload["instructions"][payload["prompt_sections"].index("adversary_approval")]
+    assert "valid in one situation and invalid in another" in adversary_section
 
     action = base.model_copy(update={"triggering_item_id": "item-1"})
     assert "action_review" in json.loads(build_stateless_supervisor_prompt(action))["prompt_sections"]

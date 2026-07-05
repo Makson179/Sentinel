@@ -43,17 +43,24 @@ from supervisor.schemas import (
 # such a command runs it UNSANDBOXED, so at that point "leaving the cage" is exactly what
 # we must not rubber-stamp.
 #
-# Fail closed: allow the escalation only when EVERY risk tag is in the contained-safe set
-# below; any other tag (network, interpreter_execution/unknown_executable — which can open
-# a socket or read grading material at runtime past static analysis, see the integrity note
-# on CHEAP_REVIEW_BLOCK_TAGS — dependency/git mutation that fetch over the network, secret
-# or grading paths, workspace escape, ambiguous parse, ...) denies. A new tag added later is
-# denied by default rather than silently allowed.
+# Escalations whose every risk tag is in the contained-safe set below stay inside the
+# snapshot and are auto-approved. Tags in the hard-deny set can never be legitimized by
+# any task (grading/secret material). Everything else — network, interpreter or
+# unknown-binary execution, dependency/git mutation, workspace escape, ambiguous parse —
+# is situational: the same command can be valid under one task and cheating under
+# another, so it routes to the full supervisor for judgment against the task and project
+# state. Fail closed: with no supervisor wired, or on supervisor error/timeout, the
+# escalation is denied.
 ADVERSARY_SNAPSHOT_SAFE_TAGS = {
     "filesystem_write",
     "destructive",
     "permission_change",
     "environment_mutation",
+}
+
+ADVERSARY_HARD_DENY_TAGS = {
+    "secret_path",
+    "grading_path",
 }
 
 COMMAND_APPROVAL_METHOD = "item/commandExecution/requestApproval"
@@ -189,28 +196,35 @@ class ApprovalManager:
         if policy_decision.kind == PolicyDecisionKind.DENY:
             return self._deny(context, policy_decision.reason)
         if self.adversary_mode:
-            return self._adversary_containment_decision(context)
+            return await self._adversary_containment_decision(context)
         return await self._route_review_chain_or_full_supervisor(context, policy_decision)
 
-    def _adversary_containment_decision(self, context: ApprovalContext) -> ApprovalResolution:
-        """Adversary gray zone: allow only escalations that stay contained in the snapshot.
+    async def _adversary_containment_decision(self, context: ApprovalContext) -> ApprovalResolution:
+        """Adversary gray zone: contained escalations auto-approve, the rest is situational.
 
-        Approving an escalated command runs it outside the OS sandbox, so containment is
-        checked statically and fail-closed: the command is auto-approved only when every
-        risk tag is in ADVERSARY_SNAPSHOT_SAFE_TAGS; any other tag (network, interpreter or
-        unknown-binary execution, dependency/git fetch, secret/grading path, workspace
-        escape, ambiguous parse) denies.
+        Approving an escalated command runs it outside the OS sandbox. Commands whose every
+        risk tag is in ADVERSARY_SNAPSHOT_SAFE_TAGS stay inside the snapshot and are
+        auto-approved. Grading/secret material (ADVERSARY_HARD_DENY_TAGS) is denied
+        unconditionally — no task can legitimize it. Everything else routes to the full
+        supervisor, which judges the command against the task and project state; without a
+        wired supervisor that route fails closed to deny.
         """
         analysis = analyze_command(self.workspace, context.command or "", context.cwd)
         unsafe = analysis.risk_tags - ADVERSARY_SNAPSHOT_SAFE_TAGS
-        if unsafe:
+        if not unsafe:
+            return self._allow(
+                context,
+                "adversary command is contained in the disposable snapshot; auto-approved",
+            )
+        hard = analysis.risk_tags & ADVERSARY_HARD_DENY_TAGS
+        if hard:
             return self._deny(
                 context,
-                "adversary snapshot policy denies leaving the sandbox: " + ", ".join(sorted(unsafe)),
+                "adversary snapshot policy denies leaving the sandbox: " + ", ".join(sorted(hard)),
             )
-        return self._allow(
+        return await self._route_full_supervisor_or_deny(
             context,
-            "adversary command is contained in the disposable snapshot; auto-approved",
+            "adversary snapshot escalation (" + ", ".join(sorted(unsafe)) + ") requires supervisor judgment",
         )
 
     def response_payload(self, context: ApprovalContext, resolution: ApprovalResolution) -> dict[str, Any]:
