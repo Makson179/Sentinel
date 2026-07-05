@@ -12,6 +12,7 @@ dependencies = [
   "click>=8.1",
   "pydantic>=2.0",
   "prompt-toolkit>=3.0",
+  "wcwidth>=0.2",
 ]
 
 [project.optional-dependencies]
