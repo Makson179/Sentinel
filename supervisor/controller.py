@@ -93,6 +93,10 @@ NO_MARKER_IDLE_NUDGE = (
     "Continue working. If you believe the task is ready, provide Summary, Validation evidence, "
     "and the exact readiness marker on its own line: SENTINEL_READY_FOR_REVIEW."
 )
+POST_RESTART_CONTINUE_NUDGE = (
+    "You are a fresh generation after a restart. Read HANDOFF.md and continue the task from there. "
+    "Do not declare readiness until you have done new work and validated it."
+)
 ACCEPT_GATE_REVIEWER_INCOMPLETE = "reviewer-incomplete"
 ACCEPT_GATE_CODER_CORRECTABLE = "coder-correctable"
 ACCEPT_GATE_AUDIT_FAILURE = "audit-failure"
@@ -290,6 +294,9 @@ class SentinelController:
         self._supervisor_next_summary: str | None = None
         self._supervisor_next_completion_review = False
         self._current_turn_action_count = 0
+        # True at run start (the initial generation begins working immediately); reset to False by
+        # restart() until the new generation's first coder turn starts.
+        self._generation_has_coder_turn = True
         self._last_completion_marker_sequence: int | None = None
         self.completion_returns: list[CompletionReturnRecord] = []
         self.completion_attempt_count = 0
@@ -846,6 +853,7 @@ class SentinelController:
             if self.coder:
                 self.coder.active_turn_id = turn_id
             self._current_turn_action_count = 0
+            self._generation_has_coder_turn = True
             self.store.update_sentinel_config(lambda current: current.model_copy(update={"active_coder_turn_id": turn_id}))
             self.tui.render("CODER", f"turn started {turn_id}")
             return
@@ -1068,6 +1076,14 @@ class SentinelController:
         cfg = self.store.get_sentinel_config()
         if cfg.active_coder_turn_id:
             return
+        if not getattr(self, "_generation_has_coder_turn", True):
+            # A freshly restarted generation has produced no coder work yet: forcing a completion
+            # review here would judge the previous generation's leftover state (observed killing a
+            # run via restart-with-exhausted-budget). Kick the coder instead; steer_or_start starts
+            # a turn if the restart kickoff died.
+            if self.coder:
+                await self.coder.steer_or_start(POST_RESTART_CONTINUE_NUDGE)
+            return
         latest_validation_sequence = max((validation.sequence for validation in self.validations), default=None)
         last_message_sequence = self.last_coder_message.sequence if self.last_coder_message is not None else None
         review_key = f"{cfg.generation}:{last_message_sequence}:{latest_validation_sequence}"
@@ -1126,6 +1142,9 @@ class SentinelController:
         self.prior_interventions = []
         self.no_marker_idle_nudge_count = 0
         self._last_completion_marker_sequence = None
+        # The new generation has produced no coder work yet; until its first turn starts,
+        # completion machinery must not judge (or restart over) the previous generation's state.
+        self._generation_has_coder_turn = False
         self.completion_review_return_sequence = None
         self.completion_review_return_validation_sequence = None
         self._pending_adversary_report = None
@@ -2060,6 +2079,22 @@ class SentinelController:
             await self._return_completion_to_coder(decision)
             return
         if decision.decision == CompletionReviewDecisionKind.RESTART:
+            if not getattr(self, "_generation_has_coder_turn", True):
+                # Nothing to restart: the current generation has not run a single coder turn, so
+                # this verdict can only be judging the previous generation's leftover state. With
+                # the restart budget exhausted it would finalize the run as STUCK for no reason.
+                self.store.append_text_locked(
+                    PROGRESS,
+                    "- Discarded completion restart issued before any coder work in the current generation.\n",
+                )
+                self._append_event(
+                    AppEventSource.SUPERVISOR,
+                    "completion/restart_discarded_virgin_generation",
+                    reason=decision.reason,
+                )
+                if self.coder:
+                    await self.coder.steer_or_start(POST_RESTART_CONTINUE_NUDGE)
+                return
             self._pending_completion_gate_rejection = None
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)

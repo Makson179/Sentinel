@@ -15,6 +15,7 @@ from supervisor.approvals import ApprovalManager
 from supervisor.controller import (
     ADVERSARY_MODEL,
     NO_MARKER_IDLE_NUDGE,
+    POST_RESTART_CONTINUE_NUDGE,
     ControllerEvent,
     SentinelController,
     _ensure_internal_runtime_git_excluded,
@@ -5150,3 +5151,89 @@ def test_effective_max_adversary_runs_cli_override(tmp_path: Path) -> None:
     # CLI --adversary false wins regardless of budget.
     controller.adversary_enabled = False
     assert controller._effective_max_adversary_runs() == 0
+
+
+class _FakeSteerCoder:
+    def __init__(self) -> None:
+        self.steers: list[str] = []
+
+    async def steer_or_start(self, message: str) -> None:
+        self.steers.append(message)
+
+
+async def test_no_marker_idle_skips_review_for_virgin_generation(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
+    )
+    controller._generation_has_coder_turn = False
+    controller.coder = _FakeSteerCoder()
+
+    await controller._handle_no_marker_idle()
+
+    assert fake.completion_packets == []
+    assert "Controller forcing completion_review" not in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert controller.coder.steers == [POST_RESTART_CONTINUE_NUDGE]
+
+
+async def test_completion_restart_discarded_for_virgin_generation(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        overwrite=True,
+    )
+    handoff = RestartHandoff(
+        objective="task",
+        restart_reason="recovery restart before any coder work",
+        bad_pattern="none",
+        known_evidence="handoff from prior generation",
+        next_step="continue",
+        recovery_signal="new coder work",
+    )
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.coder = _FakeSteerCoder()
+    controller.pending_approvals = {}
+    controller.prior_interventions = []
+    controller.validations = []
+    controller.observed_changed_files = {}
+    controller.use_git_diff = False
+    controller.tui = _FakeTUI()
+    controller.running = True
+    controller.event_queue = asyncio.Queue()
+    controller._sequence = 0
+    controller.completion_returns = []
+    controller.completion_restarts = 0
+    controller.no_marker_idle_nudge_count = 0
+    controller._generation_has_coder_turn = False
+
+    await controller.apply_completion_decision(
+        CompletionReviewDecision(
+            decision="restart",
+            reason="generation recovery before any new coder work",
+            uncovered_behaviors=[],
+            validation_gaps=["stale prior-generation state"],
+            message_to_coder=None,
+            persistent_decision=None,
+            progress_update="Restarting into recovery.",
+            clear_handoff=False,
+            display_message=None,
+            handoff=handoff,
+            wake_sequence=1,
+            generation=0,
+        ),
+        packet_thread_id="thread",
+    )
+
+    cfg = store.get_sentinel_config()
+    assert cfg.generation == 0
+    assert cfg.status not in (SentinelStatus.STUCK, SentinelStatus.RESTARTING)
+    assert controller.completion_restarts == 0
+    assert "Discarded completion restart" in store.path(PROGRESS).read_text(encoding="utf-8")
+    events = store.path(EVENTS).read_text(encoding="utf-8")
+    assert "completion/restart_discarded_virgin_generation" in events
+    assert controller.coder.steers == [POST_RESTART_CONTINUE_NUDGE]
