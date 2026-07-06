@@ -172,6 +172,7 @@ class SentinelConfig(BaseModel):
     max_no_marker_idle_nudges: int = 2
     max_completion_returns_per_generation: int = 10
     max_adversary_runs: int = 1
+    completion_review_enabled: bool = True
     adversary_run_count: int = 0
     accept_gate_accepts: int = 0
     accept_gate_rejections: int = 0

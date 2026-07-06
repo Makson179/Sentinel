@@ -1048,6 +1048,80 @@ async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> N
     assert len(fake.completion_packets) == 1
 
 
+async def test_marker_with_completion_review_disabled_finalizes_without_review(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    controller.last_coder_message = CoderMessage(
+        text="Summary: done\nValidation: pytest\nSENTINEL_READY_FOR_REVIEW",
+        sequence=1,
+    )
+    controller.validations = [
+        ValidationRun(command="pytest", exit_code=0, passed=True, summary="passed", sequence=1)
+    ]
+
+    await controller._handle_coder_turn_completed(item_id="message-item")
+
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert fake.completion_packets == []
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "completion review disabled by config" in report
+    assert "- Completion review accepted: false" in report
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "completion review is disabled by config" in progress
+    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    assert any(event["event_type"] == "completion/review_disabled_finalize" for event in events)
+
+
+async def test_completion_review_cli_override_beats_persisted_config(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+
+    controller.completion_review = False
+    assert controller._effective_completion_review() is False
+
+    controller.completion_review = True
+    store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    assert controller._effective_completion_review() is True
+
+    controller.completion_review = None
+    assert controller._effective_completion_review() is False
+
+
+async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = True
+    controller.adversary_runs = None
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "completion_review_enabled": False})
+    )
+
+    assert controller._effective_max_adversary_runs() == 0
+    assert controller._adversary_model_required_for_preflight() is False
+
+
+async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    store.update_sentinel_config(
+        lambda cfg: cfg.model_copy(
+            update={"active_coder_turn_id": None, "last_event_sequence": 17, "completion_review_enabled": False}
+        )
+    )
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str) -> str:
+            self.messages.append(message)
+            return "turn"
+
+    controller.coder = FakeCoder()
+
+    await controller._handle_no_marker_idle()
+
+    assert fake.completion_packets == []
+    assert controller.coder.messages == [NO_MARKER_IDLE_NUDGE]
+
+
 def test_runtime_supervisor_schema_rejects_complete() -> None:
     with pytest.raises(Exception):
         SupervisorDecision.model_validate({"decision": "complete"})

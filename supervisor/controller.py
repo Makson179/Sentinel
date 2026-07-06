@@ -240,6 +240,7 @@ class SentinelController:
         use_git_diff: bool = True,
         adversary_enabled: bool | None = None,
         adversary_runs: int | None = None,
+        completion_review: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
     ):
@@ -262,6 +263,9 @@ class SentinelController:
         self.use_git_diff = use_git_diff
         self.adversary_enabled = _adversary_enabled_from_env() if adversary_enabled is None else adversary_enabled
         self.adversary_runs = adversary_runs
+        # CLI override for the completion-review toggle; stays runtime-scoped and never
+        # rewrites the persisted project config, matching the other run settings.
+        self.completion_review = completion_review
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
@@ -338,6 +342,11 @@ class SentinelController:
             await self.tui.start()
             self.running = True
             self.tui.render("SYSTEM", self._runtime_settings_summary())
+            if self._adversary_enabled_for_config() and not self._effective_completion_review():
+                self.tui.render(
+                    "SYSTEM",
+                    "adversary requires completion review; disabled for this run",
+                )
             await self.preflight()
             if not self.running:
                 return
@@ -403,6 +412,7 @@ class SentinelController:
             protected_paths=list(project_config.protected_path),
             max_adversary_runs=self._configured_adversary_runs(project_config),
             max_completion_returns_per_generation=project_config.completion_returns_per_generation,
+            completion_review_enabled=project_config.completion_review,
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_sentinel(config, mode=mode)
@@ -422,6 +432,7 @@ class SentinelController:
                     "protected_paths": list(project_config.protected_path),
                     "max_adversary_runs": self._configured_adversary_runs(project_config),
                     "max_completion_returns_per_generation": project_config.completion_returns_per_generation,
+                    "completion_review_enabled": project_config.completion_review,
                 }
             )
         )
@@ -434,6 +445,24 @@ class SentinelController:
 
     def _fast_mode(self) -> bool:
         return bool(getattr(self, "fast", False))
+
+    def _effective_completion_review(self) -> bool:
+        """Whether the completion review gate is active for this run.
+
+        CLI override wins; otherwise the persisted project-config mirror. With the gate
+        off, the coder's readiness marker finalizes the run directly and the adversary
+        (which runs inside the review-accept path) is inactive.
+        """
+        override = getattr(self, "completion_review", None)
+        if override is not None:
+            return bool(override)
+        try:
+            return bool(self.store.get_sentinel_config().completion_review_enabled)
+        except Exception:
+            project_config = getattr(self, "project_config", None)
+            if project_config is not None:
+                return bool(project_config.completion_review)
+            return True
 
     def _adversary_enabled_for_config(self) -> bool:
         enabled = getattr(self, "adversary_enabled", None)
@@ -481,7 +510,8 @@ class SentinelController:
             f"speed={speed} "
             f"start-over={_format_bool(self.overwrite_state)} "
             f"clean={_format_bool(self.clean_workspace)} "
-            f"adversary={_format_bool(self._adversary_enabled_for_config())} "
+            f"completion-review={_format_bool(self._effective_completion_review())} "
+            f"adversary={_format_bool(self._adversary_enabled_for_config() and self._effective_completion_review())} "
             f"protected-path={protected_paths}"
         )
 
@@ -569,6 +599,8 @@ class SentinelController:
         await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
 
     def _adversary_model_required_for_preflight(self) -> bool:
+        if not self._effective_completion_review():
+            return False
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return False
@@ -1002,6 +1034,9 @@ class SentinelController:
                         triggering_item_id=item_id,
                     )
                     return
+                if not self._effective_completion_review():
+                    await self._finalize_completion_review_disabled()
+                    return
                 summary = "Coder provided exact readiness marker; running completion_review."
                 pending_gate = getattr(self, "_pending_completion_gate_rejection", None)
                 if pending_gate:
@@ -1105,6 +1140,13 @@ class SentinelController:
         if getattr(self, "_no_marker_completion_review_key", None) == review_key:
             return
         self._no_marker_completion_review_key = review_key
+        if not self._effective_completion_review():
+            # No review gate to force: nudge the coder to finish and emit the marker,
+            # which is the only terminal signal in this mode.
+            await self._steer_for_marker(
+                "Coder is idle with no active turn and no readiness marker; completion review is disabled, nudging coder to finish.",
+            )
+            return
         self.store.append_text_locked(
             PROGRESS,
             "- Controller forcing completion_review: coder is idle with no active turn and no readiness marker.\n",
@@ -2244,6 +2286,28 @@ class SentinelController:
             completion_review=True,
         )
 
+    async def _finalize_completion_review_disabled(self) -> None:
+        """Completion review is disabled: the coder's readiness marker is the finish line.
+
+        Runtime supervision (approvals, steering, restarts) already ran its course; the
+        final report carries the validation ledger and states plainly that no completion
+        review or adversary pass certified the result.
+        """
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Coder declared readiness; completion review is disabled by config, finalizing without review.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "completion/review_disabled_finalize",
+            reason="coder readiness marker with completion review disabled",
+        )
+        await self.finalize(
+            "coder declared readiness; completion review disabled by config (no review or adversary certification)",
+            status=SentinelStatus.COMPLETE,
+            completion_review_accepted=False,
+        )
+
     async def _finalize_accepted_completion(
         self,
         decision: CompletionReviewDecision,
@@ -2375,6 +2439,10 @@ class SentinelController:
         )
 
     def _effective_max_adversary_runs(self) -> int:
+        if not self._effective_completion_review():
+            # The adversary runs inside the completion-review accept path; without the
+            # review gate there is no point where it could fire.
+            return 0
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return 0

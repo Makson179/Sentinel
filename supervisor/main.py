@@ -23,7 +23,7 @@ from supervisor.schemas import SentinelStatus
 from supervisor.task_select import TaskSelectionError
 
 
-OPTIONAL_BOOL_FLAGS = {"--fast", "--start-over", "--clean", "--adversary"}
+OPTIONAL_BOOL_FLAGS = {"--fast", "--start-over", "--clean", "--adversary", "--completion-review"}
 
 
 class SentinelClickGroup(click.Group):
@@ -85,11 +85,22 @@ class SentinelClickGroup(click.Group):
     help="Delete everything in the current folder except the selected task file before starting.",
 )
 @click.option(
+    "--completion-review",
+    "completion_review",
+    default=None,
+    type=click.BOOL,
+    metavar="[true|false]",
+    help=(
+        "Run the completion review before finishing. false finishes on the coder's "
+        "readiness marker and disables the adversary, which runs inside the review."
+    ),
+)
+@click.option(
     "--adversary",
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
-    help="Run the adversarial tester before final completion.",
+    help="Run the adversarial tester before final completion; requires completion review.",
 )
 @click.option(
     "--adversary-runs",
@@ -118,6 +129,7 @@ def cli(
     start_over: bool | None,
     protected_paths: tuple[Path, ...],
     clean: bool | None,
+    completion_review: bool | None,
     adversary: bool | None,
     adversary_runs: int | None,
 ) -> None:
@@ -137,6 +149,7 @@ def cli(
             start_over=start_over,
             protected_paths=protected_paths,
             clean=clean,
+            completion_review=completion_review,
             adversary=adversary,
             adversary_runs=adversary_runs,
         )
@@ -151,6 +164,7 @@ def cli(
                 run_settings.start_over,
                 run_settings.protected_paths,
                 run_settings.clean,
+                run_settings.completion_review,
                 run_settings.adversary,
                 run_settings.adversary_runs,
             )
@@ -320,6 +334,7 @@ async def _run_sentinel(
     start_over: bool,
     protected_paths: tuple[Path, ...],
     clean: bool,
+    completion_review: bool,
     adversary: bool,
     adversary_runs: int,
 ) -> int:
@@ -336,6 +351,7 @@ async def _run_sentinel(
         clean_workspace=clean,
         adversary_enabled=adversary,
         adversary_runs=adversary_runs,
+        completion_review=completion_review,
         project_config=load_project_config(Path.cwd(), create=False),
     )
     await controller.run()
@@ -370,6 +386,7 @@ class RunSettings:
     start_over: bool
     protected_paths: tuple[Path, ...]
     clean: bool
+    completion_review: bool
     adversary: bool
     adversary_runs: int
 
@@ -386,7 +403,8 @@ def _resolve_run_settings(
     start_over: bool | None,
     protected_paths: tuple[Path, ...],
     clean: bool | None,
-    adversary: bool | None,
+    completion_review: bool | None = None,
+    adversary: bool | None = None,
     adversary_runs: int | None = None,
 ) -> RunSettings:
     selected_coder_model, selected_supervisor_model = _resolve_model_flags(
@@ -407,6 +425,7 @@ def _resolve_run_settings(
         start_over=project_config.start_over if start_over is None else start_over,
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
+        completion_review=project_config.completion_review if completion_review is None else completion_review,
         # An explicit --adversary wins; otherwise an explicit --adversary-runs implies on/off (0 = off).
         adversary=(
             adversary

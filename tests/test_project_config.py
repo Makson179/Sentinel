@@ -416,3 +416,45 @@ def test_to_json_data_round_trips_completion_return_limit(tmp_path) -> None:
     config = ProjectConfig(completion_returns_per_generation=4)
     data = config.to_json_data()
     assert data["max_completion_returns_per_generation"] == 4
+
+
+def test_completion_review_defaults_to_enabled(tmp_path) -> None:
+    _write_config_payload(tmp_path, "{}")
+    config = load_project_config(tmp_path, create=False)
+    assert config.completion_review is True
+
+
+def test_completion_review_parsed_from_payload(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"completion_review": false}')
+    config = load_project_config(tmp_path, create=False)
+    assert config.completion_review is False
+
+
+def test_completion_review_rejects_invalid_values(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"completion_review": "sometimes"}')
+    with pytest.raises(ProjectConfigError):
+        load_project_config(tmp_path, create=False)
+
+
+def test_to_json_data_round_trips_completion_review(tmp_path) -> None:
+    config = ProjectConfig(completion_review=False)
+    data = config.to_json_data()
+    assert data["completion_review"] is False
+
+
+def test_completion_review_syncs_to_runtime_config(tmp_path) -> None:
+    from supervisor.state import StateStore
+    from supervisor.schemas import SentinelConfig
+
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(
+        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        overwrite=True,
+    )
+    assert store.get_sentinel_config().completion_review_enabled is True
+
+    sync_runtime_config_fields(tmp_path, ProjectConfig(completion_review=False), ("completion_review",))
+
+    assert store.get_sentinel_config().completion_review_enabled is False

@@ -206,6 +206,7 @@ def test_controller_runtime_settings_summary_uses_effective_values(tmp_path) -> 
         "speed=fast "
         "start-over=false "
         "clean=false "
+        "completion-review=true "
         "adversary=false "
         "protected-path=hidden"
     )

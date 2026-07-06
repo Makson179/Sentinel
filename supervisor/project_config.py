@@ -18,6 +18,7 @@ RUNTIME_SYNC_FIELDS = (
     "super_intelligence",
     "speed",
     "start_over",
+    "completion_review",
     "adversary",
     "adversary_runs",
     "completion_returns_per_generation",
@@ -39,6 +40,7 @@ class ProjectConfig:
     super_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
     start_over: bool = True
+    completion_review: bool = True
     adversary: bool = True
     adversary_runs: int = 1
     completion_returns_per_generation: int = 10
@@ -58,6 +60,7 @@ class ProjectConfig:
             "super_intelligence": self.super_intelligence,
             "speed": self.speed,
             "start_over": self.start_over,
+            "completion_review": self.completion_review,
             "adversary": self.adversary,
             "max_adversary_runs": self.adversary_runs,
             "max_completion_returns_per_generation": self.completion_returns_per_generation,
@@ -181,6 +184,9 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         ),
         speed=_speed_from_payload(payload, default.speed, path=path),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
+        completion_review=_bool(
+            payload.get("completion_review", default.completion_review), "completion_review", path=path
+        ),
         adversary=_adversary_from_payload(payload, default.adversary, path=path),
         adversary_runs=_adversary_runs_from_payload(payload, default.adversary_runs, path=path),
         completion_returns_per_generation=_non_negative_int(
@@ -317,6 +323,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "protected_path" in selected:
         updates["protected_path"] = list(config.protected_path)
         updates["protected_paths"] = list(config.protected_path)
+    if "completion_review" in selected:
+        updates["completion_review_enabled"] = config.completion_review
     if selected.intersection({"adversary", "adversary_runs"}):
         updates["adversary"] = config.adversary
         updates["max_adversary_runs"] = config.adversary_runs if config.adversary else 0

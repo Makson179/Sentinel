@@ -80,6 +80,19 @@ def test_config_editor_render_shows_numeric_limit_fields() -> None:
     assert "max-completion-returns-per-generation" in output
 
 
+def test_config_editor_completion_review_row_and_adversary_coupling() -> None:
+    output = _render(width=120, height=32)
+    assert "completion-review" in output
+
+    params = parameter_defs(ProjectConfig(completion_review=False, adversary=True, adversary_runs=2))
+    by_key = {param.key: param for param in params}
+    assert by_key["completion_review"].value == "false"
+    # adversary runs inside the completion-review accept path, so with the review
+    # disabled the editor shows the adversary as effectively off.
+    assert by_key["adversary"].value == "false"
+    assert by_key["adversary_runs"].value == "0"
+
+
 def test_config_editor_render_shows_inline_edit_value_cursor() -> None:
     params = parameter_defs(ProjectConfig())
     task_index = [param.key for param in params].index("task")

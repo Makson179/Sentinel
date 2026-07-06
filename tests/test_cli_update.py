@@ -226,6 +226,7 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
         start_over,
         protected_paths,
         clean,
+        completion_review,
         adversary,
         adversary_runs,
     ):
@@ -293,6 +294,7 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
         start_over,
         protected_paths,
         clean,
+        completion_review,
         adversary,
         adversary_runs,
     ):
@@ -358,6 +360,7 @@ def test_cli_boolean_false_overrides_project_config(monkeypatch: pytest.MonkeyPa
         start_over,
         protected_paths,
         clean,
+        completion_review,
         adversary,
         adversary_runs,
     ):
@@ -378,3 +381,53 @@ def test_cli_boolean_false_overrides_project_config(monkeypatch: pytest.MonkeyPa
 
     assert result is None
     assert calls == [(False, False, False, False)]
+
+
+def test_cli_completion_review_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    calls: list[bool] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
+
+    async def fake_run_sentinel(
+        task_path,
+        coder_model,
+        supervisor_model,
+        coder_intelligence,
+        supervisor_intelligence,
+        fast,
+        start_over,
+        protected_paths,
+        clean,
+        completion_review,
+        adversary,
+        adversary_runs,
+    ):
+        calls.append(completion_review)
+        return 0
+
+    def fake_run_async_cleanly(coro):
+        assert asyncio.run(coro) == 0
+
+    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
+
+    result = cli.main(
+        args=["--task", str(task), "--completion-review=false"],
+        prog_name="sentinel",
+        standalone_mode=False,
+    )
+
+    assert result is None
+    assert calls == [False]
+
+    result = cli.main(
+        args=["--task", str(task)],
+        prog_name="sentinel",
+        standalone_mode=False,
+    )
+
+    assert result is None
+    # No flag: the project-config default (enabled) flows through.
+    assert calls == [False, True]
