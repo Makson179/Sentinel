@@ -43,46 +43,69 @@ Sentinel separates those roles:
 This is designed for unattended work with controlled risk, not for perfect
 safety or guaranteed correctness.
 
-## User Flow
+## Sentinel Command Order
 
-From a project directory:
+Rule: write command parts in the same order as this file. If item A should be
+before item B in a command, item A has a smaller line number here.
+
+`pipx install "git+https://github.com/Makson179/Sentinel.git"` - install Sentinel from the default GitHub branch.
+`SENTINEL_SKIP_UPDATE_CHECK=1` - skip the startup update check for one command.
+`sentinel` - main command; run it from the project directory.
+`config` - open the interactive project config editor.
+`doctor` - check Python, Git, Codex, auth, app-server support, install metadata, and update status.
+`update` - update Sentinel, then use the updated install for future runs.
+`--version` - print Sentinel version, installed commit, and update status.
+`-V` - short form of `--version`.
+`--help` - show command help.
+`-h` - short form of `--help`.
+`--task TASK.md` - choose the markdown task file explicitly.
+`--coder-mod MODEL` - choose the Codex model for coder turns; must be used with `--super-mod`.
+`--super-mod MODEL` - choose the Codex model for supervisor turns; must be used with `--coder-mod`.
+`--coder-intelligence VALUE` - choose coder reasoning effort.
+`--super-intelligence VALUE` - choose supervisor reasoning effort.
+`--start-over[=true|false]` - reset `.supervisor` state and start fresh.
+`--clean[=true|false]` - delete workspace files except the selected task file before starting; use only in disposable folders.
+`--adversary[=true|false]` - run the adversarial tester before final completion.
+`--adversary-runs N` - override the adversarial tester pass limit for one run; `0` disables it.
+`--protected-path PATH` - mark a hidden or grading path as protected; repeat this option for multiple paths.
+
+Examples:
 
 ```bash
-sentinel --task TASK.md
+sentinel doctor
+sentinel --version
+sentinel update
+sentinel config
+sentinel --task TASK.md --coder-mod gpt-5 --super-mod gpt-5 --start-over
+sentinel --task TASK.md --coder-mod gpt-5.5 --super-mod gpt-5.5
+SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
 ```
-
-or:
-
-```bash
-sentinel
-```
-
-When `--task` is omitted, Sentinel scans for markdown task files and shows a
-selector if there is more than one candidate.
-
-Use `--clean` in a disposable task directory to remove every file and
-directory except the selected task file before Sentinel starts.
-
-Task selection rules:
-
-- explicit `--task` must exist and end in `.md`;
-- scan excludes `.git`, `.supervisor`, `node_modules`, `vendor`, `dist`,
-  `build`, `target`, `.venv`, and `venv`;
-- `TASK.md`, `task.md`, `PLAN.md`, `plan.md`, and `TODO.md` rank first.
 
 ## Model Selection
 
-On first run, Sentinel creates `.supervisor/config.json` with project defaults:
-`gpt-5.5` for both coder and supervisor, `xhigh` intelligence for both roles,
-`start-over=true`, `adversary=true`, and `clean=false`.
+Sentinel resolves run settings by priority: explicit CLI flags for the current
+invocation win first, then project defaults saved in `.supervisor/config.json`,
+then built-in defaults. The built-in defaults are `gpt-5.5` for both coder and
+supervisor, `xhigh` intelligence for both roles, `speed=usual`,
+`start-over=true`, `adversary=true`, `max_adversary_runs=1`,
+`max_completion_returns_per_generation=10`, and `clean=false`.
 
-Edit those defaults interactively:
+Use `sentinel config` to edit the project defaults for the current directory:
 
 ```bash
 sentinel config
 ```
 
-Choose models for coder and supervisor:
+The config editor creates `.supervisor/config.json` if it does not exist and
+saves values that future `sentinel` runs use when a CLI flag is omitted. It can
+edit the task path, coder and supervisor models, reasoning effort, speed,
+`start-over`, adversary enablement, adversary run limit, completion-return
+limit, `clean`, and protected paths. Choice fields expand in place with Enter;
+free-text and numeric fields are typed directly in the `VALUE` column and saved
+with Enter. CLI flags override these saved values for one run and do not rewrite
+the project config.
+
+Choose models for a single run with:
 
 ```bash
 sentinel --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
@@ -95,6 +118,10 @@ Add `--fast` or `--fast=true` to use the Codex Fast service tier for both coder
 and full supervisor turns. Use `--fast=false` to override a fast project config
 for one run.
 
+For adversary settings, explicit `--adversary=true|false` wins. If `--adversary`
+is omitted, `--adversary-runs N` overrides the saved run limit for one run and
+also implies enabled when `N > 0` or disabled when `N = 0`.
+
 Model names are Codex/OpenAI model slugs accepted by the installed Codex
 app-server and the authenticated account. Use `gpt-5.5` for the default 5.5
 model. Other usable values are the model slugs exposed to your account by
@@ -103,11 +130,6 @@ hard-coded allow-list.
 
 The adversarial tester always uses `gpt-5.5`, independent of `--coder-mod` or
 `--super-mod`.
-
-Supported values:
-
-- `gpt-5.5`: default and recommended.
-- Any other model slug accepted by your Codex app-server/account.
 
 ## What You See
 
@@ -352,64 +374,3 @@ Ctrl+Q   clean exit when implemented by terminal
 ```
 
 Human text is routed to the supervisor, not directly to the coder.
-
-## Install For Local Development
-
-From this repository:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e '.[test]'
-```
-
-Run tests:
-
-```bash
-.venv/bin/pytest -q
-```
-
-## Safe Smoke Test
-
-Use a throwaway project first:
-
-```bash
-mkdir /tmp/sentinel-smoke
-cd /tmp/sentinel-smoke
-git init
-cat > TASK.md <<'EOF'
-Create hello.py that prints "hello from sentinel".
-Then run python3 hello.py to validate it.
-EOF
-```
-
-Run:
-
-```bash
-/path/to/Sentinel/.venv/bin/sentinel --task TASK.md --start-over
-```
-
-Afterwards inspect:
-
-```bash
-find .supervisor -maxdepth 1 -type f -print | sort
-cat .supervisor/config.json
-tail .supervisor/events.jsonl
-cat .supervisor/FINAL_REPORT.md
-```
-
-To test markdown selection, create a second `.md` file and run without
-`--task`:
-
-```bash
-echo '# Other task' > NOTES.md
-/path/to/Sentinel/.venv/bin/sentinel --start-over
-```
-
-## Current Status
-
-This is an app-server runtime. It has the core Sentinel architecture, but the Codex
-app-server protocol is experimental and can change between Codex releases.
-Sentinel therefore performs schema/version preflight checks before running.
-
-Do not run first tests in an important repository. Start with a throwaway git
-repo and inspect `.supervisor/` after the run.
