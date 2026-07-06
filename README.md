@@ -1,73 +1,122 @@
-# Sentinel
+<h1 align="center">Sentinel</h1>
 
-Sentinel is a terminal supervisor for autonomous Codex runs.
+<p align="center">
+  <strong>Terminal supervision for autonomous Codex app-server runs.</strong><br>
+  A persistent coder does the work. A separate supervisor owns approvals,
+  steering, restarts, state, and final completion.
+</p>
 
-It does not run Codex through hooks, plugins, subagents, or `codex exec --json`.
-Instead, Sentinel starts `codex app-server --listen stdio://` and controls Codex
-through the app-server JSON-RPC protocol.
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white"></a>
+  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0F766E?style=flat-square"></a>
+  <img alt="Transport: Codex app-server JSON-RPC" src="https://img.shields.io/badge/transport-codex%20app--server-334155?style=flat-square">
+  <img alt="Approvals: fail closed" src="https://img.shields.io/badge/approvals-fail--closed-B91C1C?style=flat-square">
+</p>
+
+---
+
+## What Sentinel Is
+
+Sentinel is a terminal supervisor for autonomous Codex runs. It does not run
+Codex through hooks, plugins, subagents, or `codex exec --json`. Instead,
+Sentinel starts `codex app-server --listen stdio://` and controls Codex through
+the app-server JSON-RPC protocol.
 
 The goal is simple: let a Codex coding agent work autonomously while a separate
 supervisor/controller owns approvals, steering, restarts, state, and final
 completion.
 
-## What It Does
+| Surface | Sentinel's role |
+| --- | --- |
+| Coder | A persistent Codex thread that reads the task file, edits code, runs commands, and validates the task. |
+| Supervisor | Short-lived stateless Codex turns that review compact runtime packets and return strict decisions. |
+| Human | Talks to Sentinel, not directly to the coder. Normal approval prompts should not reach the human during a run. |
+| State | Writes inspectable runtime files under `.supervisor/` in the target project. |
 
-Sentinel runs two kinds of Codex work:
+## Quick Start
 
-- **Coder**: a persistent Codex thread that reads the selected task file, edits
-  code, runs commands, and validates the task.
-- **Supervisor**: short-lived stateless Codex turns that review compact state
-  packets. Runtime monitor turns decide whether to continue, approve, deny,
-  steer, restart, or pause; a dedicated completion-review turn accepts or
-  returns final readiness after the coder emits the readiness marker.
+```bash
+pipx install "git+https://github.com/Makson179/Sentinel.git"
+sentinel doctor
+sentinel config
+sentinel --task TASK.md --coder-mod gpt-5.5 --super-mod gpt-5.5 --start-over
+```
 
-The human talks to Sentinel, not directly to the coder. Normal approval prompts
-should not reach the human during a run.
+Useful companion commands:
 
-## Why Not Just Give Codex Full Permissions?
+```bash
+sentinel --version
+sentinel update
+SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
+```
 
-
+## Why Sentinel Exists
 
 Full permissions are fast, but they also mean the same agent decides and
-executes everything.
+executes everything. Sentinel separates those roles so unattended work can keep
+moving while risky actions stay controlled.
 
-Sentinel separates those roles:
-
-- safe actions can be approved by deterministic policy;
-- dangerous actions are denied automatically;
-- gray-zone actions are reviewed by a fresh stateless supervisor turn;
-- the coder can be steered or restarted when it drifts;
-- completion is accepted only by dedicated completion review;
-- state and decisions are written to `.supervisor/` for inspection.
+| Concern | Sentinel response |
+| --- | --- |
+| Routine inspection | Safe read-only actions can be approved by deterministic policy. |
+| Dangerous actions | Secrets, broad deletes, permission changes, deploy/publish commands, git force operations, and supervisor-state edits are denied automatically. |
+| Ambiguous actions | Gray-zone approvals are reviewed by a fresh stateless supervisor turn. |
+| Drift | The coder can be steered or restarted when it loses the thread. |
+| Final claims | Completion is accepted only by dedicated completion review. |
+| Auditability | State and decisions are written to `.supervisor/` for inspection. |
 
 This is designed for unattended work with controlled risk, not for perfect
 safety or guaranteed correctness.
 
-## Sentinel Command Order
+## Runtime Architecture
 
-Rule: write command parts in the same order as this file. If item A should be
-before item B in a command, item A has a smaller line number here.
+```mermaid
+flowchart TD
+    Human["Human operator"] --> Terminal["Sentinel terminal"]
+    Terminal --> Controller["Sentinel controller"]
+    Controller --> AppServer["codex app-server<br/>--listen stdio://"]
+    AppServer --> Coder["Persistent coder thread"]
+    Controller --> Supervisor["Stateless supervisor turns"]
+    Coder --> Requests["Tool, command, file, and approval requests"]
+    Requests --> Policy["Deterministic policy"]
+    Policy -->|safe| Approve["Approve"]
+    Policy -->|dangerous| Deny["Deny"]
+    Policy -->|gray zone| Supervisor
+    Supervisor --> Decisions["noop / approve / deny / intervene / restart / pause"]
+    Controller --> State[".supervisor/ state files"]
+    Coder --> Ready["Readiness marker"]
+    Ready --> Completion["Completion review"]
+    Completion --> Final["accept / return / restart"]
+```
 
-- `pipx install "git+https://github.com/Makson179/Sentinel.git"` - install Sentinel from the default GitHub branch.
-- `SENTINEL_SKIP_UPDATE_CHECK=1` - skip the startup update check for one command.
-- `sentinel` - main command; run it from the project directory.
-- `config` - open the interactive project config editor.
-- `doctor` - check Python, Git, Codex, auth, app-server support, install metadata, and update status.
-- `update` - update Sentinel, then use the updated install for future runs.
-- `--version` - print Sentinel version, installed commit, and update status.
-- `-V` - short form of `--version`.
-- `--help` - show command help.
-- `-h` - short form of `--help`.
-- `--task TASK.md` - choose the markdown task file explicitly.
-- `--coder-mod MODEL` - choose the Codex model for coder turns; must be used with `--super-mod`.
-- `--super-mod MODEL` - choose the Codex model for supervisor turns; must be used with `--coder-mod`.
-- `--coder-intelligence VALUE` - choose coder reasoning effort.
-- `--super-intelligence VALUE` - choose supervisor reasoning effort.
-- `--start-over[=true|false]` - reset `.supervisor` state and start fresh.
-- `--clean[=true|false]` - delete workspace files except the selected task file before starting; use only in disposable folders.
-- `--adversary[=true|false]` - run the adversarial tester before final completion.
-- `--adversary-runs N` - override the adversarial tester pass limit for one run; `0` disables it.
-- `--protected-path PATH` - mark a hidden or grading path as protected; repeat this option for multiple paths.
+## Command Reference
+
+Command order rule: when combining pieces, keep the rows below in order. Earlier
+rows belong before later rows.
+
+| Piece | Use |
+| --- | --- |
+| `pipx install "git+https://github.com/Makson179/Sentinel.git"` | Install Sentinel from the default GitHub branch. |
+| `SENTINEL_SKIP_UPDATE_CHECK=1` | Skip the startup update check for one command. |
+| `sentinel` | Main command; run it from the project directory. |
+| `config` | Open the interactive project config editor. |
+| `doctor` | Check Python, Git, Codex, auth, app-server support, install metadata, and update status. |
+| `update` | Update Sentinel, then use the updated install for future runs. |
+| `--version` | Print Sentinel version, installed commit, and update status. |
+| `-V` | Short form of `--version`. |
+| `--help` | Show command help. |
+| `-h` | Short form of `--help`. |
+| `--task TASK.md` | Choose the markdown task file explicitly. |
+| `--coder-mod MODEL` | Choose the Codex model for coder turns; must be used with `--super-mod`. |
+| `--super-mod MODEL` | Choose the Codex model for supervisor turns; must be used with `--coder-mod`. |
+| `--coder-intelligence VALUE` | Choose coder reasoning effort. |
+| `--super-intelligence VALUE` | Choose supervisor reasoning effort. |
+| <code>--fast[=true&#124;false]</code> | Use the Codex Fast service tier for both coder and full supervisor turns. |
+| <code>--start-over[=true&#124;false]</code> | Reset `.supervisor` state and start fresh. |
+| <code>--clean[=true&#124;false]</code> | Delete workspace files except the selected task file before starting; use only in disposable folders. |
+| <code>--adversary[=true&#124;false]</code> | Run the adversarial tester before final completion. |
+| `--adversary-runs N` | Override the adversarial tester pass limit for one run; `0` disables it. |
+| `--protected-path PATH` | Mark a hidden or grading path as protected; repeat this option for multiple paths. |
 
 Examples:
 
@@ -83,14 +132,28 @@ SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
 
 ## Model Selection
 
-Sentinel resolves run settings by priority: explicit CLI flags for the current
-invocation win first, then project defaults saved in `.supervisor/config.json`,
-then built-in defaults. The built-in defaults are `gpt-5.5` for both coder and
-supervisor, `xhigh` intelligence for both roles, `speed=usual`,
-`start-over=true`, `adversary=true`, `max_adversary_runs=1`,
-`max_completion_returns_per_generation=10`, and `clean=false`.
+Sentinel resolves run settings by priority:
 
-Use `sentinel config` to edit the project defaults for the current directory:
+```text
+explicit CLI flags -> .supervisor/config.json -> built-in defaults
+```
+
+Built-in defaults:
+
+| Setting | Default |
+| --- | --- |
+| Coder model | `gpt-5.5` |
+| Supervisor model | `gpt-5.5` |
+| Coder intelligence | `xhigh` |
+| Supervisor intelligence | `xhigh` |
+| Speed | `usual` |
+| Start over | `true` |
+| Adversary | `true` |
+| Max adversary runs | `1` |
+| Max completion returns per generation | `10` |
+| Clean | `false` |
+
+Use `sentinel config` to edit project defaults for the current directory:
 
 ```bash
 sentinel config
@@ -100,10 +163,11 @@ The config editor creates `.supervisor/config.json` if it does not exist and
 saves values that future `sentinel` runs use when a CLI flag is omitted. It can
 edit the task path, coder and supervisor models, reasoning effort, speed,
 `start-over`, adversary enablement, adversary run limit, completion-return
-limit, `clean`, and protected paths. Choice fields expand in place with Enter;
-free-text and numeric fields are typed directly in the `VALUE` column and saved
-with Enter. CLI flags override these saved values for one run and do not rewrite
-the project config.
+limit, `clean`, and protected paths.
+
+Choice fields expand in place with Enter. Free-text and numeric fields are typed
+directly in the `VALUE` column and saved with Enter. CLI flags override saved
+values for one run and do not rewrite the project config.
 
 Choose models for a single run with:
 
@@ -111,16 +175,16 @@ Choose models for a single run with:
 sentinel --task TASK.md --coder-mod <coder-model> --super-mod <supervisor-model>
 ```
 
-`--coder-mod` and `--super-mod` must be provided together. To use the same
-model for both roles, pass the same value to both flags.
+`--coder-mod` and `--super-mod` must be provided together. To use the same model
+for both roles, pass the same value to both flags.
 
 Add `--fast` or `--fast=true` to use the Codex Fast service tier for both coder
 and full supervisor turns. Use `--fast=false` to override a fast project config
 for one run.
 
-For adversary settings, explicit `--adversary=true|false` wins. If `--adversary`
-is omitted, `--adversary-runs N` overrides the saved run limit for one run and
-also implies enabled when `N > 0` or disabled when `N = 0`.
+For adversary settings, explicit `--adversary=true|false` wins. If
+`--adversary` is omitted, `--adversary-runs N` overrides the saved run limit for
+one run and also implies enabled when `N > 0` or disabled when `N = 0`.
 
 Model names are Codex/OpenAI model slugs accepted by the installed Codex
 app-server and the authenticated account. Use `gpt-5.5` for the default 5.5
@@ -131,7 +195,7 @@ hard-coded allow-list.
 The adversarial tester always uses `gpt-5.5`, independent of `--coder-mod` or
 `--super-mod`.
 
-## What You See
+## Terminal Output
 
 The terminal stream is chronological and lane-based:
 
@@ -146,36 +210,36 @@ The terminal stream is chronological and lane-based:
 [SYSTEM] final report written: .supervisor/FINAL_REPORT.md
 ```
 
-Lanes:
-
-- `[SYSTEM]`: Sentinel runtime state.
-- `[USER]`: human input to Sentinel.
-- `[SUPERVISOR]`: supervisor decisions and steering.
-- `[CODER]`: completed coder messages.
-- `[TOOL]`: completed tool/command/file actions.
-- `[APPROVAL]`: approved requests.
-- `[DENIED]`: declined or cancelled requests.
+| Lane | Meaning |
+| --- | --- |
+| `[SYSTEM]` | Sentinel runtime state. |
+| `[USER]` | Human input to Sentinel. |
+| `[SUPERVISOR]` | Supervisor decisions and steering. |
+| `[CODER]` | Completed coder messages. |
+| `[TOOL]` | Completed tool, command, and file actions. |
+| `[APPROVAL]` | Approved requests. |
+| `[DENIED]` | Declined or cancelled requests. |
 
 ## Startup Preflight
 
 Before starting the real coder, Sentinel checks:
 
-- `codex --version`;
-- app-server schema generation and required protocol files;
-- Codex account/auth state;
-- selected coder, supervisor, and adversarial tester models are available;
-- account rate limits when available;
-- structured JSON output for the supervisor;
-- optional cheap approval triage structured output when
-  `SENTINEL_APPROVAL_TRIAGE_ENABLED=true` and
-  `SENTINEL_APPROVAL_TRIAGE_MODEL` is configured;
-- app-server config requirements;
-- requested coder sandbox and approval settings.
+| Check | Purpose |
+| --- | --- |
+| `codex --version` | Confirm Codex is available. |
+| App-server schema generation | Confirm required protocol files and app-server support. |
+| Codex account/auth state | Fail early when auth is missing. |
+| Selected models | Confirm coder, supervisor, and adversarial tester models are available. |
+| Account rate limits | Read limits when available. |
+| Supervisor structured output | Confirm strict JSON can be produced. |
+| Cheap approval triage | Optional structured-output probe when enabled. |
+| App-server config requirements | Confirm the runtime can start correctly. |
+| Coder sandbox and approval settings | Confirm requested execution constraints. |
 
 If one of these fails, Sentinel exits before real work starts and records the
 interruption in `.supervisor/FINAL_REPORT.md`.
 
-## Runtime Model
+## Runtime Contract
 
 The coder receives an instruction like:
 
@@ -210,7 +274,7 @@ a compact packet containing:
 - current git diff summary;
 - generation and restart count.
 
-The runtime monitor returns strict JSON with one decision:
+Runtime monitor decisions are strict JSON:
 
 ```text
 noop | approve | deny | intervene | restart | pause
@@ -235,7 +299,7 @@ It contains:
 - `coder_initial.template`;
 - `coder_restart.template`;
 - `stateless_supervisor.body_sections`;
-- `stateless_supervisor.sections.*`;
+- `stateless_supervisor.sections.*`.
 
 The coder templates support the `{task_path}` placeholder. Sentinel loads this
 file at runtime before building coder and supervisor turns.
@@ -253,14 +317,14 @@ JSON-RPC server request id.
 
 Deterministic policy handles obvious cases first:
 
-- allow safe read-only project inspection;
-- allow known validation commands;
-- allow normal workspace file changes;
-- deny secrets, broad deletes, permission changes, deploy/publish commands,
-  git force operations, and supervisor state edits.
-
-Gray-zone approvals are sent to the stateless supervisor. If the supervisor
-times out or returns invalid output, Sentinel fails closed with decline/cancel.
+| Route | Behavior |
+| --- | --- |
+| Safe project inspection | Approved automatically. |
+| Known validation commands | Approved automatically. |
+| Normal workspace file changes | Approved automatically. |
+| Secrets, broad deletes, permission changes, deploy/publish commands, git force operations, supervisor-state edits | Denied automatically. |
+| Gray-zone approvals | Sent to the stateless supervisor. |
+| Supervisor timeout or invalid output | Fail closed with decline/cancel. |
 
 When enabled, command approvals in a narrow gray zone can take a cheaper
 mechanical review path before the full supervisor:
@@ -276,28 +340,43 @@ deterministic policy
   -> full-supervisor failure: decline/cancel
 ```
 
-The cheap reviewer only classifies whether a command is bounded,
-operationally read-only, workspace-local, and safe without task context. It
-cannot deny, grant `acceptForSession`, amend policy, persist decisions, steer
-the coder, or resolve file-change, network, permissions, tool, MCP, or unknown
-request types. Its output is not included in the full-supervisor packet; on
-uncertainty or failure the full supervisor sees the same approval context and
-deterministic routing reason it would have seen without cheap review.
+The cheap reviewer only classifies whether a command is bounded, operationally
+read-only, workspace-local, and safe without task context. It cannot deny, grant
+`acceptForSession`, amend policy, persist decisions, steer the coder, or resolve
+file-change, network, permissions, tool, MCP, or unknown request types.
 
-Configure it independently from the full supervisor:
+Its output is not included in the full-supervisor packet. On uncertainty or
+failure, the full supervisor sees the same approval context and deterministic
+routing reason it would have seen without cheap review.
 
-- `SENTINEL_APPROVAL_TRIAGE_ENABLED=true` enables the optional fast path.
-- `SENTINEL_APPROVAL_TRIAGE_MODEL=<model>` selects the cheap reviewer model.
-  Sentinel does not silently reuse the full supervisor model when this is
-  missing.
-- `SENTINEL_APPROVAL_TRIAGE_TIMEOUT=<seconds>` sets the cheap-review timeout.
+Configure cheap approval triage independently from the full supervisor:
 
-Representative candidates include `git status --short && git diff --stat`,
-`git diff --name-only | head -n 20`, `find src -maxdepth 2 -type f | sort`,
-and `cat pyproject.toml | head -n 80`. Noncandidates include redirects,
-command or process substitution, network commands, interpreters such as
-`python -c`, dependency installation, git mutation, permission changes,
-destructive commands, secret paths, workspace escapes, and unknown executables.
+| Variable | Meaning |
+| --- | --- |
+| `SENTINEL_APPROVAL_TRIAGE_ENABLED=true` | Enables the optional fast path. |
+| `SENTINEL_APPROVAL_TRIAGE_MODEL=<model>` | Selects the cheap reviewer model. Sentinel does not silently reuse the full supervisor model when this is missing. |
+| `SENTINEL_APPROVAL_TRIAGE_TIMEOUT=<seconds>` | Sets the cheap-review timeout. |
+
+Representative candidates:
+
+- `git status --short && git diff --stat`;
+- `git diff --name-only | head -n 20`;
+- `find src -maxdepth 2 -type f | sort`;
+- `cat pyproject.toml | head -n 80`.
+
+Noncandidates:
+
+- redirects;
+- command or process substitution;
+- network commands;
+- interpreters such as `python -c`;
+- dependency installation;
+- git mutation;
+- permission changes;
+- destructive commands;
+- secret paths;
+- workspace escapes;
+- unknown executables.
 
 Unsupported app-server surfaces are fail-closed in the MVP:
 
@@ -317,12 +396,12 @@ coder thread.
 
 Restart creates a new coder generation:
 
-1. interrupt active coder turn;
-2. resolve pending approvals;
-3. write `.supervisor/HANDOFF.md`;
-4. increment generation and restart count;
-5. start a fresh coder thread;
-6. tell the new coder to read task, decisions, progress, and handoff.
+1. Interrupt active coder turn.
+2. Resolve pending approvals.
+3. Write `.supervisor/HANDOFF.md`.
+4. Increment generation and restart count.
+5. Start a fresh coder thread.
+6. Tell the new coder to read task, decisions, progress, and handoff.
 
 Default restart cap is 3. After that, Sentinel writes a stuck final report and
 exits cleanly.
@@ -346,31 +425,36 @@ Sentinel writes state under `.supervisor/` in the target project:
 
 Useful files:
 
-- `config.json`: task path, coder and supervisor models, Codex version, schema
-  hash, thread ids, generation.
-- `events.jsonl`: normalized event stream.
-- `PROGRESS.md`: supervisor progress notes.
-- `DECISIONS.md`: persistent supervisor decisions.
-- `HANDOFF.md`: restart handoff context.
-- `FINAL_REPORT.md`: final result, changed files, validation, risks.
+| File | Purpose |
+| --- | --- |
+| `config.json` | Task path, coder and supervisor models, Codex version, schema hash, thread ids, generation. |
+| `events.jsonl` | Normalized event stream. |
+| `PROGRESS.md` | Supervisor progress notes. |
+| `DECISIONS.md` | Persistent supervisor decisions. |
+| `HANDOFF.md` | Restart handoff context. |
+| `FINAL_REPORT.md` | Final result, changed files, validation, risks. |
 
 ## Controls
 
 Inside the terminal:
 
-```text
-/status   show task, generation, active turn, pending approvals, health
-/pause    interrupt coder and resolve pending approvals
-/resume   resume autonomous loop
-/restart  request supervised restart
-/quit     write state and exit
-```
+| Control | Action |
+| --- | --- |
+| `/status` | Show task, generation, active turn, pending approvals, health. |
+| `/pause` | Interrupt coder and resolve pending approvals. |
+| `/resume` | Resume autonomous loop. |
+| `/restart` | Request supervised restart. |
+| `/quit` | Write state and exit. |
 
 Keyboard behavior:
 
-```text
-Ctrl+C   pause/abort current terminal process
-Ctrl+Q   clean exit when implemented by terminal
-```
+| Key | Action |
+| --- | --- |
+| `Ctrl+C` | Pause or abort current terminal process. |
+| `Ctrl+Q` | Clean exit when implemented by terminal. |
 
 Human text is routed to the supervisor, not directly to the coder.
+
+## License
+
+Sentinel is released under the MIT License. See [LICENSE](./LICENSE).
