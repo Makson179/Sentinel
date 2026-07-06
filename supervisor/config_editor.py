@@ -25,13 +25,15 @@ from supervisor.project_config import (
 )
 
 
-EditorAction = Literal["edit_text", "add_protected_path"]
+EditorAction = Literal["add_protected_path"]
+InlineEditKind = Literal["optional_text", "non_negative_int", "protected_path_entry"]
 StyledFragment = tuple[str, str]
 FragmentLine = list[StyledFragment]
 FormattedRender = list[StyledFragment]
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ELLIPSIS = "..."
+EDIT_CURSOR = "▏"
 OUTER_BORDER_GRADIENT = (
     "#18f8ff",
     "#10d0ff",
@@ -67,6 +69,7 @@ class EditorParameter:
     label: str
     value: str
     options: tuple[EditorOption, ...]
+    edit_kind: InlineEditKind | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,10 @@ class EditorState:
     parameter_index: int = 0
     expanded_index: int | None = None
     option_index: int | None = None
+    editing: bool = False
+    edit_kind: InlineEditKind | None = None
+    edit_value: str = ""
+    edit_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -329,10 +336,8 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             "task",
             "task",
             config.task or "absent",
-            (
-                EditorOption("absent", "task", None),
-                EditorOption("edit path", action="edit_text"),
-            ),
+            (),
+            edit_kind="optional_text",
         ),
         EditorParameter(
             "coder_mod",
@@ -377,6 +382,20 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             (EditorOption("true", "adversary", True), EditorOption("false", "adversary", False)),
         ),
         EditorParameter(
+            "adversary_runs",
+            "max-adversary-runs",
+            str(config.adversary_runs if config.adversary else 0),
+            (),
+            edit_kind="non_negative_int",
+        ),
+        EditorParameter(
+            "completion_returns_per_generation",
+            "max-completion-returns-per-generation",
+            str(config.completion_returns_per_generation),
+            (),
+            edit_kind="non_negative_int",
+        ),
+        EditorParameter(
             "clean",
             "clean",
             _format_bool(config.clean),
@@ -392,9 +411,11 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
 
 
 def move_down(state: EditorState, parameters: tuple[EditorParameter, ...]) -> EditorState:
+    if state.editing:
+        return state
     if state.expanded_index == state.parameter_index:
         option_count = len(parameters[state.parameter_index].options)
-        if state.option_index is None:
+        if state.option_index is None and option_count:
             return replace(state, option_index=0)
         if state.option_index + 1 < option_count:
             return replace(state, option_index=state.option_index + 1)
@@ -403,6 +424,8 @@ def move_down(state: EditorState, parameters: tuple[EditorParameter, ...]) -> Ed
 
 
 def move_up(state: EditorState, parameters: tuple[EditorParameter, ...]) -> EditorState:
+    if state.editing:
+        return state
     if state.expanded_index == state.parameter_index and state.option_index is not None:
         if state.option_index > 0:
             return replace(state, option_index=state.option_index - 1)
@@ -418,22 +441,112 @@ def select_current(
 ) -> tuple[ProjectConfig, EditorState, EditorAction | None]:
     parameters = parameter_defs(config, model_choices)
     parameter = parameters[state.parameter_index]
+    if state.editing:
+        updated, updated_state = _commit_inline_edit(config, state, parameters)
+        return updated, updated_state, None
+    if parameter.edit_kind is not None and state.option_index is None:
+        return config, _start_inline_edit(config, state, parameter), None
     if state.expanded_index != state.parameter_index:
         return config, replace(state, expanded_index=state.parameter_index, option_index=None), None
     if state.option_index is None:
         return config, replace(state, expanded_index=None), None
 
     option = parameter.options[state.option_index]
-    if option.action is not None:
-        return config, state, option.action
+    if option.action == "add_protected_path":
+        return config, _start_inline_edit(config, state, parameter, edit_kind="protected_path_entry", initial_value=""), None
     if option.field is None:
         return config, advance_after_selection(state, len(parameters)), None
-    updated = replace(config, **{option.field: option.value})
+    updated = _replace_config_field(config, option.field, option.value)
     return updated, advance_after_selection(state, len(parameters)), None
 
 
 def advance_after_selection(state: EditorState, parameter_count: int) -> EditorState:
     return EditorState(parameter_index=min(state.parameter_index + 1, parameter_count - 1))
+
+
+def append_inline_text(state: EditorState, text: str) -> EditorState:
+    if not state.editing or not _printable_text(text):
+        return state
+    return replace(state, edit_value=state.edit_value + text, edit_error=None)
+
+
+def backspace_inline_text(state: EditorState) -> EditorState:
+    if not state.editing:
+        return state
+    return replace(state, edit_value=state.edit_value[:-1], edit_error=None)
+
+
+def cancel_inline_edit(state: EditorState) -> EditorState:
+    if not state.editing:
+        return state
+    return replace(state, editing=False, edit_kind=None, edit_value="", edit_error=None)
+
+
+def _start_inline_edit(
+    config: ProjectConfig,
+    state: EditorState,
+    parameter: EditorParameter,
+    *,
+    edit_kind: InlineEditKind | None = None,
+    initial_value: str | None = None,
+) -> EditorState:
+    kind = edit_kind or parameter.edit_kind
+    if kind is None:
+        return state
+    value = initial_value if initial_value is not None else _inline_initial_value(config, parameter)
+    return replace(
+        state,
+        expanded_index=None,
+        option_index=None,
+        editing=True,
+        edit_kind=kind,
+        edit_value=value,
+        edit_error=None,
+    )
+
+
+def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> str:
+    if parameter.key == "task":
+        return config.task or ""
+    if parameter.key == "adversary_runs":
+        return str(config.adversary_runs if config.adversary else 0)
+    if parameter.key == "completion_returns_per_generation":
+        return str(config.completion_returns_per_generation)
+    return parameter.value if parameter.value != "absent" else ""
+
+
+def _commit_inline_edit(
+    config: ProjectConfig,
+    state: EditorState,
+    parameters: tuple[EditorParameter, ...],
+) -> tuple[ProjectConfig, EditorState]:
+    parameter = parameters[state.parameter_index]
+    raw = state.edit_value.strip()
+    if state.edit_kind == "optional_text":
+        updated = _replace_config_field(config, parameter.key, raw or None)
+        return updated, advance_after_selection(state, len(parameters))
+    if state.edit_kind == "protected_path_entry":
+        updated = config
+        if raw:
+            updated = replace(config, protected_path=tuple([*config.protected_path, raw]))
+        return updated, advance_after_selection(state, len(parameters))
+    if state.edit_kind == "non_negative_int":
+        if not raw.isdecimal():
+            return config, replace(state, edit_error="enter a non-negative integer")
+        updated = _replace_config_field(config, parameter.key, int(raw))
+        return updated, advance_after_selection(state, len(parameters))
+    return config, cancel_inline_edit(state)
+
+
+def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> ProjectConfig:
+    if field == "adversary_runs":
+        runs = int(value)
+        return replace(config, adversary_runs=runs, adversary=runs > 0)
+    return replace(config, **{field: value})
+
+
+def _printable_text(text: str) -> bool:
+    return bool(text) and all(char >= " " and char != "\x7f" for char in text)
 
 
 class Header:
@@ -493,10 +606,15 @@ class PathBar:
 
 class HelpLine:
     @staticmethod
-    def render(layout: LayoutSpec, theme: Theme) -> FragmentLine:
+    def render(layout: LayoutSpec, theme: Theme, state: EditorState) -> FragmentLine:
+        text = (
+            "    Type value. Enter saves. Esc cancels. Backspace edits."
+            if state.editing
+            else "    Arrows move. Enter expands or saves. Esc/q exits."
+        )
         return _frame_line(
             _fit_fragments(
-                [(_merge_styles(theme.style("surface"), theme.style("muted")), "    Arrows move. Enter expands or saves. Esc/q exits.")],
+                [(_merge_styles(theme.style("surface"), theme.style("muted")), text)],
                 layout.content_width,
                 theme,
                 fill_style=theme.style("surface"),
@@ -583,7 +701,7 @@ class ConfigList:
         label_width = _label_width(parameters, max(0, width - 2))
         inner_width = max(0, width - 2)
         for parameter_index, parameter in enumerate(parameters):
-            expanded = state.expanded_index == parameter_index
+            expanded = not state.editing and state.expanded_index == parameter_index
             active_parameter = state.parameter_index == parameter_index and state.option_index is None
             if active_parameter:
                 active_row = len(rows)
@@ -643,7 +761,7 @@ class ConfigList:
             (active_style, "  "),
             (_merge_styles(active_style, theme.style("name")), name),
             (active_style, "  "),
-            (_merge_styles(active_style, theme.style(_value_style_key(parameter.key, parameter.value))), parameter.value),
+            *_parameter_value_fragments(parameter, parameter_index, state, active_style, theme),
         ]
 
     @staticmethod
@@ -747,7 +865,7 @@ def _render_editor_lines(
         _horizontal_line(layout, theme, tee=True),
         PathBar.render(path, layout, theme),
         _horizontal_line(layout, theme, tee=True),
-        HelpLine.render(layout, theme),
+        HelpLine.render(layout, theme, state),
     ]
     config_lines = ConfigList.render(config, parameters, state, layout.main_width, layout.list_height, theme)
     if layout.side_panel:
@@ -1009,6 +1127,8 @@ def _label_width(parameters: tuple[EditorParameter, ...], width: int) -> int:
 
 
 def _visible_option_count(parameters: tuple[EditorParameter, ...], state: EditorState) -> int:
+    if state.editing:
+        return 0
     if state.expanded_index is None:
         return 0
     if state.expanded_index < 0 or state.expanded_index >= len(parameters):
@@ -1027,6 +1147,8 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
             "speed": "F",
             "start_over": "R",
             "adversary": "A",
+            "adversary_runs": "N",
+            "completion_returns_per_generation": "N",
             "clean": "X",
             "protected_path": "P",
         }.get(parameter_key, "-")
@@ -1039,6 +1161,8 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         "speed": "⚡",
         "start_over": "↻",
         "adversary": "◈",
+        "adversary_runs": "#",
+        "completion_returns_per_generation": "#",
         "clean": "✧",
         "protected_path": "▣",
     }.get(parameter_key, "•")
@@ -1082,6 +1206,8 @@ def _icon_style_key(parameter_key: str) -> str:
         "speed": "yellow",
         "start_over": "magenta",
         "adversary": "green",
+        "adversary_runs": "cyan",
+        "completion_returns_per_generation": "cyan",
         "clean": "red",
         "protected_path": "magenta",
     }.get(parameter_key, "muted")
@@ -1130,6 +1256,8 @@ def _value_style_key(parameter_key: str, value: str) -> str:
     normalized = value.strip().lower()
     if parameter_key in {"coder_mod", "super_mod"}:
         return "magenta_soft"
+    if parameter_key in {"adversary_runs", "completion_returns_per_generation"}:
+        return "cyan"
     if "intelligence" in parameter_key:
         return "violet" if normalized == "xhigh" else "magenta"
     if parameter_key == "speed":
@@ -1141,6 +1269,30 @@ def _value_style_key(parameter_key: str, value: str) -> str:
     if normalized in {"", "absent"}:
         return "violet"
     return "cyan"
+
+
+def _parameter_value_fragments(
+    parameter: EditorParameter,
+    parameter_index: int,
+    state: EditorState,
+    active_style: str,
+    theme: Theme,
+) -> FragmentLine:
+    value_style = _merge_styles(active_style, theme.style(_value_style_key(parameter.key, parameter.value)))
+    if state.editing and state.parameter_index == parameter_index:
+        fragments: FragmentLine = [
+            (value_style, state.edit_value),
+            (_merge_styles(active_style, theme.style("active_marker")), EDIT_CURSOR),
+        ]
+        if state.edit_error:
+            fragments.extend(
+                [
+                    (active_style, "  "),
+                    (_merge_styles(active_style, theme.style("red")), state.edit_error),
+                ]
+            )
+        return fragments
+    return [(value_style, parameter.value)]
 
 
 def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, option: EditorOption) -> bool:
@@ -1163,7 +1315,7 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError("sentinel config requires an interactive terminal")
     try:
-        from prompt_toolkit import Application, prompt
+        from prompt_toolkit import Application
         from prompt_toolkit.application.current import get_app
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.layout.controls import FormattedTextControl
@@ -1177,77 +1329,86 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
     model_choices = available_model_choices(project_root)
     path = project_config_path(project_root)
     state = EditorState()
+    should_exit = False
 
-    while True:
-        pending_action: dict[str, EditorAction | bool | None] = {"action": None, "exit": False}
-
-        def render_current() -> FormattedRender:
-            width, height = _prompt_toolkit_size(get_app)
-            return cast(
-                FormattedRender,
-                render_editor(config, state, path, model_choices, width=width, height=height, formatted=True),
-            )
-
-        control = FormattedTextControl(render_current, focusable=True)
-        kb = KeyBindings()
-
-        @kb.add("down")
-        def _down(event) -> None:
-            nonlocal state
-            state = move_down(state, parameter_defs(config, model_choices))
-            event.app.invalidate()
-
-        @kb.add("up")
-        def _up(event) -> None:
-            nonlocal state
-            state = move_up(state, parameter_defs(config, model_choices))
-            event.app.invalidate()
-
-        @kb.add("enter")
-        def _enter(event) -> None:
-            nonlocal config, state
-            previous_config = config
-            config, state, action = select_current(config, state, model_choices)
-            if action is None:
-                _save_config_change(project_root, previous_config, config)
-                event.app.invalidate()
-                return
-            pending_action["action"] = action
-            event.app.exit()
-
-        @kb.add("escape")
-        @kb.add("q")
-        @kb.add("c-c")
-        def _exit(event) -> None:
-            pending_action["exit"] = True
-            event.app.exit()
-
-        app = Application(
-            layout=Layout(Window(content=control, wrap_lines=False)),
-            key_bindings=kb,
-            full_screen=True,
-            style=Style.from_dict({"": "bg:#050617"}),
+    def render_current() -> FormattedRender:
+        width, height = _prompt_toolkit_size(get_app)
+        return cast(
+            FormattedRender,
+            render_editor(config, state, path, model_choices, width=width, height=height, formatted=True),
         )
-        app.run()
-        if pending_action["exit"]:
-            return config
 
-        action = pending_action["action"]
-        parameter = parameter_defs(config, model_choices)[state.parameter_index]
-        if action == "edit_text" and parameter.key == "task":
-            raw = prompt("Task path (blank to unset): ", default=config.task or "")
-            previous_config = config
-            config = replace(config, task=raw.strip() or None)
-            _save_config_change(project_root, previous_config, config)
-            state = advance_after_selection(state, len(parameter_defs(config, model_choices)))
-        elif action == "add_protected_path":
-            raw = prompt("Protected path: ")
-            value = raw.strip()
-            if value:
-                previous_config = config
-                config = replace(config, protected_path=tuple([*config.protected_path, value]))
-                _save_config_change(project_root, previous_config, config)
-            state = advance_after_selection(state, len(parameter_defs(config, model_choices)))
+    control = FormattedTextControl(render_current, focusable=True, show_cursor=False)
+    kb = KeyBindings()
+
+    @kb.add("down")
+    def _down(event) -> None:
+        nonlocal state
+        state = move_down(state, parameter_defs(config, model_choices))
+        event.app.invalidate()
+
+    @kb.add("up")
+    def _up(event) -> None:
+        nonlocal state
+        state = move_up(state, parameter_defs(config, model_choices))
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _enter(event) -> None:
+        nonlocal config, state
+        previous_config = config
+        config, state, _action = select_current(config, state, model_choices)
+        _save_config_change(project_root, previous_config, config)
+        event.app.invalidate()
+
+    @kb.add("backspace")
+    def _backspace(event) -> None:
+        nonlocal state
+        state = backspace_inline_text(state)
+        event.app.invalidate()
+
+    @kb.add("escape")
+    def _escape(event) -> None:
+        nonlocal state, should_exit
+        if state.editing:
+            state = cancel_inline_edit(state)
+            event.app.invalidate()
+            return
+        should_exit = True
+        event.app.exit()
+
+    @kb.add("q")
+    def _q(event) -> None:
+        nonlocal state, should_exit
+        if state.editing:
+            state = append_inline_text(state, event.data)
+            event.app.invalidate()
+            return
+        should_exit = True
+        event.app.exit()
+
+    @kb.add("c-c")
+    def _ctrl_c(event) -> None:
+        nonlocal should_exit
+        should_exit = True
+        event.app.exit()
+
+    @kb.add("<any>")
+    def _any(event) -> None:
+        nonlocal state
+        state = append_inline_text(state, event.data)
+        event.app.invalidate()
+
+    app = Application(
+        layout=Layout(Window(content=control, wrap_lines=False)),
+        key_bindings=kb,
+        full_screen=True,
+        style=Style.from_dict({"": "bg:#050617"}),
+    )
+    app.run()
+    if should_exit:
+        return config
+    return config
 
 
 def _format_bool(value: bool) -> str:

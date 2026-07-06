@@ -73,6 +73,28 @@ def test_config_editor_render_marks_active_selected_option() -> None:
     assert re.search(r"›\s+└─ ✦  fast", output)
 
 
+def test_config_editor_render_shows_numeric_limit_fields() -> None:
+    output = _render(width=120, height=32)
+
+    assert "max-adversary-runs" in output
+    assert "max-completion-returns-per-generation" in output
+
+
+def test_config_editor_render_shows_inline_edit_value_cursor() -> None:
+    params = parameter_defs(ProjectConfig())
+    task_index = [param.key for param in params].index("task")
+
+    output = _render(
+        ProjectConfig(),
+        EditorState(parameter_index=task_index, editing=True, edit_kind="optional_text", edit_value="TASK.md"),
+        width=100,
+        height=14,
+    )
+
+    assert "Type value. Enter saves. Esc cancels. Backspace edits." in output
+    assert "TASK.md▏" in output
+
+
 def test_config_editor_render_uses_dynamic_model_options() -> None:
     config = ProjectConfig(coder_mod="project-coder", super_mod="project-super")
     params = parameter_defs(config, model_choices=("alpha-model", "beta-model"))

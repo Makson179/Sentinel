@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from supervisor.config_editor import EditorState, available_model_choices, move_down, parameter_defs, select_current
+from supervisor.config_editor import EditorState, append_inline_text, available_model_choices, move_down, parameter_defs, select_current
 from supervisor.main import cli
 from supervisor.project_config import (
     DEFAULT_INTELLIGENCE,
@@ -34,6 +34,8 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.super_intelligence == DEFAULT_INTELLIGENCE
     assert config.start_over is True
     assert config.adversary is True
+    assert config.adversary_runs == 1
+    assert config.completion_returns_per_generation == 10
     assert config.clean is False
     assert config.task is None
     assert config.protected_path == ()
@@ -77,6 +79,7 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["speed"] == "fast"
     assert payload["fast"] is True
     assert payload["clean"] is True
+    assert payload["max_completion_returns_per_generation"] == 10
 
 
 def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
@@ -96,6 +99,7 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
             protected_paths=["hidden"],
             adversary=False,
             max_adversary_runs=0,
+            max_completion_returns_per_generation=4,
         ),
     )
 
@@ -111,6 +115,8 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     assert config.clean is True
     assert config.protected_path == ("hidden",)
     assert config.adversary is False
+    assert config.adversary_runs == 0
+    assert config.completion_returns_per_generation == 4
 
 
 def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> None:
@@ -127,6 +133,7 @@ def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> Non
     assert runtime_config.fast is True
     assert runtime_config.adversary is False
     assert runtime_config.max_adversary_runs == 0
+    assert runtime_config.max_completion_returns_per_generation == 10
 
 
 def test_config_does_not_touch_existing_supervisor_state_by_default(tmp_path: Path) -> None:
@@ -206,6 +213,29 @@ def test_config_editor_state_expands_selects_and_advances() -> None:
     assert state.expanded_index is None
 
 
+def test_config_editor_starts_inline_edit_for_direct_text_field() -> None:
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    task_index = [param.key for param in params].index("task")
+    state = EditorState(parameter_index=task_index)
+
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.task is None
+    assert state.editing is True
+    assert state.edit_kind == "optional_text"
+    assert state.edit_value == ""
+
+    state = append_inline_text(state, "TASK.md")
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.task == "TASK.md"
+    assert state.editing is False
+    assert state.parameter_index == task_index + 1
+
+
 def test_config_editor_choice_can_update_boolean() -> None:
     config = ProjectConfig()
     params = parameter_defs(config)
@@ -218,6 +248,70 @@ def test_config_editor_choice_can_update_boolean() -> None:
     assert action is None
     assert config.clean is True
     assert state.parameter_index == clean_index + 1
+
+
+def test_config_editor_inline_adversary_runs_updates_boolean() -> None:
+    config = ProjectConfig(adversary=False)
+    params = parameter_defs(config)
+    runs_index = [param.key for param in params].index("adversary_runs")
+    state = EditorState(parameter_index=runs_index)
+
+    config, state, action = select_current(config, state)
+    assert action is None
+    assert state.editing is True
+    assert state.edit_value == "0"
+
+    state = replace(state, edit_value="3")
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.adversary is True
+    assert config.adversary_runs == 3
+
+
+def test_config_editor_inline_adversary_runs_zero_disables_adversary() -> None:
+    config = ProjectConfig(adversary=True, adversary_runs=2)
+    params = parameter_defs(config)
+    runs_index = [param.key for param in params].index("adversary_runs")
+    state = EditorState(parameter_index=runs_index)
+
+    config, state, action = select_current(config, state)
+    state = replace(state, edit_value="0")
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.adversary is False
+    assert config.adversary_runs == 0
+
+
+def test_config_editor_inline_completion_return_limit_updates_config() -> None:
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    limit_index = [param.key for param in params].index("completion_returns_per_generation")
+    state = EditorState(parameter_index=limit_index)
+
+    config, state, action = select_current(config, state)
+    state = replace(state, edit_value="4")
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.completion_returns_per_generation == 4
+
+
+def test_config_editor_inline_number_rejects_invalid_input() -> None:
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    limit_index = [param.key for param in params].index("completion_returns_per_generation")
+    state = EditorState(parameter_index=limit_index)
+
+    config, state, action = select_current(config, state)
+    state = replace(state, edit_value="-1")
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.completion_returns_per_generation == 10
+    assert state.editing is True
+    assert state.edit_error == "enter a non-negative integer"
 
 
 def test_config_editor_model_choices_come_from_available_models() -> None:
@@ -304,3 +398,21 @@ def test_to_json_data_round_trips_adversary_runs(tmp_path) -> None:
     config = ProjectConfig(adversary_runs=2)
     data = config.to_json_data()
     assert data["max_adversary_runs"] == 2
+
+
+def test_max_completion_returns_per_generation_parsed_from_payload(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": 3}')
+    config = load_project_config(tmp_path, create=False)
+    assert config.completion_returns_per_generation == 3
+
+
+def test_max_completion_returns_per_generation_rejects_invalid_values(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": -1}')
+    with pytest.raises(ProjectConfigError):
+        load_project_config(tmp_path, create=False)
+
+
+def test_to_json_data_round_trips_completion_return_limit(tmp_path) -> None:
+    config = ProjectConfig(completion_returns_per_generation=4)
+    data = config.to_json_data()
+    assert data["max_completion_returns_per_generation"] == 4

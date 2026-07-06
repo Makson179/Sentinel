@@ -402,6 +402,7 @@ class SentinelController:
             fast=project_config.fast,
             protected_paths=list(project_config.protected_path),
             max_adversary_runs=self._configured_adversary_runs(project_config),
+            max_completion_returns_per_generation=project_config.completion_returns_per_generation,
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_sentinel(config, mode=mode)
@@ -420,6 +421,7 @@ class SentinelController:
                     "fast": project_config.fast,
                     "protected_paths": list(project_config.protected_path),
                     "max_adversary_runs": self._configured_adversary_runs(project_config),
+                    "max_completion_returns_per_generation": project_config.completion_returns_per_generation,
                 }
             )
         )
