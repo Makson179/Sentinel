@@ -1,4 +1,4 @@
-<h1 align="center">Sentinel</h1>
+<h1 align="center">🛡️ Sentinel</h1>
 
 <p align="center">
   <strong>Terminal supervision for autonomous Codex app-server runs.</strong><br>
@@ -13,9 +13,13 @@
   <img alt="Approvals: fail closed" src="https://img.shields.io/badge/approvals-fail--closed-B91C1C?style=flat-square">
 </p>
 
+<p align="center">
+  <img src="./docs/assets/sentinel-readme-hero.svg" alt="Sentinel architecture preview" width="900">
+</p>
+
 ---
 
-## What Sentinel Is
+## ✨ What Sentinel Is
 
 Sentinel is a terminal supervisor for autonomous Codex runs. It does not run
 Codex through hooks, plugins, subagents, or `codex exec --json`. Instead,
@@ -28,12 +32,12 @@ completion.
 
 | Surface | Sentinel's role |
 | --- | --- |
-| Coder | A persistent Codex thread that reads the task file, edits code, runs commands, and validates the task. |
-| Supervisor | Short-lived stateless Codex turns that review compact runtime packets and return strict decisions. |
-| Human | Talks to Sentinel, not directly to the coder. Normal approval prompts should not reach the human during a run. |
-| State | Writes inspectable runtime files under `.supervisor/` in the target project. |
+| 🧑‍💻 Coder | A persistent Codex thread that reads the task file, edits code, runs commands, and validates the task. |
+| 🧭 Supervisor | Short-lived stateless Codex turns that review compact runtime packets and return strict decisions. |
+| 👤 Human | Talks to Sentinel, not directly to the coder. Normal approval prompts should not reach the human during a run. |
+| 🗂️ State | Writes inspectable runtime files under `.supervisor/` in the target project. |
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 pipx install "git+https://github.com/Makson179/Sentinel.git"
@@ -50,7 +54,7 @@ sentinel update
 SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
 ```
 
-## Why Sentinel Exists
+## 🧠 Why Sentinel Exists
 
 Full permissions are fast, but they also mean the same agent decides and
 executes everything. Sentinel separates those roles so unattended work can keep
@@ -58,17 +62,17 @@ moving while risky actions stay controlled.
 
 | Concern | Sentinel response |
 | --- | --- |
-| Routine inspection | Safe read-only actions can be approved by deterministic policy. |
-| Dangerous actions | Secrets, broad deletes, permission changes, deploy/publish commands, git force operations, and supervisor-state edits are denied automatically. |
-| Ambiguous actions | Gray-zone approvals are reviewed by a fresh stateless supervisor turn. |
-| Drift | The coder can be steered or restarted when it loses the thread. |
-| Final claims | Completion is accepted only by dedicated completion review. |
-| Auditability | State and decisions are written to `.supervisor/` for inspection. |
+| 🔎 Routine inspection | Safe read-only actions can be approved by deterministic policy. |
+| ⛔ Dangerous actions | Secrets, broad deletes, permission changes, deploy/publish commands, git force operations, and supervisor-state edits are denied automatically. |
+| ⚖️ Ambiguous actions | Gray-zone approvals are reviewed by a fresh stateless supervisor turn. |
+| 🧵 Drift | The coder can be steered or restarted when it loses the thread. |
+| 🏁 Final claims | Completion is accepted only by dedicated completion review. |
+| 📜 Auditability | State and decisions are written to `.supervisor/` for inspection. |
 
 This is designed for unattended work with controlled risk, not for perfect
 safety or guaranteed correctness.
 
-## Runtime Architecture
+## 🗺️ Runtime Architecture
 
 ```mermaid
 flowchart TD
@@ -89,7 +93,7 @@ flowchart TD
     Completion --> Final["accept / return / restart"]
 ```
 
-## Command Reference
+## 🧰 Command Reference
 
 Command order rule: when combining pieces, keep the rows below in order. Earlier
 rows belong before later rows.
@@ -130,7 +134,7 @@ sentinel --task TASK.md --coder-mod gpt-5.5 --super-mod gpt-5.5
 SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md
 ```
 
-## Model Selection
+## 🎛️ Model Selection
 
 Sentinel resolves run settings by priority:
 
@@ -195,7 +199,7 @@ hard-coded allow-list.
 The adversarial tester always uses `gpt-5.5`, independent of `--coder-mod` or
 `--super-mod`.
 
-## Terminal Output
+## 📺 Terminal Output
 
 The terminal stream is chronological and lane-based:
 
@@ -212,15 +216,15 @@ The terminal stream is chronological and lane-based:
 
 | Lane | Meaning |
 | --- | --- |
-| `[SYSTEM]` | Sentinel runtime state. |
-| `[USER]` | Human input to Sentinel. |
-| `[SUPERVISOR]` | Supervisor decisions and steering. |
-| `[CODER]` | Completed coder messages. |
-| `[TOOL]` | Completed tool, command, and file actions. |
-| `[APPROVAL]` | Approved requests. |
-| `[DENIED]` | Declined or cancelled requests. |
+| 🖥️ `[SYSTEM]` | Sentinel runtime state. |
+| 👤 `[USER]` | Human input to Sentinel. |
+| 🧭 `[SUPERVISOR]` | Supervisor decisions and steering. |
+| 🧑‍💻 `[CODER]` | Completed coder messages. |
+| 🛠️ `[TOOL]` | Completed tool, command, and file actions. |
+| ✅ `[APPROVAL]` | Approved requests. |
+| 🚫 `[DENIED]` | Declined or cancelled requests. |
 
-## Startup Preflight
+## 🧪 Startup Preflight
 
 Before starting the real coder, Sentinel checks:
 
@@ -239,7 +243,7 @@ Before starting the real coder, Sentinel checks:
 If one of these fails, Sentinel exits before real work starts and records the
 interruption in `.supervisor/FINAL_REPORT.md`.
 
-## Runtime Contract
+## 📜 Runtime Contract
 
 The coder receives an instruction like:
 
@@ -286,7 +290,7 @@ Completion review uses a separate strict schema:
 accept | return | restart
 ```
 
-## Prompt Configuration
+## 🧩 Prompt Configuration
 
 All editable Sentinel prompt text lives in one TOML file:
 
@@ -310,7 +314,7 @@ For local experiments, point Sentinel at another prompt file:
 SENTINEL_PROMPTS_FILE=/path/to/prompts.toml sentinel --task TASK.md
 ```
 
-## Approvals
+## ✅ Approvals
 
 Codex app-server sends approval requests to Sentinel. Sentinel answers the exact
 JSON-RPC server request id.
@@ -386,7 +390,7 @@ Unsupported app-server surfaces are fail-closed in the MVP:
 - Computer Use / Browser Use;
 - external app tools without a purpose-built `tool/requestUserInput` mapper.
 
-## Steering And Restarts
+## 🔁 Steering And Restarts
 
 The supervisor can steer the coder with natural language.
 
@@ -406,7 +410,7 @@ Restart creates a new coder generation:
 Default restart cap is 3. After that, Sentinel writes a stuck final report and
 exits cleanly.
 
-## State Files
+## 🗂️ State Files
 
 Sentinel writes state under `.supervisor/` in the target project:
 
@@ -434,7 +438,7 @@ Useful files:
 | `HANDOFF.md` | Restart handoff context. |
 | `FINAL_REPORT.md` | Final result, changed files, validation, risks. |
 
-## Controls
+## 🎮 Controls
 
 Inside the terminal:
 
@@ -455,6 +459,6 @@ Keyboard behavior:
 
 Human text is routed to the supervisor, not directly to the coder.
 
-## License
+## 📄 License
 
 Sentinel is released under the MIT License. See [LICENSE](./LICENSE).

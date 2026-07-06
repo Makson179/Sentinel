@@ -1,0 +1,92 @@
+<svg width="1200" height="420" viewBox="0 0 1200 420" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Sentinel architecture overview</title>
+  <desc id="desc">A visual overview of Sentinel supervising a Codex app-server run with coder, policy, supervisor, completion review, and state files.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#101827"/>
+      <stop offset="0.48" stop-color="#12343B"/>
+      <stop offset="1" stop-color="#2B1B3F"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="110" y1="76" x2="1090" y2="344" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F8FAFC" stop-opacity="0.98"/>
+      <stop offset="1" stop-color="#EEF7F4" stop-opacity="0.94"/>
+    </linearGradient>
+    <filter id="shadow" x="53" y="33" width="1094" height="354" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" result="hardAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>
+      <feOffset dy="18"/>
+      <feGaussianBlur stdDeviation="22"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.02 0 0 0 0 0.06 0 0 0 0 0.12 0 0 0 0.42 0"/>
+      <feBlend in2="BackgroundImageFix" mode="normal" result="effect1_dropShadow"/>
+      <feBlend in="SourceGraphic" in2="effect1_dropShadow" mode="normal" result="shape"/>
+    </filter>
+    <marker id="arrow-teal" markerHeight="11" markerWidth="11" orient="auto" refX="10" refY="5.5">
+      <path d="M0 0L11 5.5L0 11V0Z" fill="#0F766E"/>
+    </marker>
+    <marker id="arrow-rose" markerHeight="11" markerWidth="11" orient="auto" refX="10" refY="5.5">
+      <path d="M0 0L11 5.5L0 11V0Z" fill="#BE123C"/>
+    </marker>
+    <style>
+      .title { font: 800 44px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #F8FAFC; letter-spacing: 0; }
+      .subtitle { font: 500 18px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #CBD5E1; letter-spacing: 0; }
+      .label { font: 800 18px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0F172A; letter-spacing: 0; }
+      .small { font: 600 13px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; letter-spacing: 0; }
+      .tiny { font: 700 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748B; letter-spacing: 0; }
+      .pill { font: 800 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #F8FAFC; letter-spacing: 0.8px; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="420" rx="34" fill="url(#bg)"/>
+  <circle cx="1030" cy="70" r="98" fill="#F59E0B" opacity="0.16"/>
+  <circle cx="150" cy="350" r="112" fill="#14B8A6" opacity="0.14"/>
+  <circle cx="1060" cy="350" r="96" fill="#F43F5E" opacity="0.12"/>
+
+  <text x="92" y="72" class="title">Sentinel</text>
+  <text x="92" y="106" class="subtitle">A supervised lane for autonomous Codex work: coder writes, supervisor judges, state stays inspectable.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="82" y="126" width="1036" height="220" rx="28" fill="url(#panel)" stroke="#DCE8E5"/>
+
+    <rect x="124" y="181" width="154" height="90" rx="18" fill="#E0F2FE" stroke="#7DD3FC"/>
+    <text x="201" y="215" text-anchor="middle" class="label">Operator</text>
+    <text x="201" y="239" text-anchor="middle" class="small">terminal control</text>
+
+    <rect x="330" y="165" width="172" height="122" rx="18" fill="#DCFCE7" stroke="#86EFAC"/>
+    <text x="416" y="202" text-anchor="middle" class="label">Sentinel</text>
+    <text x="416" y="226" text-anchor="middle" class="small">controller</text>
+    <text x="416" y="250" text-anchor="middle" class="tiny">approvals + restarts</text>
+
+    <rect x="560" y="151" width="190" height="64" rx="18" fill="#FEF3C7" stroke="#FBBF24"/>
+    <text x="655" y="179" text-anchor="middle" class="label">Coder</text>
+    <text x="655" y="201" text-anchor="middle" class="small">persistent thread</text>
+
+    <rect x="560" y="242" width="190" height="64" rx="18" fill="#FFE4E6" stroke="#FDA4AF"/>
+    <text x="655" y="270" text-anchor="middle" class="label">Supervisor</text>
+    <text x="655" y="292" text-anchor="middle" class="small">stateless turns</text>
+
+    <rect x="808" y="165" width="132" height="122" rx="18" fill="#EDE9FE" stroke="#C4B5FD"/>
+    <text x="874" y="202" text-anchor="middle" class="label">Review</text>
+    <text x="874" y="226" text-anchor="middle" class="small">accept</text>
+    <text x="874" y="248" text-anchor="middle" class="small">return</text>
+    <text x="874" y="270" text-anchor="middle" class="small">restart</text>
+
+    <rect x="986" y="181" width="90" height="90" rx="18" fill="#F1F5F9" stroke="#CBD5E1"/>
+    <text x="1031" y="215" text-anchor="middle" class="label">State</text>
+    <text x="1031" y="239" text-anchor="middle" class="small">.supervisor</text>
+
+    <path d="M278 226H318" stroke="#0F766E" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-teal)"/>
+    <path d="M502 198C526 183 536 181 548 181" stroke="#0F766E" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-teal)"/>
+    <path d="M502 254C526 272 536 274 548 274" stroke="#BE123C" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-rose)"/>
+    <path d="M750 183H796" stroke="#0F766E" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-teal)"/>
+    <path d="M750 274H796" stroke="#BE123C" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-rose)"/>
+    <path d="M940 226H974" stroke="#0F766E" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-teal)"/>
+
+    <rect x="342" y="306" width="148" height="24" rx="12" fill="#0F766E"/>
+    <text x="416" y="323" text-anchor="middle" class="pill">FAIL CLOSED</text>
+    <rect x="582" y="306" width="146" height="24" rx="12" fill="#BE123C"/>
+    <text x="655" y="323" text-anchor="middle" class="pill">GRAY ZONE</text>
+    <rect x="808" y="306" width="132" height="24" rx="12" fill="#6D28D9"/>
+    <text x="874" y="323" text-anchor="middle" class="pill">FINAL GATE</text>
+  </g>
+</svg>
