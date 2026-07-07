@@ -226,6 +226,56 @@ def test_unsafe_or_ambiguous_commands_are_not_cheap_review_candidates(
     assert expected_tag in analysis.risk_tags
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_tag"),
+    [
+        ("find / -type f", "workspace_escape"),
+        ("ls /", "workspace_escape"),
+        ("ls ~/.ssh", "secret_path"),
+        ("rg token /tmp", "workspace_escape"),
+        ("git diff -- /tmp/foo", "workspace_escape"),
+        ("grep token ~/.ssh/id_rsa", "secret_path"),
+        ("rg token ~/.ssh", "secret_path"),
+        ("grep token .env", "secret_path"),
+        ("rg token .env", "secret_path"),
+    ],
+)
+def test_protected_or_escaping_read_only_commands_do_not_auto_allow(
+    workspace: Path,
+    command: str,
+    expected_tag: str,
+) -> None:
+    decision = PolicyEngine(workspace).evaluate({"command": command, "cwd": str(workspace)})
+    analysis = command_analysis_from_policy_decision(decision)
+
+    assert decision.kind != PolicyDecisionKind.ALLOW
+    assert analysis is not None
+    assert expected_tag in analysis.risk_tags
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls src",
+        "find src -maxdepth 2 -type f",
+        "rg TODO src",
+        "grep TODO src/file.txt",
+        "git diff -- src/file.txt",
+    ],
+)
+def test_read_only_commands_inside_workspace_can_still_auto_allow(workspace: Path, command: str) -> None:
+    src = workspace / "src"
+    src.mkdir()
+    (src / "file.txt").write_text("TODO\n", encoding="utf-8")
+
+    decision = PolicyEngine(workspace).evaluate({"command": command, "cwd": str(workspace)})
+    analysis = command_analysis_from_policy_decision(decision)
+
+    assert decision.kind == PolicyDecisionKind.ALLOW
+    assert analysis is not None
+    assert analysis.risk_tags == set()
+
+
 def test_one_unsafe_segment_makes_pipeline_ineligible(workspace: Path) -> None:
     decision = PolicyEngine(workspace).evaluate({"command": "git status --short | unknown-program", "cwd": str(workspace)})
     analysis = command_analysis_from_policy_decision(decision)

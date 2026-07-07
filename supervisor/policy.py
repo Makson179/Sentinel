@@ -131,6 +131,7 @@ FORBIDDEN_CHEAP_RISK_TAGS = {
 # interpreter_execution stays blocked on purpose: running an arbitrary script/binary could
 # read hidden grading material at runtime, bypassing static path analysis (integrity hole).
 CHEAP_REVIEW_BLOCK_TAGS = FORBIDDEN_CHEAP_RISK_TAGS - {"filesystem_write"}
+AUTO_ALLOW_BLOCK_RISK_TAGS = FORBIDDEN_CHEAP_RISK_TAGS - {"interpreter_execution"}
 SHELL_PUNCTUATION = "|&;()<>"
 SHELL_OPERATORS = {"|", "&&", "||", ";", "&"}
 SHELL_REDIRECT_OPERATORS = {">", ">>", "<", "<<", "<<<", "<>", ">|", "&>", "2>", "2>>"}
@@ -722,6 +723,21 @@ def deterministic_task_command_reason(workspace: Path, command: str, cwd: str | 
     if _safe_pycache_cleanup_command(tokens, workspace.resolve(), cwd_path):
         return "routine pycache cleanup"
     return None
+
+
+def auto_allow_block_reason(tags: set[str]) -> str | None:
+    blocked = tags & AUTO_ALLOW_BLOCK_RISK_TAGS
+    if not blocked:
+        return None
+    if GRADING_PATH_RISK_TAG in blocked:
+        return "protected/grading path requires LLM judgment"
+    if "secret_path" in blocked:
+        return "secret-pattern read requires LLM judgment"
+    if "workspace_escape" in blocked:
+        return "path escapes workspace or is ambiguous"
+    if "ambiguous_parse" in blocked:
+        return "command path analysis is ambiguous"
+    return "command risk requires LLM judgment: " + ", ".join(sorted(blocked))
 
 
 def _deterministic_task_command_tokens(command: str) -> list[str] | None:
@@ -1354,6 +1370,9 @@ class PolicyEngine:
         deterministic_reason = deterministic_task_command_reason(self.workspace, command, cwd=cwd)
         if deterministic_reason is not None:
             return PolicyDecision.allow(deterministic_reason, **payload)
+        block_reason = auto_allow_block_reason(analysis.risk_tags)
+        if block_reason is not None:
+            return PolicyDecision.route_llm(block_reason, **payload)
         if problem:
             return PolicyDecision.route_llm(problem, **payload)
 
