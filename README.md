@@ -1,4 +1,4 @@
-<h1 align="center">🛡️ Sentinel</h1>
+<h1 align="center">Sentinel</h1>
 
 <p align="center">
   <strong>Walk away while an autonomous coding agent does the work, safely.</strong><br>
@@ -20,7 +20,7 @@
 
 ---
 
-## 🧭 Why Sentinel
+## Why Sentinel
 
 Today you run an autonomous coding agent in one of two ways, and both are bad:
 
@@ -50,7 +50,7 @@ survives review. You leave. It works. You come back to a final report.
 [SYSTEM]     final report written: .supervisor/FINAL_REPORT.md
 ```
 
-## 📈 Measured results
+## Measured results
 
 Supervision is not just safety. It is measurably more finished work from the
 same underlying model:
@@ -66,7 +66,7 @@ Honest fine print: the deep mode is slower than a raw agent run. Hard tasks
 take hours, so start it in the evening and read the final report in the
 morning. Supervisor turns also consume tokens on top of the coder's work.
 
-## 🛤️ Two ways to run it
+## Two ways to run it
 
 | | Deep work (default) | Everyday |
 | --- | --- | --- |
@@ -80,7 +80,7 @@ Both modes keep the full runtime supervision: fail-closed approvals, steering,
 health tracking, and restarts. The everyday mode only removes the final exam,
 not the guardrails.
 
-## 🧠 Why it works
+## Why it works
 
 Long-context degradation is well documented: models get measurably worse as
 their context window fills, long before the nominal limit
@@ -106,7 +106,7 @@ Sentinel's design attacks that directly:
   gets a disposable snapshot of the workspace and tries to break the result
   with its own probes before the run is allowed to finish.
 
-## ⚙️ How it works
+## How it works
 
 ```mermaid
 flowchart LR
@@ -130,7 +130,7 @@ flowchart LR
 - **Fail closed:** if the supervisor can't be reached or returns garbage, the
   action is declined, never waved through.
 
-## ✅ Requirements
+## Requirements
 
 - **Codex CLI** installed and authenticated (Sentinel drives
   `codex app-server`; your Codex account provides the models).
@@ -139,7 +139,7 @@ flowchart LR
 
 Verify your environment at any time with `sentinel doctor`.
 
-## 📦 Install
+## Install
 
 **Option A: Codex plugin** (recommended if you work inside Codex):
 
@@ -162,7 +162,7 @@ sentinel doctor
 Sentinel checks for updates at startup and offers to install them; run
 `sentinel update` to update explicitly.
 
-## 🚀 Quick start
+## Quick start
 
 ```bash
 cd your-project
@@ -190,7 +190,7 @@ in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
 decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
 stream), and `FINAL_REPORT.md` (the result).
 
-## 🎛️ Configuration
+## Configuration
 
 Open the interactive editor from your project folder:
 
@@ -233,7 +233,7 @@ sentinel --task task.md --completion-review=false
 sentinel --task task.md --adversary-runs 2
 ```
 
-## 📚 Command reference
+## Command reference
 
 ```bash
 sentinel                 # run the configured task in the current folder
@@ -263,7 +263,7 @@ Environment variables: `SENTINEL_SKIP_UPDATE_CHECK=1` skips the startup update
 check; `SENTINEL_PROMPTS_FILE=/path/to/prompts.toml` points Sentinel at an
 alternative prompt file for experiments.
 
-## 🧩 Under the hood
+## Under the hood
 
 For the curious. None of this needs configuring:
 
