@@ -4192,6 +4192,47 @@ async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp
     assert controller.running is False
 
 
+async def test_restart_preserves_coder_intelligence(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.turn_params = []
+
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "restart-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.turn_params.append(params)
+            return {"turn": {"id": "restart-turn", "status": "completed"}}
+
+    client = FakeClient()
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.client = client
+    controller.tui = _FakeTUI()
+    controller.supervisor = None
+    controller.approvals = None
+    controller.coder = None
+    controller.pending_approvals = {}
+    controller.declared_grading_roots = ()
+    controller._sequence = 0
+    controller.coder_model = "gpt-coder"
+    controller.coder_intelligence = "high"
+    controller.fast = False
+
+    await controller.restart("test restart")
+
+    assert controller.coder is not None
+    assert controller.coder.intelligence == "high"
+    assert client.turn_params[-1]["effort"] == "high"
+
+
 async def test_supervisor_decision_can_clear_handoff(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")

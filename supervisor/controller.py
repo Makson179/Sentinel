@@ -1236,6 +1236,7 @@ class SentinelController:
             self.task_path,
             model=self._coder_model(),
             fast=self._fast_mode(),
+            intelligence=self._coder_intelligence(),
         )
         await self.coder.start_thread()
         await self.coder.start_restart_turn()
