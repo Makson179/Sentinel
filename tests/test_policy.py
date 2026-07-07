@@ -10,7 +10,7 @@ from supervisor.schemas import PolicyDecisionKind
 
 
 def test_workspace_policy_rejects_symlink_escape(workspace: Path, tmp_path: Path) -> None:
-    outside = workspace.parent / "outside.txt"
+    outside = workspace.parent / f"outside-{workspace.name}.txt"
     outside.write_text("no", encoding="utf-8")
     link = workspace / "link"
     link.symlink_to(outside)
@@ -118,6 +118,48 @@ def test_write_tool_supervisor_runtime_write_denies(workspace: Path) -> None:
 
     assert decision.kind == PolicyDecisionKind.DENY
     assert decision.reason == "writes to supervisor runtime/state files are denied"
+
+
+def test_supervisor_runtime_read_routes_to_llm(workspace: Path) -> None:
+    (workspace / ".supervisor").mkdir()
+    (workspace / ".supervisor" / "PROGRESS.md").write_text("state", encoding="utf-8")
+
+    decision = PolicyEngine(workspace).evaluate({"tool_name": "Read", "path": ".supervisor/PROGRESS.md"})
+
+    assert decision.kind == PolicyDecisionKind.ROUTE_LLM
+    assert decision.reason == "supervisor runtime/state read requires LLM judgment"
+
+
+def test_command_access_to_supervisor_runtime_via_symlink_or_glob_denies(workspace: Path) -> None:
+    (workspace / ".supervisor").mkdir()
+    (workspace / "s").symlink_to(workspace / ".supervisor")
+    engine = PolicyEngine(workspace)
+
+    commands = [
+        "cp payload s/PROGRESS.md",
+        "mv payload s/PROGRESS.md",
+        "tee s/PROGRESS.md",
+        "echo x > s/PROGRESS.md",
+        "sed -i 's/a/b/' s/PROGRESS.md",
+        "cat s/PROGRESS.md",
+        "cp payload .super*/PROGRESS.md",
+    ]
+
+    for command in commands:
+        decision = engine.evaluate({"command": command, "cwd": str(workspace)})
+        assert decision.kind == PolicyDecisionKind.DENY, command
+        assert decision.reason == "supervisor runtime/state files are off-limits", command
+
+
+def test_c_compiler_output_into_supervisor_runtime_is_not_auto_allowed(workspace: Path) -> None:
+    (workspace / ".supervisor").mkdir()
+    (workspace / "s").symlink_to(workspace / ".supervisor")
+    (workspace / "c_compiler").write_text("#!/bin/sh\n", encoding="utf-8")
+    (workspace / "in.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+    decision = PolicyEngine(workspace).evaluate({"command": "./c_compiler in.c -o s/out.o", "cwd": str(workspace)})
+
+    assert decision.kind != PolicyDecisionKind.ALLOW
 
 
 def test_commands_invoking_sentinel_cli_deny(workspace: Path) -> None:
@@ -286,7 +328,7 @@ def test_one_unsafe_segment_makes_pipeline_ineligible(workspace: Path) -> None:
 
 
 def test_symlink_escape_command_path_is_not_cheap_candidate(workspace: Path) -> None:
-    outside = workspace.parent / "outside.txt"
+    outside = workspace.parent / f"outside-{workspace.name}.txt"
     outside.write_text("no", encoding="utf-8")
     link = workspace / "linked-secret.txt"
     link.symlink_to(outside)

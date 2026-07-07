@@ -518,7 +518,7 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
     if parameter.key == "task":
         return config.task or ""
     if parameter.key == "adversary_runs":
-        return str(config.adversary_runs if config.adversary else 0)
+        return str(config.adversary_runs if config.adversary and config.completion_review else 0)
     if parameter.key == "completion_returns_per_generation":
         return str(config.completion_returns_per_generation)
     return parameter.value if parameter.value != "absent" else ""

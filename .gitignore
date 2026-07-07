@@ -4,3 +4,5 @@ __pycache__/
 .test-runtime/
 *.py[cod]
 *.egg-info/
+build/
+.supervisor/

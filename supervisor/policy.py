@@ -898,6 +898,8 @@ def _pytest_option_values_are_safe(args: list[str], workspace: Path, cwd: Path) 
                 continue
             if not _is_relative_to(resolved, workspace):
                 return False
+            if is_supervisor_runtime_path(workspace, resolved):
+                return False
             if is_protected_path(workspace, resolved):
                 return False
     return True
@@ -963,6 +965,8 @@ def _path_arg_is_workspace_or_tmp(raw: str, workspace: Path, *, cwd: Path) -> bo
     if _is_tmp_scratch_path(path):
         return True
     if not _is_relative_to(path, workspace):
+        return False
+    if is_supervisor_runtime_path(workspace, path):
         return False
     return not is_protected_path(workspace, path)
 
@@ -1275,6 +1279,7 @@ class PolicyEngine:
         if any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
             if operation == "write" or tool_name in WRITE_TOOLS:
                 return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
+            return PolicyDecision.route_llm("supervisor runtime/state read requires LLM judgment")
 
         if isinstance(tool_name, str) and tool_name in APPLY_PATCH_TOOLS:
             patch_text = command if isinstance(command, str) else payload.get("patch")
@@ -1331,6 +1336,33 @@ class PolicyEngine:
                 return hit
         return None
 
+    def _command_targets_supervisor_runtime(self, analysis: CommandAnalysis, *, cwd: str | None) -> bool:
+        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        if cwd_path is None:
+            cwd_path = self.workspace
+        for token in analysis.tokens:
+            if token in SHELL_OPERATORS or token in SHELL_REDIRECT_OPERATORS or token in {"(", ")"}:
+                continue
+            if token.startswith("-"):
+                continue
+            pathish = token.startswith(("~", "/", ".")) or "/" in token
+            if not pathish:
+                continue
+            if self._references_supervisor_runtime(token, cwd=cwd_path):
+                return True
+        return False
+
+    def _references_supervisor_runtime(self, raw: str, *, cwd: Path) -> bool:
+        resolved = _resolve_candidate_path(raw, cwd=cwd)
+        if resolved is not None and is_supervisor_runtime_path(self.workspace, resolved):
+            return True
+        text = raw.strip().strip("'\"")
+        for part in Path(text).parts:
+            lowered = part.lower()
+            if lowered.startswith(".") and fnmatch.fnmatch(".supervisor", lowered):
+                return True
+        return False
+
     def _evaluate_command(self, command: str, paths: list[Path], *, cwd: str | None = None) -> PolicyDecision:
         analysis = analyze_command(self.workspace, command, cwd)
         analysis_payload = analysis.policy_payload()
@@ -1350,6 +1382,8 @@ class PolicyEngine:
             return PolicyDecision.deny("commands invoking Sentinel are denied", **payload)
         if command_mentions_supervisor(command):
             return PolicyDecision.deny("commands containing supervisor are denied", **payload)
+        if self._command_targets_supervisor_runtime(analysis, cwd=cwd):
+            return PolicyDecision.deny("supervisor runtime/state files are off-limits", **payload)
         patch_paths = extract_apply_patch_paths(command)
         if patch_paths is not None:
             return self._evaluate_patch_paths(patch_paths)
