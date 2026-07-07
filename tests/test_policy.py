@@ -98,6 +98,28 @@ def test_apply_patch_secret_write_denies(workspace: Path) -> None:
     assert decision.kind == PolicyDecisionKind.DENY
 
 
+def test_apply_patch_supervisor_runtime_write_denies(workspace: Path) -> None:
+    patch = """*** Begin Patch
+*** Add File: .supervisor/config.json
++{}
+*** End Patch
+"""
+
+    decision = PolicyEngine(workspace).evaluate({"tool_name": "apply_patch", "command": patch})
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert decision.reason == "writes to supervisor runtime/state files are denied"
+
+
+def test_write_tool_supervisor_runtime_write_denies(workspace: Path) -> None:
+    decision = PolicyEngine(workspace).evaluate(
+        {"tool_name": "Write", "path": ".supervisor/config.json", "operation": "write"}
+    )
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert decision.reason == "writes to supervisor runtime/state files are denied"
+
+
 def test_commands_invoking_sentinel_cli_deny(workspace: Path) -> None:
     engine = PolicyEngine(workspace)
 

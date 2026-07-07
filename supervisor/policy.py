@@ -198,6 +198,14 @@ def is_workspace_cheating_path(workspace: Path, path: Path) -> bool:
     return any(part.lower() in CHEATING_WORKSPACE_PATH_PARTS for part in relative_parts)
 
 
+def is_supervisor_runtime_path(workspace: Path, path: Path) -> bool:
+    try:
+        relative_parts = path.resolve().relative_to(workspace.resolve()).parts
+    except ValueError:
+        return False
+    return any(part.lower() == ".supervisor" for part in relative_parts)
+
+
 def is_protected_path(workspace: Path, path: Path) -> bool:
     return is_secret_path(path) or is_workspace_cheating_path(workspace, path)
 
@@ -1248,6 +1256,10 @@ class PolicyEngine:
                 return PolicyDecision.deny("writes to secret-pattern paths are denied")
             return PolicyDecision.route_llm("secret-pattern read requires LLM judgment")
 
+        if any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
+            if operation == "write" or tool_name in WRITE_TOOLS:
+                return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
+
         if isinstance(tool_name, str) and tool_name in APPLY_PATCH_TOOLS:
             patch_text = command if isinstance(command, str) else payload.get("patch")
             if not isinstance(patch_text, str):
@@ -1270,6 +1282,8 @@ class PolicyEngine:
 
         if operation == "read" and not path_problem:
             return PolicyDecision.allow("read operation inside workspace")
+        if operation == "write" and any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
+            return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
         if operation == "write" and any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("write to secret-pattern path")
         return PolicyDecision.route_llm("unclassified event requires LLM judgment")
@@ -1382,4 +1396,6 @@ class PolicyEngine:
             return PolicyDecision.route_llm(path_problem)
         if any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to secret-pattern paths are denied")
+        if any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
+            return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
         return PolicyDecision.allow("workspace patch inside workspace")
