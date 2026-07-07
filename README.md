@@ -285,3 +285,6 @@ For the curious. None of this needs configuring:
 ## License
 
 Sentinel is released under the MIT License. See [LICENSE](./LICENSE).
+
+Contributions require signing the project [CLA](./CLA.md); a bot will prompt
+you on your first pull request, and you only sign once.
