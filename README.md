@@ -66,19 +66,21 @@ Honest fine print: the deep mode is slower than a raw agent run. Hard tasks
 take hours, so start it in the evening and read the final report in the
 morning. Supervisor turns also consume tokens on top of the coder's work.
 
-## Two ways to run it
+## Use cases
 
-| | Deep work (default) | Everyday |
+Sentinel is configurable, but these are the main ways people should think
+about using it:
+
+| Use case | Best for | What you get |
 | --- | --- | --- |
-| **Use for** | Hard, long, high-stakes tasks | Routine tasks you'd normally babysit |
-| **Finish line** | Completion review must accept the work, then an adversarial tester attacks it | Coder declares readiness after validating its work |
-| **Config** | defaults (`completion_review=true`, `adversary=true`) | `completion_review=false` |
-| **Quality** | Maximum (the measured gains above) | The same model, kept safe and on-track |
-| **Time** | Hours; run it overnight | Minutes |
+| **Deep work (default)** | Long, labor-intensive tasks where there are many details, edge cases, and nuances to keep straight, and quality matters more than speed. | Completion review stays on, then an adversarial tester attacks the result. It is slower, but the work has to survive independent review before Sentinel accepts it. |
+| **Everyday** | Short to medium tasks you would normally give to Codex directly. | The same Codex coding loop, but with a supervisor watching risky actions, steering drift, and blocking hallucinated claims. The supervisor always judges from a clean context, so it is better positioned to decide what is safe and when the coder is losing the thread. |
+| **Experiments** | Custom workflows, model comparisons, and unusual risk/speed tradeoffs. | Combine any supported coder and supervisor models, reasoning levels, completion-review settings, and adversary passes. Sentinel leaves the knobs open. |
 
-Both modes keep the full runtime supervision: fail-closed approvals, steering,
-health tracking, and restarts. The everyday mode only removes the final exam,
-not the guardrails.
+Deep work and everyday are recommended presets, not the limits of how Sentinel
+can run. Every run keeps the runtime supervision: fail-closed approvals,
+steering, health tracking, and restarts. Everyday removes the final exam, not
+the guardrails.
 
 ## Why it works
 
