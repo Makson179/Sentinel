@@ -146,7 +146,7 @@ Verify your environment at any time with `sentinel doctor`.
 **Option A: Codex plugin** (recommended if you work inside Codex):
 
 ```bash
-pipx install "git+https://github.com/Makson179/Sentinel.git"
+pipx install sentinel-supervisor
 codex plugin marketplace add AlexeyKulaev/sentinel-codex-marketplace --ref main
 codex plugin add sentinel-supervisor@sentinel-marketplace
 ```
@@ -157,12 +157,19 @@ file. The plugin checks for updates and launches the run for you.
 **Option B: standalone CLI**
 
 ```bash
-pipx install "git+https://github.com/Makson179/Sentinel.git"
+pipx install sentinel-supervisor
 sentinel doctor
 ```
 
 Sentinel checks for updates at startup and offers to install them; run
 `sentinel update` to update explicitly.
+
+If you installed an earlier GitHub build, migrate once:
+
+```bash
+pipx uninstall sentinel
+pipx install sentinel-supervisor
+```
 
 ## Quick start
 
@@ -243,7 +250,8 @@ sentinel --task TASK.md  # run a specific task file
 sentinel config          # open the interactive config editor
 sentinel doctor          # check Python, git, Codex, auth, app-server support
 sentinel update          # update Sentinel to the latest version
-sentinel --version       # version, installed commit, update status
+sentinel update --check --json  # machine-readable update status
+sentinel --version       # installed version, latest version, update status
 ```
 
 Run flags (each overrides the saved config for one run):

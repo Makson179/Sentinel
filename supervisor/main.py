@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -178,25 +179,63 @@ def cli(
 
 
 @cli.command("update")
-def update_command() -> None:
+@click.option("--check", "check_only", is_flag=True, help="Check for updates without installing them.")
+@click.option("--json", "json_output", is_flag=True, help="Emit update status as JSON. Implies --check.")
+def update_command(check_only: bool, json_output: bool) -> None:
     status = update_check.check_for_update()
     info = status.install_info
+    if check_only or json_output:
+        if json_output:
+            click.echo(json.dumps(_update_status_payload(status), sort_keys=True))
+        else:
+            click.echo(_format_update_check_report(status))
+        return
+
     if status.state == update_check.UpdateState.UNKNOWN:
         raise click.ClickException(status.warning or "Could not check for Sentinel updates")
     if status.state == update_check.UpdateState.CURRENT:
         click.echo("Sentinel is up to date.")
-        click.echo(f"Installed: {update_check.short_sha(info.installed_commit)}")
+        click.echo(f"Installed: {info.version}")
         return
 
-    assert status.latest_commit is not None
-    old_commit = info.installed_commit
+    assert status.latest_version is not None
+    old_version = info.version
     try:
         update_check.run_update(info)
     except update_check.UpdateCheckError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo("Sentinel updated.")
-    click.echo(f"Previous: {update_check.short_sha(old_commit)}")
-    click.echo(f"Current:  {update_check.short_sha(status.latest_commit)}")
+    click.echo(f"Previous: {old_version}")
+    click.echo(f"Current:  {status.latest_version}")
+
+
+def _update_status_payload(status: update_check.UpdateStatus) -> dict[str, Any]:
+    info = status.install_info
+    return {
+        "package": info.package_name,
+        "installed_version": info.version,
+        "latest_version": status.latest_version,
+        "state": status.state.value,
+        "update_available": status.state == update_check.UpdateState.OUTDATED,
+        "install_mode": info.install_mode,
+        "warning": status.warning,
+    }
+
+
+def _format_update_check_report(status: update_check.UpdateStatus) -> str:
+    info = status.install_info
+    lines = [f"Sentinel {info.version}"]
+    if status.state == update_check.UpdateState.CURRENT:
+        lines.append("status: up to date")
+        lines.append(f"latest: {status.latest_version or info.version}")
+    elif status.state == update_check.UpdateState.OUTDATED:
+        lines.append("status: update available")
+        lines.append(f"installed: {info.version}")
+        lines.append(f"latest:    {status.latest_version}")
+    else:
+        lines.append("status: unknown")
+        lines.append(f"warning: Could not check for Sentinel updates: {status.warning or 'unknown error'}")
+    return "\n".join(lines)
 
 
 @cli.command("doctor")
@@ -227,15 +266,14 @@ def _format_version_report() -> str:
     info = status.install_info
     lines = [f"Sentinel {info.version}"]
     if status.state == update_check.UpdateState.CURRENT:
-        lines.append(f"commit: {update_check.short_sha(info.installed_commit)}")
+        lines.append(f"latest: {status.latest_version or info.version}")
         lines.append("status: up to date")
     elif status.state == update_check.UpdateState.OUTDATED:
-        lines.append(f"installed commit: {update_check.short_sha(info.installed_commit)}")
-        lines.append(f"latest commit:    {update_check.short_sha(status.latest_commit)}")
+        lines.append(f"installed: {info.version}")
+        lines.append(f"latest:    {status.latest_version}")
         lines.append("status: update available")
         lines.extend(["", "Run:", "  sentinel update"])
     else:
-        lines.append(f"commit: {update_check.short_sha(info.installed_commit)}")
         lines.append("status: unknown")
         lines.append(f"warning: Could not check for Sentinel updates: {status.warning or 'unknown error'}")
     return "\n".join(lines)
@@ -282,9 +320,8 @@ def _format_update_available_message(status: update_check.UpdateStatus) -> str:
         [
             "A newer Sentinel version is available.",
             "",
-            f"Installed: {update_check.short_sha(info.installed_commit)}",
-            f"Latest:    {update_check.short_sha(status.latest_commit)}",
-            f"Source:    {info.source_display}",
+            f"Installed: {info.version}",
+            f"Latest:    {status.latest_version}",
             "",
             "Choose:",
             "  [u] update now and rerun this command",

@@ -84,16 +84,6 @@ def collect_doctor_results() -> list[DoctorResult]:
         results.append(DoctorResult("warn", "sentinel command not found on PATH"))
     results.append(DoctorResult("ok", f"Sentinel install mode: {info.install_mode}"))
 
-    if info.repo_url:
-        results.append(DoctorResult("ok", f"Sentinel install source: {info.source_display}"))
-    else:
-        results.append(DoctorResult("warn", "Sentinel install source could not be determined", info.warning))
-
-    if info.installed_commit:
-        results.append(DoctorResult("ok", f"Sentinel commit: {update_check.short_sha(info.installed_commit)}"))
-    else:
-        results.append(DoctorResult("warn", "Sentinel commit could not be determined", info.warning))
-
     status = update_check.check_for_update(info)
     if status.state == update_check.UpdateState.CURRENT:
         results.append(DoctorResult("ok", "Sentinel is up to date"))
@@ -101,7 +91,7 @@ def collect_doctor_results() -> list[DoctorResult]:
         results.append(
             DoctorResult(
                 "warn",
-                f"Update available: {update_check.short_sha(status.latest_commit)}",
+                f"Update available: {status.latest_version}",
                 "Run: sentinel update",
             )
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 
 import click
 from click.testing import CliRunner
@@ -13,23 +14,20 @@ from supervisor.project_config import DEFAULT_INTELLIGENCE
 from supervisor.main import _format_version_report, _startup_update_gate, _update_and_reexec, cli
 
 
-FULL_A = "a" * 40
-FULL_B = "b" * 40
+VERSION_A = "0.1.0"
+VERSION_B = "0.1.1"
 
 
-def _info(commit: str = FULL_A) -> update_check.InstallInfo:
+def _info(version: str = VERSION_A) -> update_check.InstallInfo:
     return update_check.InstallInfo(
-        package_name="sentinel",
-        version="0.1.0",
-        repo_url="https://github.com/Makson179/Sentinel.git",
-        requested_revision=None,
-        installed_commit=commit,
+        package_name="sentinel-supervisor",
+        version=version,
         install_mode="pipx",
     )
 
 
-def _status(state: update_check.UpdateState, latest: str | None = FULL_A) -> update_check.UpdateStatus:
-    return update_check.UpdateStatus(state, _info(), latest_commit=latest)
+def _status(state: update_check.UpdateState, latest: str | None = VERSION_A) -> update_check.UpdateStatus:
+    return update_check.UpdateStatus(state, _info(), latest_version=latest)
 
 
 class NonTty(io.StringIO):
@@ -46,14 +44,14 @@ def test_version_report_shows_update_available(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         update_check,
         "check_for_update",
-        lambda: update_check.UpdateStatus(update_check.UpdateState.OUTDATED, _info(FULL_A), latest_commit=FULL_B),
+        lambda: update_check.UpdateStatus(update_check.UpdateState.OUTDATED, _info(VERSION_A), latest_version=VERSION_B),
     )
 
     report = _format_version_report()
 
     assert "Sentinel 0.1.0" in report
-    assert "installed commit: aaaaaaa" in report
-    assert "latest commit:    bbbbbbb" in report
+    assert "installed: 0.1.0" in report
+    assert "latest:    0.1.1" in report
     assert "sentinel update" in report
 
 
@@ -61,7 +59,7 @@ def test_startup_gate_warns_and_continues_when_outdated_without_tty(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
     monkeypatch.setattr("supervisor.main.sys.stdin", NonTty())
 
     _startup_update_gate()
@@ -72,8 +70,29 @@ def test_startup_gate_warns_and_continues_when_outdated_without_tty(
     assert "Set SENTINEL_SKIP_UPDATE_CHECK=1" in captured.err
 
 
+def test_startup_gate_warns_and_continues_when_update_check_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        update_check,
+        "check_for_update",
+        lambda: update_check.UpdateStatus(
+            update_check.UpdateState.UNKNOWN,
+            _info(),
+            warning="could not reach PyPI",
+        ),
+    )
+
+    _startup_update_gate()
+
+    captured = capsys.readouterr()
+    assert "Could not check for Sentinel updates" in captured.err
+    assert "could not reach PyPI" in captured.err
+
+
 def test_startup_gate_continues_on_interactive_continue(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
     monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
     monkeypatch.setattr("builtins.input", lambda prompt: "c")
 
@@ -85,7 +104,7 @@ def test_startup_gate_accepts_case_and_retries_invalid_selection(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     responses = iter(["x", " C\r"])
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
     monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
     monkeypatch.setattr("builtins.input", lambda prompt: next(responses))
 
@@ -95,7 +114,7 @@ def test_startup_gate_accepts_case_and_retries_invalid_selection(
 
 
 def test_startup_gate_quit_exits_without_running_task(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
     monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
     monkeypatch.setattr("builtins.input", lambda prompt: "q")
 
@@ -107,7 +126,7 @@ def test_startup_gate_quit_exits_without_running_task(monkeypatch: pytest.Monkey
 
 def test_startup_gate_update_choice_updates_and_reexecs(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[object] = []
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
     monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
     monkeypatch.setattr("builtins.input", lambda prompt: "u")
     monkeypatch.setattr(update_check, "run_update", lambda info: calls.append(info))
@@ -148,7 +167,7 @@ def test_update_reexec_preserves_original_launcher_and_task_args(
     monkeypatch.setattr("supervisor.main.os.execvp", fake_execvp)
 
     with pytest.raises(RuntimeError, match="reexec requested"):
-        _update_and_reexec(_status(update_check.UpdateState.OUTDATED, FULL_B))
+        _update_and_reexec(_status(update_check.UpdateState.OUTDATED, VERSION_B))
 
     assert calls == [_info(), (argv[0], argv)]
 
@@ -161,13 +180,57 @@ def test_startup_gate_skip_env_bypasses_check(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_update_command_reports_current(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.CURRENT, FULL_A))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.CURRENT, VERSION_A))
 
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code == 0
     assert "Sentinel is up to date." in result.output
-    assert "Installed: aaaaaaa" in result.output
+    assert "Installed: 0.1.0" in result.output
+
+
+def test_update_check_reports_outdated_without_installing(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[update_check.InstallInfo] = []
+    monkeypatch.setattr(
+        update_check,
+        "check_for_update",
+        lambda: update_check.UpdateStatus(update_check.UpdateState.OUTDATED, _info(VERSION_A), latest_version=VERSION_B),
+    )
+    monkeypatch.setattr(update_check, "run_update", lambda info: calls.append(info))
+
+    result = CliRunner().invoke(cli, ["update", "--check"])
+
+    assert result.exit_code == 0
+    assert calls == []
+    assert "status: update available" in result.output
+    assert "installed: 0.1.0" in result.output
+    assert "latest:    0.1.1" in result.output
+
+
+def test_update_check_json_reports_unknown_without_failing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        update_check,
+        "check_for_update",
+        lambda: update_check.UpdateStatus(
+            update_check.UpdateState.UNKNOWN,
+            _info(VERSION_A),
+            warning="PyPI returned invalid JSON",
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["update", "--check", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "package": "sentinel-supervisor",
+        "installed_version": "0.1.0",
+        "latest_version": None,
+        "state": "unknown",
+        "update_available": False,
+        "install_mode": "pipx",
+        "warning": "PyPI returned invalid JSON",
+    }
 
 
 def test_update_command_runs_update_when_outdated(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,23 +238,23 @@ def test_update_command_runs_update_when_outdated(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         update_check,
         "check_for_update",
-        lambda: update_check.UpdateStatus(update_check.UpdateState.OUTDATED, _info(FULL_A), latest_commit=FULL_B),
+        lambda: update_check.UpdateStatus(update_check.UpdateState.OUTDATED, _info(VERSION_A), latest_version=VERSION_B),
     )
     monkeypatch.setattr(update_check, "run_update", lambda info: calls.append(info))
 
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code == 0
-    assert calls == [_info(FULL_A)]
-    assert "Previous: aaaaaaa" in result.output
-    assert "Current:  bbbbbbb" in result.output
+    assert calls == [_info(VERSION_A)]
+    assert "Previous: 0.1.0" in result.output
+    assert "Current:  0.1.1" in result.output
 
 
 def test_version_option_bypasses_startup_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         update_check,
         "check_for_update",
-        lambda: update_check.UpdateStatus(update_check.UpdateState.CURRENT, _info(FULL_A), latest_commit=FULL_A),
+        lambda: update_check.UpdateStatus(update_check.UpdateState.CURRENT, _info(VERSION_A), latest_version=VERSION_A),
     )
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: pytest.fail("startup gate should not run"))
 
@@ -199,6 +262,25 @@ def test_version_option_bypasses_startup_gate(monkeypatch: pytest.MonkeyPatch) -
 
     assert result.exit_code == 0
     assert "Sentinel 0.1.0" in result.output
+
+
+def test_version_option_reports_unknown_update_status_without_failing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        update_check,
+        "check_for_update",
+        lambda: update_check.UpdateStatus(
+            update_check.UpdateState.UNKNOWN,
+            _info(VERSION_A),
+            warning="could not reach PyPI",
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["--version"])
+
+    assert result.exit_code == 0
+    assert "Sentinel 0.1.0" in result.output
+    assert "status: unknown" in result.output
+    assert "could not reach PyPI" in result.output
 
 
 @pytest.mark.parametrize("platform_name", ["linux", "darwin", "win32"])
@@ -214,7 +296,7 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
     monkeypatch.setattr("supervisor.main.sys.platform", platform_name)
     monkeypatch.setattr("supervisor.main.sys.stdin", Tty())
     monkeypatch.setattr("builtins.input", lambda prompt: "c")
-    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, FULL_B))
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
 
     async def fake_run_sentinel(
         task_path,

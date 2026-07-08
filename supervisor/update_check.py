@@ -3,23 +3,28 @@ from __future__ import annotations
 import importlib.metadata as metadata
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 from supervisor import __version__
 
 
-DISTRIBUTION_NAME = "sentinel"
+DISTRIBUTION_NAME = "sentinel-supervisor"
 SKIP_UPDATE_CHECK_ENV = "SENTINEL_SKIP_UPDATE_CHECK"
 REMOTE_CHECK_TIMEOUT_SECONDS = 8.0
 UPDATE_COMMAND_TIMEOUT_SECONDS = 300.0
 NONINTERACTIVE_UPDATE_EXIT_CODE = 17
+PYPI_JSON_BASE_URL = "https://pypi.org/pypi"
 
 
 class UpdateCheckError(RuntimeError):
@@ -36,28 +41,17 @@ class UpdateState(str, Enum):
 class InstallInfo:
     package_name: str
     version: str
-    repo_url: str | None
-    requested_revision: str | None
-    installed_commit: str | None
     install_mode: str
     metadata_available: bool = True
     metadata_location: str | None = None
     warning: str | None = None
-
-    @property
-    def source_display(self) -> str:
-        if self.repo_url and self.requested_revision:
-            return f"{self.repo_url}@{self.requested_revision}"
-        if self.repo_url:
-            return f"{self.repo_url} (default branch)"
-        return "unknown"
 
 
 @dataclass(frozen=True)
 class UpdateStatus:
     state: UpdateState
     install_info: InstallInfo
-    latest_commit: str | None = None
+    latest_version: str | None = None
     warning: str | None = None
 
     @property
@@ -74,56 +68,26 @@ def skip_update_check_enabled(environ: dict[str, str] | None = None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def short_sha(value: str | None) -> str:
-    if not value:
-        return "unknown"
-    return value[:7]
-
-
 def read_install_info(distribution_name: str = DISTRIBUTION_NAME) -> InstallInfo:
     version = __version__
     metadata_location: str | None = None
-    direct_url: dict[str, Any] | None = None
     warning: str | None = None
+    metadata_available = True
 
     try:
         dist = metadata.distribution(distribution_name)
     except metadata.PackageNotFoundError:
-        dist = None
+        metadata_available = False
         warning = f"package metadata for {distribution_name!r} was not found"
     else:
         version = getattr(dist, "version", None) or version
         metadata_location = _distribution_location(dist)
-        direct_url = _read_direct_url(dist)
-
-    repo_url: str | None = None
-    requested_revision: str | None = None
-    installed_commit: str | None = None
-
-    if direct_url:
-        repo_url, requested_revision, installed_commit = _pep610_git_info(direct_url)
-
-    build_info = _build_info_fallback()
-    repo_url = repo_url or build_info.get("repo_url")
-    requested_revision = requested_revision or build_info.get("requested_revision")
-    installed_commit = installed_commit or build_info.get("installed_commit")
-
-    git_info = _git_checkout_fallback()
-    repo_url = repo_url or git_info.get("repo_url")
-    requested_revision = requested_revision or git_info.get("requested_revision")
-    installed_commit = installed_commit or git_info.get("installed_commit")
-
-    if warning is None and direct_url is None and not installed_commit:
-        warning = "install source metadata does not include a git commit"
 
     return InstallInfo(
         package_name=distribution_name,
         version=version,
-        repo_url=repo_url,
-        requested_revision=requested_revision,
-        installed_commit=installed_commit,
         install_mode=detect_install_mode(),
-        metadata_available=dist is not None,
+        metadata_available=metadata_available,
         metadata_location=metadata_location,
         warning=warning,
     )
@@ -131,80 +95,58 @@ def read_install_info(distribution_name: str = DISTRIBUTION_NAME) -> InstallInfo
 
 def check_for_update(install_info: InstallInfo | None = None) -> UpdateStatus:
     info = install_info or read_install_info()
-    if not info.installed_commit:
-        return UpdateStatus(UpdateState.UNKNOWN, info, warning="could not determine installed Sentinel commit")
-    if not info.repo_url:
-        return UpdateStatus(UpdateState.UNKNOWN, info, warning="could not determine Sentinel install source")
-
     try:
-        latest = latest_remote_commit(info.repo_url, info.requested_revision)
-    except UpdateCheckError as exc:
+        latest = latest_pypi_version(info.package_name)
+        installed_version = Version(info.version)
+        latest_version = Version(latest)
+    except (UpdateCheckError, InvalidVersion) as exc:
         return UpdateStatus(UpdateState.UNKNOWN, info, warning=str(exc))
 
-    if latest.lower() == info.installed_commit.lower():
-        return UpdateStatus(UpdateState.CURRENT, info, latest_commit=latest)
-    return UpdateStatus(UpdateState.OUTDATED, info, latest_commit=latest)
+    if latest_version > installed_version:
+        return UpdateStatus(UpdateState.OUTDATED, info, latest_version=latest)
+    return UpdateStatus(UpdateState.CURRENT, info, latest_version=latest)
 
 
-def latest_remote_commit(repo_url: str, ref: str | None, *, timeout: float = REMOTE_CHECK_TIMEOUT_SECONDS) -> str:
-    if _looks_like_full_sha(ref):
-        raise UpdateCheckError("could not determine latest commit for a pinned commit ref")
-    args = ["git", "ls-remote", repo_url, ref] if ref else ["git", "ls-remote", "--symref", repo_url, "HEAD"]
+def latest_pypi_version(
+    package_name: str,
+    *,
+    timeout: float = REMOTE_CHECK_TIMEOUT_SECONDS,
+    base_url: str = PYPI_JSON_BASE_URL,
+) -> str:
+    quoted_name = urllib.parse.quote(package_name, safe="")
+    url = f"{base_url.rstrip('/')}/{quoted_name}/json"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        completed = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise UpdateCheckError("git executable not found") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise UpdateCheckError("git ls-remote timed out while checking for Sentinel updates") from exc
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise UpdateCheckError(f"package {package_name!r} was not found on PyPI") from exc
+        raise UpdateCheckError(f"PyPI returned HTTP {exc.code} while checking for updates") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise UpdateCheckError(f"could not reach PyPI while checking for updates: {reason}") from exc
+    except TimeoutError as exc:
+        raise UpdateCheckError("PyPI update check timed out") from exc
 
-    if completed.returncode != 0:
-        message = (completed.stderr or completed.stdout).strip() or "git ls-remote failed"
-        raise UpdateCheckError(message)
-    return parse_ls_remote_commit(completed.stdout)
+    try:
+        payload: Any = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UpdateCheckError("PyPI returned invalid JSON while checking for updates") from exc
 
-
-def parse_ls_remote_commit(output: str) -> str:
-    rows: list[tuple[str, str]] = []
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        sha, remote_ref = parts[0], parts[1]
-        if _looks_like_full_sha(sha):
-            rows.append((sha, remote_ref))
-
-    if not rows:
-        raise UpdateCheckError("could not determine latest commit for the installed ref")
-
-    peeled = {sha for sha, remote_ref in rows if remote_ref.endswith("^{}")}
-    if len(peeled) == 1:
-        return next(iter(peeled))
-    if len(peeled) > 1:
-        raise UpdateCheckError("remote ref matched multiple peeled commits")
-
-    distinct = {sha for sha, _ in rows}
-    if len(distinct) != 1:
-        raise UpdateCheckError("remote ref is ambiguous")
-    return next(iter(distinct))
-
-
-def install_spec(info: InstallInfo) -> str:
-    if not info.repo_url:
-        raise UpdateCheckError("could not build a git install spec for this Sentinel install")
-    if not info.requested_revision:
-        return f"git+{info.repo_url}"
-    return f"git+{info.repo_url}@{info.requested_revision}"
+    if not isinstance(payload, dict):
+        raise UpdateCheckError("PyPI returned an invalid response while checking for updates")
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        raise UpdateCheckError("PyPI response did not include package info")
+    version = info.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise UpdateCheckError("PyPI response did not include a latest version")
+    return version
 
 
 def run_update(info: InstallInfo) -> subprocess.CompletedProcess[str]:
-    spec = install_spec(info)
-    command = update_command(info, spec)
+    command = update_command(info)
     try:
         completed = subprocess.run(
             command,
@@ -225,28 +167,33 @@ def run_update(info: InstallInfo) -> subprocess.CompletedProcess[str]:
     return completed
 
 
-def update_command(info: InstallInfo, spec: str) -> list[str]:
+def update_command(info: InstallInfo) -> list[str]:
     if info.install_mode == "pipx" and shutil.which("pipx"):
-        return ["pipx", "install", "--force", spec]
+        return ["pipx", "upgrade", info.package_name]
     if _running_inside_venv():
-        return [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", spec]
+        return [sys.executable, "-m", "pip", "install", "--upgrade", info.package_name]
     raise UpdateCheckError(manual_update_message(info))
 
 
 def manual_update_message(info: InstallInfo) -> str:
-    lines = [
-        "Could not update Sentinel automatically.",
-        "",
-        "Try:",
-        f"  pipx reinstall {info.package_name}",
-    ]
-    if info.repo_url:
-        lines.extend(["", "or:", f"  pipx install --force {shlex.quote(install_spec(info))}"])
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "Could not update Sentinel automatically.",
+            "",
+            "Try:",
+            f"  pipx upgrade {info.package_name}",
+            "",
+            "or:",
+            f"  pipx install --force {info.package_name}",
+        ]
+    )
 
 
 def detect_install_mode() -> str:
-    prefix_parts = {part.lower() for part in Path(sys.prefix).parts}
+    prefix = Path(sys.prefix)
+    if (prefix / "pipx_metadata.json").exists():
+        return "pipx"
+    prefix_parts = {part.lower() for part in prefix.parts}
     if "pipx" in prefix_parts and "venvs" in prefix_parts:
         return "pipx"
     if _running_inside_venv():
@@ -263,80 +210,3 @@ def _distribution_location(dist: metadata.Distribution) -> str | None:
         return str(dist.locate_file(""))
     except Exception:
         return None
-
-
-def _read_direct_url(dist: metadata.Distribution) -> dict[str, Any] | None:
-    try:
-        text = dist.read_text("direct_url.json")
-    except Exception:
-        return None
-    if not text:
-        return None
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _pep610_git_info(direct_url: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
-    repo_url = direct_url.get("url") if isinstance(direct_url.get("url"), str) else None
-    vcs_info = direct_url.get("vcs_info")
-    if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != "git":
-        return repo_url, None, None
-    requested_revision = vcs_info.get("requested_revision")
-    commit_id = vcs_info.get("commit_id")
-    return (
-        repo_url,
-        requested_revision if isinstance(requested_revision, str) and requested_revision else None,
-        commit_id if isinstance(commit_id, str) and commit_id else None,
-    )
-
-
-def _build_info_fallback() -> dict[str, str]:
-    try:
-        from supervisor import _build
-    except Exception:
-        return {}
-    values = {
-        "repo_url": getattr(_build, "SOURCE_URL", None),
-        "requested_revision": getattr(_build, "REQUESTED_REVISION", None),
-        "installed_commit": getattr(_build, "COMMIT_SHA", None),
-    }
-    return {key: value for key, value in values.items() if isinstance(value, str) and value}
-
-
-def _git_checkout_fallback() -> dict[str, str]:
-    package_root = Path(__file__).resolve().parents[1]
-    git_root = _git_output(["git", "-C", str(package_root), "rev-parse", "--show-toplevel"], timeout=2)
-    if not git_root:
-        return {}
-    root = Path(git_root)
-    installed_commit = _git_output(["git", "-C", str(root), "rev-parse", "HEAD"], timeout=2)
-    repo_url = _git_output(["git", "-C", str(root), "config", "--get", "remote.origin.url"], timeout=2)
-    branch = _git_output(["git", "-C", str(root), "branch", "--show-current"], timeout=2)
-    values = {
-        "repo_url": repo_url,
-        "requested_revision": branch,
-        "installed_commit": installed_commit,
-    }
-    return {key: value for key, value in values.items() if value}
-
-
-def _git_output(args: list[str], *, timeout: float) -> str | None:
-    try:
-        completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return None
-    value = completed.stdout.strip()
-    return value or None
-
-
-def _looks_like_full_sha(value: str | None) -> bool:
-    if value is None:
-        return False
-    if len(value) not in {40, 64}:
-        return False
-    return all(char in "0123456789abcdefABCDEF" for char in value)

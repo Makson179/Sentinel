@@ -14,7 +14,7 @@ def test_project_installs_sentinel_console_script() -> None:
 
     scripts = metadata["project"]["scripts"]
 
-    assert metadata["project"]["name"] == "sentinel"
+    assert metadata["project"]["name"] == "sentinel-supervisor"
     assert scripts["sentinel"] == "supervisor.main:cli"
     assert "supervisor" not in scripts
 

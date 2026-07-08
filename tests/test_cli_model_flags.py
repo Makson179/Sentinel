@@ -20,7 +20,8 @@ def test_model_flag_is_not_registered() -> None:
     result = CliRunner().invoke(cli, ["--model", "gpt-custom"])
 
     assert result.exit_code != 0
-    assert "No such option '--model'" in result.output
+    assert "No such option" in result.output
+    assert "--model" in result.output
 
 
 def test_split_model_flags_must_be_paired() -> None:
