@@ -164,13 +164,6 @@ sentinel doctor
 Sentinel checks for updates at startup and offers to install them; run
 `sentinel update` to update explicitly.
 
-If you installed an earlier GitHub build, migrate once:
-
-```bash
-pipx uninstall sentinel
-pipx install sentinel-supervisor
-```
-
 ## Quick start
 
 ```bash
