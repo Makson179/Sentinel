@@ -18,17 +18,21 @@ from supervisor.state import StateStore
 
 CODER_SANDBOX_ENV = "SENTINEL_CODER_SANDBOX"
 CODER_SANDBOX_READ_ONLY = "read-only"
+CODER_SANDBOX_WORKSPACE_WRITE = "workspace-write"
 CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
 CODEX_FAST_SERVICE_TIER = "priority"
 DEFAULT_INTELLIGENCE = "xhigh"
 
 
 def coder_sandbox_mode() -> str:
-    raw = os.environ.get(CODER_SANDBOX_ENV, CODER_SANDBOX_READ_ONLY).strip().lower()
+    raw = os.environ.get(CODER_SANDBOX_ENV, CODER_SANDBOX_WORKSPACE_WRITE).strip().lower()
     aliases = {
         "read-only": CODER_SANDBOX_READ_ONLY,
         "readonly": CODER_SANDBOX_READ_ONLY,
         "read_only": CODER_SANDBOX_READ_ONLY,
+        "workspace-write": CODER_SANDBOX_WORKSPACE_WRITE,
+        "workspace_write": CODER_SANDBOX_WORKSPACE_WRITE,
+        "workspacewrite": CODER_SANDBOX_WORKSPACE_WRITE,
         "danger-full-access": CODER_SANDBOX_DANGER_FULL_ACCESS,
         "danger_full_access": CODER_SANDBOX_DANGER_FULL_ACCESS,
         "danger": CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -36,13 +40,22 @@ def coder_sandbox_mode() -> str:
     try:
         return aliases[raw]
     except KeyError as exc:
-        supported = f"{CODER_SANDBOX_READ_ONLY}, {CODER_SANDBOX_DANGER_FULL_ACCESS}"
+        supported = f"{CODER_SANDBOX_READ_ONLY}, {CODER_SANDBOX_WORKSPACE_WRITE}, {CODER_SANDBOX_DANGER_FULL_ACCESS}"
         raise RuntimeError(f"unsupported {CODER_SANDBOX_ENV}={raw!r}; expected one of: {supported}") from exc
 
 
-def coder_turn_sandbox_policy() -> dict[str, Any]:
-    if coder_sandbox_mode() == CODER_SANDBOX_DANGER_FULL_ACCESS:
+def coder_turn_sandbox_policy(project_root: Path | None = None) -> dict[str, Any]:
+    mode = coder_sandbox_mode()
+    if mode == CODER_SANDBOX_DANGER_FULL_ACCESS:
         return {"type": "dangerFullAccess"}
+    if mode == CODER_SANDBOX_WORKSPACE_WRITE:
+        if project_root is None:
+            raise RuntimeError("workspace-write coder sandbox requires a project root")
+        return {
+            "type": "workspaceWrite",
+            "writableRoots": [str(project_root.resolve())],
+            "networkAccess": False,
+        }
     return {"type": "readOnly", "networkAccess": False}
 
 
@@ -89,7 +102,7 @@ def coder_turn_params(
         "runtimeWorkspaceRoots": [str(project_root)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
-        "sandboxPolicy": coder_turn_sandbox_policy(),
+        "sandboxPolicy": coder_turn_sandbox_policy(project_root),
         "serviceTier": codex_service_tier(fast=fast),
     }
     if model:

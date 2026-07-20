@@ -31,6 +31,7 @@ RUNTIME_TRACE = "runtime_trace.jsonl"
 RUNTIME_METRICS = "runtime_metrics.json"
 AGENT_SETTINGS = "agent-settings.json"
 PREVIOUS_RUNS = "previous_runs"
+RECOVERY = "recovery"
 
 INITIALIZATION_MODES = Literal["fresh", "resume"]
 
@@ -164,7 +165,7 @@ class StateStore:
         if mode == "fresh":
             self._clear_state_dir(preserve=set())
         elif mode == "resume":
-            self._clear_state_dir(preserve={EVENTS, LOG, PREVIOUS_RUNS})
+            self._clear_state_dir(preserve={EVENTS, LOG, PREVIOUS_RUNS, RECOVERY})
         else:
             raise ValueError(f"unknown sentinel initialization mode: {mode}")
 
@@ -211,6 +212,20 @@ class StateStore:
             path.unlink()
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def next_recovery_dir(self) -> Path:
+        recovery = self.path(RECOVERY)
+        if recovery.exists() and not recovery.is_dir():
+            recovery.unlink()
+        recovery.mkdir(parents=True, exist_ok=True)
+        max_run = 0
+        for child in recovery.iterdir():
+            if not child.is_dir() or not child.name.startswith("run"):
+                continue
+            suffix = child.name[3:]
+            if suffix.isdigit():
+                max_run = max(max_run, int(suffix))
+        return recovery / f"run{max_run + 1}"
 
     def archive_completed_run(self, task_path: Path) -> Path:
         previous_runs = self.ensure_previous_runs_dir()

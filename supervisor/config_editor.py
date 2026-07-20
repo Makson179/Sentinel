@@ -15,10 +15,16 @@ from wcwidth import wcwidth
 from supervisor.appserver import AppServerClient
 from supervisor.project_config import (
     DEFAULT_MODEL,
-    INTELLIGENCE_CHOICES,
+    GPT_5_6_MODELS,
+    MODEL_GPT_5_5,
+    MODEL_GPT_5_6_LUNA,
+    MODEL_GPT_5_6_SOL,
+    MODEL_GPT_5_6_TERRA,
     SPEED_CHOICES,
+    SUPPORTED_MODEL_CHOICES,
     ProjectConfig,
     changed_project_config_fields,
+    intelligence_choices_for_model,
     load_project_config,
     project_config_path,
     sync_runtime_config_fields,
@@ -53,6 +59,13 @@ PANEL_BORDER_GRADIENT = (
 ACTIVE_ROW_BG_GRADIENT = (
     "#100832",
 )
+MODEL_FAMILY_5_6_LABEL = "GPT-5.6"
+MODEL_FAMILY_5_5_LABEL = "GPT-5.5"
+MODEL_VARIANT_LABELS = {
+    MODEL_GPT_5_6_SOL: "Sol",
+    MODEL_GPT_5_6_TERRA: "Terra",
+    MODEL_GPT_5_6_LUNA: "Luna",
+}
 
 
 @dataclass(frozen=True)
@@ -324,6 +337,38 @@ class WidthUtils:
 
 def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None = None) -> tuple[EditorParameter, ...]:
     models = _model_choices_for_config(config, model_choices)
+    coder_parameters = _role_parameters(
+        "coder",
+        "coder_mod",
+        "coder_intelligence",
+        config.coder_mod,
+        config.coder_intelligence,
+        models,
+    )
+    runtime_parameters = _role_parameters(
+        "runtime",
+        "runtime_mod",
+        "runtime_intelligence",
+        config.runtime_mod,
+        config.runtime_intelligence,
+        models,
+    )
+    completion_parameters = _role_parameters(
+        "completion",
+        "completion_mod",
+        "completion_intelligence",
+        config.completion_mod,
+        config.completion_intelligence,
+        models,
+    )
+    adversary_parameters = _role_parameters(
+        "adversary",
+        "adversary_mod",
+        "adversary_intelligence",
+        config.adversary_mod,
+        config.adversary_intelligence,
+        models,
+    )
     protected_options = [
         EditorOption("clear all", "protected_path", ()),
         EditorOption("add path", action="add_protected_path"),
@@ -339,30 +384,10 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             (),
             edit_kind="optional_text",
         ),
-        EditorParameter(
-            "coder_mod",
-            "coder-mod",
-            config.coder_mod,
-            tuple(EditorOption(model, "coder_mod", model) for model in models),
-        ),
-        EditorParameter(
-            "super_mod",
-            "super-mod",
-            config.super_mod,
-            tuple(EditorOption(model, "super_mod", model) for model in models),
-        ),
-        EditorParameter(
-            "coder_intelligence",
-            "coder-intelligence",
-            config.coder_intelligence,
-            tuple(EditorOption(value, "coder_intelligence", value) for value in INTELLIGENCE_CHOICES),
-        ),
-        EditorParameter(
-            "super_intelligence",
-            "super-intelligence",
-            config.super_intelligence,
-            tuple(EditorOption(value, "super_intelligence", value) for value in INTELLIGENCE_CHOICES),
-        ),
+        *coder_parameters,
+        *runtime_parameters,
+        *completion_parameters,
+        *adversary_parameters,
         EditorParameter(
             "speed",
             "speed",
@@ -417,6 +442,75 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             tuple(protected_options),
         ),
     )
+
+
+def _role_parameters(
+    role: str,
+    model_field: str,
+    intelligence_field: str,
+    selected_model: str,
+    selected_intelligence: str,
+    available_models: tuple[str, ...],
+) -> tuple[EditorParameter, ...]:
+    return (
+        *_model_parameters(role, model_field, selected_model, available_models),
+        EditorParameter(
+            intelligence_field,
+            f"{role}-intelligence",
+            selected_intelligence,
+            tuple(
+                EditorOption(value, intelligence_field, value)
+                for value in intelligence_choices_for_model(selected_model)
+            ),
+        ),
+    )
+
+
+def _model_parameters(
+    role: str,
+    field: str,
+    selected_model: str,
+    available_models: tuple[str, ...],
+) -> tuple[EditorParameter, ...]:
+    available = set(available_models)
+    available_56 = [model for model in GPT_5_6_MODELS if model in available or model == selected_model]
+    family_options: list[EditorOption] = []
+    if available_56:
+        selected_56 = selected_model if selected_model in GPT_5_6_MODELS else available_56[0]
+        family_options.append(EditorOption(MODEL_FAMILY_5_6_LABEL, field, selected_56))
+    if MODEL_GPT_5_5 in available or selected_model == MODEL_GPT_5_5:
+        family_options.append(EditorOption(MODEL_FAMILY_5_5_LABEL, field, MODEL_GPT_5_5))
+
+    parameters = [
+        EditorParameter(
+            field,
+            f"{role}-mod",
+            _model_family_label(selected_model),
+            tuple(family_options),
+        )
+    ]
+    if selected_model in GPT_5_6_MODELS:
+        parameters.append(
+            EditorParameter(
+                f"{field}_variant",
+                f"{role}-5.6-variant",
+                MODEL_VARIANT_LABELS[selected_model],
+                tuple(
+                    EditorOption(MODEL_VARIANT_LABELS[model], field, model)
+                    for model in GPT_5_6_MODELS
+                    if model in available or model == selected_model
+                ),
+            )
+        )
+    return tuple(parameters)
+
+
+def _model_family_label(model: str) -> str:
+    if model in GPT_5_6_MODELS:
+        return MODEL_FAMILY_5_6_LABEL
+    if model == MODEL_GPT_5_5:
+        return MODEL_FAMILY_5_5_LABEL
+    return model
 
 
 def move_down(state: EditorState, parameters: tuple[EditorParameter, ...]) -> EditorState:
@@ -551,6 +645,20 @@ def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> Proj
     if field == "adversary_runs":
         runs = int(value)
         return replace(config, adversary_runs=runs, adversary=runs > 0)
+    model_effort_fields = {
+        "coder_mod": "coder_intelligence",
+        "runtime_mod": "runtime_intelligence",
+        "completion_mod": "completion_intelligence",
+        "adversary_mod": "adversary_intelligence",
+    }
+    if field in model_effort_fields:
+        updated = replace(config, **{field: value})
+        intelligence_field = model_effort_fields[field]
+        current_intelligence = getattr(updated, intelligence_field)
+        supported = intelligence_choices_for_model(str(value))
+        if current_intelligence not in supported:
+            updated = replace(updated, **{intelligence_field: supported[-1]})
+        return updated
     return replace(config, **{field: value})
 
 
@@ -649,7 +757,7 @@ class FooterStatus:
             (theme.style("footer"), " "),
             *_inline_badge("JSON", theme, "json_badge"),
             (theme.style("footer"), "  "),
-            (_merge_styles(theme.style("footer"), theme.style("muted")), f"{len(parameters)} keys"),
+            (_merge_styles(theme.style("footer"), theme.style("muted")), f"{len(parameters)} settings"),
             (_merge_styles(theme.style("footer"), theme.style("muted")), f"  {theme.symbols.bullet}  "),
             (_merge_styles(theme.style("footer"), theme.style("muted")), f"{nested_count} nested"),
             (theme.style("footer"), "  "),
@@ -1150,9 +1258,17 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         return {
             "task": "T",
             "coder_mod": "C",
-            "super_mod": "S",
+            "coder_mod_variant": "V",
+            "runtime_mod": "R",
+            "runtime_mod_variant": "V",
+            "completion_mod": "F",
+            "completion_mod_variant": "V",
+            "adversary_mod": "A",
+            "adversary_mod_variant": "V",
             "coder_intelligence": "I",
-            "super_intelligence": "I",
+            "runtime_intelligence": "I",
+            "completion_intelligence": "I",
+            "adversary_intelligence": "I",
             "speed": "F",
             "start_over": "R",
             "completion_review": "V",
@@ -1165,9 +1281,17 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
     return {
         "task": "☑",
         "coder_mod": "◇",
-        "super_mod": "☆",
+        "coder_mod_variant": "◇",
+        "runtime_mod": "☆",
+        "runtime_mod_variant": "☆",
+        "completion_mod": "✓",
+        "completion_mod_variant": "✓",
+        "adversary_mod": "◈",
+        "adversary_mod_variant": "◈",
         "coder_intelligence": "✾",
-        "super_intelligence": "✾",
+        "runtime_intelligence": "✾",
+        "completion_intelligence": "✾",
+        "adversary_intelligence": "✾",
         "speed": "⚡",
         "start_over": "↻",
         "completion_review": "✓",
@@ -1211,9 +1335,17 @@ def _icon_style_key(parameter_key: str) -> str:
     return {
         "task": "violet",
         "coder_mod": "violet",
-        "super_mod": "magenta",
+        "coder_mod_variant": "violet",
+        "runtime_mod": "magenta",
+        "runtime_mod_variant": "magenta",
+        "completion_mod": "green",
+        "completion_mod_variant": "green",
+        "adversary_mod": "cyan",
+        "adversary_mod_variant": "cyan",
         "coder_intelligence": "magenta",
-        "super_intelligence": "magenta",
+        "runtime_intelligence": "magenta",
+        "completion_intelligence": "green",
+        "adversary_intelligence": "cyan",
         "speed": "yellow",
         "start_over": "magenta",
         "completion_review": "green",
@@ -1266,12 +1398,12 @@ def _primary_action_hint(state: EditorState) -> str:
 
 def _value_style_key(parameter_key: str, value: str) -> str:
     normalized = value.strip().lower()
-    if parameter_key in {"coder_mod", "super_mod"}:
+    if parameter_key.endswith("_mod") or parameter_key.endswith("_mod_variant"):
         return "magenta_soft"
     if parameter_key in {"adversary_runs", "completion_returns_per_generation"}:
         return "cyan"
     if "intelligence" in parameter_key:
-        return "violet" if normalized == "xhigh" else "magenta"
+        return "violet" if normalized in {"xhigh", "max", "ultra"} else "magenta"
     if parameter_key == "speed":
         return "yellow"
     if normalized == "true":
@@ -1443,28 +1575,27 @@ def available_model_choices(project_root: Path) -> tuple[str, ...]:
 def _model_choices_for_config(config: ProjectConfig, model_choices: tuple[str, ...] | None) -> tuple[str, ...]:
     return _normalize_model_choices(
         [
-            *(model_choices or ()),
+            *(model_choices if model_choices is not None else SUPPORTED_MODEL_CHOICES),
             config.coder_mod,
-            config.super_mod,
-            DEFAULT_MODEL,
+            config.runtime_mod,
+            config.completion_mod,
+            config.adversary_mod,
         ]
     )
 
 
 def _normalize_model_choices(models: Any) -> tuple[str, ...]:
-    values: list[str] = []
     if isinstance(models, str):
         candidates = [models]
     else:
         candidates = list(models) if isinstance(models, list | tuple | set) else []
-    for candidate in candidates:
-        if isinstance(candidate, str):
-            value = candidate.strip()
-            if value and value not in values:
-                values.append(value)
-    if DEFAULT_MODEL in values:
-        values.remove(DEFAULT_MODEL)
-    return tuple([DEFAULT_MODEL, *values])
+    available = {
+        candidate.strip()
+        for candidate in candidates
+        if isinstance(candidate, str) and candidate.strip() in SUPPORTED_MODEL_CHOICES
+    }
+    available.update({DEFAULT_MODEL, MODEL_GPT_5_5})
+    return tuple(model for model in SUPPORTED_MODEL_CHOICES if model in available)
 
 
 def _available_models_from_cache() -> tuple[str, ...]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -150,12 +151,18 @@ class ApprovalManager:
         supervisor: SupervisorApprovalReviewer | None = None,
         cheap_reviewer: CheapApprovalReviewerProtocol | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+        immutable_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
         timeout_seconds: float = 180.0,
         cheap_review_timeout_seconds: float = 20.0,
         adversary_mode: bool = False,
     ):
         self.workspace = workspace.resolve()
-        self.policy = PolicyEngine(self.workspace, declared_grading_roots=declared_grading_roots)
+        self.immutable_paths = tuple(Path(path).expanduser() for path in immutable_paths or ())
+        self.policy = PolicyEngine(
+            self.workspace,
+            declared_grading_roots=declared_grading_roots,
+            immutable_paths=self.immutable_paths,
+        )
         self.supervisor = supervisor
         self.cheap_reviewer = cheap_reviewer
         self.timeout_seconds = timeout_seconds
@@ -174,9 +181,6 @@ class ApprovalManager:
         }:
             return self._deny(context, "unsupported approval/request type")
 
-        if context.network_approval_context is not None:
-            return await self._route_full_supervisor_or_deny(context, "network approval requires supervisor judgment")
-
         if context.request_type == ApprovalRequestType.FILE_CHANGE:
             file_decision = self._evaluate_file_change(context)
             if file_decision.kind == PolicyDecisionKind.ALLOW:
@@ -191,10 +195,12 @@ class ApprovalManager:
         if context.cwd:
             payload["cwd"] = context.cwd
         policy_decision = self.policy.evaluate(payload)
-        if policy_decision.kind == PolicyDecisionKind.ALLOW:
-            return self._allow(context, policy_decision.reason)
         if policy_decision.kind == PolicyDecisionKind.DENY:
             return self._deny(context, policy_decision.reason)
+        if context.network_approval_context is not None or context.proposed_network_policy_amendments:
+            return await self._route_full_supervisor_or_deny(context, "network approval requires supervisor judgment")
+        if policy_decision.kind == PolicyDecisionKind.ALLOW:
+            return self._allow(context, policy_decision.reason)
         if self.adversary_mode:
             return await self._adversary_containment_decision(context)
         return await self._route_review_chain_or_full_supervisor(context, policy_decision)
@@ -341,7 +347,8 @@ class ApprovalManager:
             approval = decision.approval_decision.value
             if approval not in {"accept", "acceptForSession"}:
                 return self._deny(context, "supervisor approve used a denial decision")
-            if decision.execpolicy_amendment:
+            network_scoped = _network_scoped_approval(context, self.workspace)
+            if decision.execpolicy_amendment and not network_scoped:
                 protocol_decision = {
                     "acceptWithExecpolicyAmendment": {"execpolicy_amendment": decision.execpolicy_amendment}
                 }
@@ -356,6 +363,13 @@ class ApprovalManager:
                         persistent_decision=decision.persistent_decision,
                         from_supervisor=True,
                     )
+            if network_scoped and approval == "accept" and self._is_allowed(context, "accept"):
+                return ApprovalResolution(
+                    decision="accept",
+                    reason=decision.reason,
+                    persistent_decision=None,
+                    from_supervisor=True,
+                )
             if approval == "acceptForSession" and _accept_for_session_forbidden(context, self.workspace):
                 return self._deny(context, "acceptForSession is forbidden for this approval class")
             if self._is_allowed(context, approval):
@@ -383,6 +397,9 @@ class ApprovalManager:
         if not raw_paths:
             return PolicyDecision.allow("app-server file-change approval without exposed paths treated as workspace edit")
         for raw in raw_paths:
+            immutable_hit = _immutable_path_hit(raw, cwd=context.cwd, workspace=self.workspace, roots=self.immutable_paths)
+            if immutable_hit is not None:
+                return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")
             path = normalize_path(self.workspace, raw)
             if path is None:
                 return PolicyDecision.route_llm(f"path escapes workspace or is ambiguous: {raw}")
@@ -477,14 +494,60 @@ def _paths_from_changes(changes: list[Any]) -> list[str]:
     return paths
 
 
+def _immutable_path_hit(
+    raw: str,
+    *,
+    cwd: str | None,
+    workspace: Path,
+    roots: tuple[Path, ...],
+) -> str | None:
+    if not roots:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        base = Path(cwd).expanduser() if cwd else workspace
+        path = base / path
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        return None
+    for root in roots:
+        try:
+            immutable = root.resolve(strict=False)
+        except OSError:
+            continue
+        if resolved == immutable:
+            return str(immutable)
+        try:
+            resolved.relative_to(immutable)
+            return str(immutable)
+        except ValueError:
+            continue
+    return None
+
+
 def _accept_for_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
-    if context.network_approval_context is not None:
+    if _network_scoped_approval(context, workspace):
         return True
     if context.request_type == ApprovalRequestType.FILE_CHANGE:
         return _file_change_session_forbidden(context, workspace)
     if context.command:
         return _command_session_forbidden(context.command)
     return False
+
+
+def _network_scoped_approval(context: ApprovalContext, workspace: Path) -> bool:
+    if context.network_approval_context is not None or context.proposed_network_policy_amendments:
+        return True
+    if not context.command:
+        return False
+    if "network" in analyze_command(workspace, context.command, context.cwd).risk_tags:
+        return True
+    command = context.command
+    return bool(
+        re.search(r"(?i)(?<![\w.-])(?:curl|wget)(?=$|[\s;&|()])", command)
+        or re.search(r"(?i)\b(?:https?|ftp)://", command)
+    )
 
 
 def _file_change_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:

@@ -298,32 +298,23 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
     monkeypatch.setattr("builtins.input", lambda prompt: "c")
     monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
 
-    async def fake_run_sentinel(
-        task_path,
-        coder_model,
-        supervisor_model,
-        coder_intelligence,
-        supervisor_intelligence,
-        fast,
-        start_over,
-        protected_paths,
-        clean,
-        completion_review,
-        adversary,
-        adversary_runs,
-    ):
+    async def fake_run_sentinel(settings):
         calls.append(
             (
-                task_path,
-                coder_model,
-                supervisor_model,
-                coder_intelligence,
-                supervisor_intelligence,
-                fast,
-                start_over,
-                protected_paths,
-                clean,
-                adversary,
+                settings.task_path,
+                settings.coder_model,
+                settings.runtime_model,
+                settings.completion_model,
+                settings.adversary_model,
+                settings.coder_intelligence,
+                settings.runtime_intelligence,
+                settings.completion_intelligence,
+                settings.adversary_intelligence,
+                settings.fast,
+                settings.start_over,
+                settings.protected_paths,
+                settings.clean,
+                settings.adversary,
             )
         )
         return 0
@@ -347,6 +338,10 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
             task,
             DEFAULT_MODEL,
             DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            DEFAULT_INTELLIGENCE,
+            DEFAULT_INTELLIGENCE,
             DEFAULT_INTELLIGENCE,
             DEFAULT_INTELLIGENCE,
             False,
@@ -366,32 +361,23 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(
-        task_path,
-        coder_model,
-        supervisor_model,
-        coder_intelligence,
-        supervisor_intelligence,
-        fast,
-        start_over,
-        protected_paths,
-        clean,
-        completion_review,
-        adversary,
-        adversary_runs,
-    ):
+    async def fake_run_sentinel(settings):
         calls.append(
             (
-                task_path,
-                coder_model,
-                supervisor_model,
-                coder_intelligence,
-                supervisor_intelligence,
-                fast,
-                start_over,
-                protected_paths,
-                clean,
-                adversary,
+                settings.task_path,
+                settings.coder_model,
+                settings.runtime_model,
+                settings.completion_model,
+                settings.adversary_model,
+                settings.coder_intelligence,
+                settings.runtime_intelligence,
+                settings.completion_intelligence,
+                settings.adversary_intelligence,
+                settings.fast,
+                settings.start_over,
+                settings.protected_paths,
+                settings.clean,
+                settings.adversary,
             )
         )
         return 0
@@ -414,6 +400,10 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
             task,
             DEFAULT_MODEL,
             DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            DEFAULT_INTELLIGENCE,
+            DEFAULT_INTELLIGENCE,
             DEFAULT_INTELLIGENCE,
             DEFAULT_INTELLIGENCE,
             True,
@@ -432,21 +422,8 @@ def test_cli_boolean_false_overrides_project_config(monkeypatch: pytest.MonkeyPa
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(
-        task_path,
-        coder_model,
-        supervisor_model,
-        coder_intelligence,
-        supervisor_intelligence,
-        fast,
-        start_over,
-        protected_paths,
-        clean,
-        completion_review,
-        adversary,
-        adversary_runs,
-    ):
-        calls.append((fast, start_over, clean, adversary))
+    async def fake_run_sentinel(settings):
+        calls.append((settings.fast, settings.start_over, settings.clean, settings.adversary))
         return 0
 
     def fake_run_async_cleanly(coro):
@@ -472,21 +449,8 @@ def test_cli_completion_review_flag_reaches_runner(monkeypatch: pytest.MonkeyPat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(
-        task_path,
-        coder_model,
-        supervisor_model,
-        coder_intelligence,
-        supervisor_intelligence,
-        fast,
-        start_over,
-        protected_paths,
-        clean,
-        completion_review,
-        adversary,
-        adversary_runs,
-    ):
-        calls.append(completion_review)
+    async def fake_run_sentinel(settings):
+        calls.append(settings.completion_review)
         return 0
 
     def fake_run_async_cleanly(coro):

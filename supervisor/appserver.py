@@ -3,13 +3,30 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
-from collections.abc import Awaitable, Callable
+import tempfile
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 CODEX_NO_WEB_SEARCH_CONFIG_FLAGS = ["-c", 'web_search="disabled"']
+
+APP_SERVER_PARENT_CONTEXT_ENV_VARS = {
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "CODEX_NETWORK_ALLOW_LOCAL_BINDING",
+    "CODEX_NETWORK_POLICY_VIOLATION",
+    "CODEX_NETWORK_PROXY_ACTIVE",
+    "CODEX_NETWORK_PROXY_ATTRIBUTION",
+    "CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS",
+    "CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE",
+    "CODEX_PERMISSION_PROFILE",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_SNAPSHOT_OVERRIDE",
+    "CODEX_THREAD_ID",
+}
 
 
 class AppServerError(RuntimeError):
@@ -92,46 +109,66 @@ class AppServerClient:
         self._waiters: list[tuple[Callable[[AppServerMessage], bool], asyncio.Future[AppServerMessage]]] = []
         self.incoming: asyncio.Queue[AppServerMessage] = asyncio.Queue()
         self.reader_error: BaseException | None = None
+        self._isolated_codex_home: Path | None = None
 
     async def start(self) -> None:
         if self.process is not None:
             return
-        self.process = await asyncio.create_subprocess_exec(
-            *self.command,
-            cwd=str(self.cwd) if self.cwd else None,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=self.stdout_limit,
-            start_new_session=True,
-        )
+        env = _app_server_environment()
+        source_codex_home = _codex_home_from_environment(env)
+        if source_codex_home.is_dir():
+            self._isolated_codex_home = _create_isolated_codex_home(source_codex_home)
+            env["CODEX_HOME"] = str(self._isolated_codex_home)
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *self.command,
+                cwd=str(self.cwd) if self.cwd else None,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=self.stdout_limit,
+                start_new_session=True,
+            )
+        except BaseException:
+            self._cleanup_isolated_codex_home()
+            raise
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def stop(self) -> None:
-        if self._reader_task:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-            self._reader_task = None
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except asyncio.CancelledError:
-                pass
-            self._stderr_task = None
-        if self.process:
-            if self.process.returncode is None:
-                self._terminate_process_group(signal.SIGTERM)
+        try:
+            if self._reader_task:
+                self._reader_task.cancel()
                 try:
-                    await asyncio.wait_for(self.process.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    self._terminate_process_group(signal.SIGKILL)
-                    await self.process.wait()
-            self.process = None
+                    await self._reader_task
+                except asyncio.CancelledError:
+                    pass
+                self._reader_task = None
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                try:
+                    await self._stderr_task
+                except asyncio.CancelledError:
+                    pass
+                self._stderr_task = None
+            if self.process:
+                if self.process.returncode is None:
+                    self._terminate_process_group(signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(self.process.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        self._terminate_process_group(signal.SIGKILL)
+                        await self.process.wait()
+                self.process = None
+        finally:
+            self._cleanup_isolated_codex_home()
+
+    def _cleanup_isolated_codex_home(self) -> None:
+        if self._isolated_codex_home is None:
+            return
+        shutil.rmtree(self._isolated_codex_home, ignore_errors=True)
+        self._isolated_codex_home = None
 
     def _terminate_process_group(self, sig: int) -> None:
         process = self.process
@@ -151,7 +188,7 @@ class AppServerClient:
         result = await self.request(
             "initialize",
             {
-                "clientInfo": {"name": "sentinel", "title": "Sentinel", "version": "0.1.0"},
+                "clientInfo": {"name": "sentinel", "title": "Sentinel", "version": "0.2.0"},
                 "capabilities": {"experimentalApi": True, "requestAttestation": False},
             },
             timeout=timeout,
@@ -430,6 +467,36 @@ class AppServerClient:
 
 def text_input(text: str) -> dict[str, Any]:
     return {"type": "text", "text": text, "text_elements": []}
+
+
+def _app_server_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if environ is None else environ)
+    for name in APP_SERVER_PARENT_CONTEXT_ENV_VARS:
+        env.pop(name, None)
+    return env
+
+
+def _codex_home_from_environment(environ: Mapping[str, str]) -> Path:
+    configured = environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    home = Path(environ.get("HOME") or Path.home()).expanduser()
+    return (home / ".codex").resolve(strict=False)
+
+
+def _create_isolated_codex_home(source: Path) -> Path:
+    source = source.resolve(strict=True)
+    isolated = Path(tempfile.mkdtemp(prefix="sentinel-codex-home-")).resolve()
+    try:
+        for child in source.iterdir():
+            if child.name == "rules":
+                continue
+            os.symlink(str(child), isolated / child.name, target_is_directory=child.is_dir())
+        (isolated / "rules").mkdir(mode=0o700)
+        return isolated
+    except BaseException:
+        shutil.rmtree(isolated, ignore_errors=True)
+        raise
 
 
 def last_agent_message_text(turn: dict[str, Any]) -> str | None:

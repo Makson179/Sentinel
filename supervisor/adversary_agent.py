@@ -13,6 +13,7 @@ from supervisor.appserver import (
     last_agent_message_text,
     text_input,
 )
+from supervisor.coder import DEFAULT_INTELLIGENCE, apply_intelligence
 from supervisor.prompts import build_adversary_prompt
 from supervisor.schemas import SupervisorWakePacket
 
@@ -50,6 +51,7 @@ class AdversaryAgent:
         project_root: Path,
         *,
         model: str | None = None,
+        intelligence: str | None = DEFAULT_INTELLIGENCE,
         timeout_seconds: float = DEFAULT_ADVERSARY_TIMEOUT_SECONDS,
         on_thread_start: Callable[[str], None] | None = None,
         on_thread_done: Callable[[str], None] | None = None,
@@ -58,6 +60,7 @@ class AdversaryAgent:
         self.client = client
         self.project_root = project_root.resolve()
         self.model = model
+        self.intelligence = intelligence
         self.timeout_seconds = timeout_seconds
         self.on_thread_start = on_thread_start
         self.on_thread_done = on_thread_done
@@ -209,7 +212,7 @@ class AdversaryAgent:
         }
         if self.model:
             params["model"] = self.model
-        return params
+        return apply_intelligence(params, self.intelligence)
 
     async def _await_rpc(self, stage: str, awaitable: Any, *, timeout: float) -> Any:
         try:

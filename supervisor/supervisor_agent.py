@@ -31,7 +31,6 @@ from supervisor.schemas import (
     PriorIntervention,
     RestartHandoff,
     SupervisorDecision,
-    SupervisorDecisionKind,
     SupervisorWakePacket,
     TriggeringAction,
     ValidationOutput,
@@ -70,6 +69,8 @@ class StatelessSupervisorAgent:
         store: StateStore,
         task_path: Path,
         *,
+        workspace_root: Path | None = None,
+        task_contents: str | None = None,
         model: str | None = None,
         fast: bool = False,
         intelligence: str | None = DEFAULT_INTELLIGENCE,
@@ -79,6 +80,8 @@ class StatelessSupervisorAgent:
         self.client = client
         self.store = store
         self.task_path = task_path.resolve()
+        self.workspace_root = (workspace_root or store.workspace).resolve()
+        self.task_contents = task_contents
         self.model = model
         self.fast = fast
         self.intelligence = intelligence
@@ -492,7 +495,11 @@ class StatelessSupervisorAgent:
             generation=cfg.generation,
             restart_count=cfg.restart_count,
             task_path=str(self.task_path),
-            task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else "",
+            task_contents=(
+                self.task_contents
+                if self.task_contents is not None
+                else self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else ""
+            ),
             progress=self.store.read_text(PROGRESS, ""),
             decisions=self.store.read_text(DECISIONS, ""),
             last_actions=self.store.read_recent_actions(10),
@@ -542,8 +549,8 @@ class StatelessSupervisorAgent:
 
     def _thread_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "cwd": str(self.store.workspace),
-            "runtimeWorkspaceRoots": [str(self.store.workspace)],
+            "cwd": str(self.workspace_root),
+            "runtimeWorkspaceRoots": [str(self.workspace_root)],
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
             "sandbox": "read-only",

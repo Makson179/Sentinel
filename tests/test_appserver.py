@@ -1,10 +1,59 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+from pathlib import Path
 
 import pytest
 
-from supervisor.appserver import AppServerClient, AppServerProtocolError, AppServerTimeoutError
+from supervisor.appserver import (
+    AppServerClient,
+    AppServerProtocolError,
+    AppServerTimeoutError,
+    _app_server_environment,
+    _create_isolated_codex_home,
+)
+
+
+def test_appserver_environment_drops_parent_codex_execution_context() -> None:
+    source = {
+        "PATH": "/usr/bin",
+        "CODEX_HOME": "/tmp/codex-home",
+        "CODEX_PERMISSION_PROFILE": ":danger-full-access",
+        "CODEX_SANDBOX": "seatbelt",
+        "CODEX_SANDBOX_NETWORK_DISABLED": "1",
+        "CODEX_NETWORK_PROXY_ACTIVE": "1",
+        "CODEX_THREAD_ID": "parent-thread",
+    }
+
+    result = _app_server_environment(source)
+
+    assert result == {"PATH": "/usr/bin", "CODEX_HOME": "/tmp/codex-home"}
+
+
+def test_isolated_codex_home_preserves_configuration_but_not_user_rules(tmp_path: Path) -> None:
+    source = tmp_path / "codex-home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"token": "test"}\n', encoding="utf-8")
+    (source / "config.toml").write_text('model = "gpt-test"\n', encoding="utf-8")
+    (source / "skills").mkdir()
+    (source / "rules").mkdir()
+    (source / "rules" / "default.rules").write_text(
+        'prefix_rule(pattern=["curl"], decision="allow")\n',
+        encoding="utf-8",
+    )
+
+    isolated = _create_isolated_codex_home(source)
+    try:
+        assert (isolated / "auth.json").is_symlink()
+        assert (isolated / "config.toml").read_text(encoding="utf-8") == 'model = "gpt-test"\n'
+        assert (isolated / "skills").is_symlink()
+        assert (isolated / "rules").is_dir()
+        assert not (isolated / "rules").is_symlink()
+        assert list((isolated / "rules").iterdir()) == []
+        assert (source / "rules" / "default.rules").exists()
+    finally:
+        shutil.rmtree(isolated)
 
 
 async def test_request_times_out_without_appserver_response() -> None:

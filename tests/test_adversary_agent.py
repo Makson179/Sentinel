@@ -70,6 +70,8 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     agent = AdversaryAgent(
         client,  # type: ignore[arg-type]
         tmp_path,
+        model="gpt-adversary",
+        intelligence="ultra",
         timeout_seconds=1,
         on_thread_start=started.append,
         on_thread_done=done.append,
@@ -86,6 +88,10 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     assert client.thread_params[0]["ephemeral"] is False
     assert client.thread_params[0]["persistExtendedHistory"] is False
     assert client.thread_params[0]["sandbox"] == "workspace-write"
+    assert client.thread_params[0]["model"] == "gpt-adversary"
+    assert "effort" not in client.thread_params[0]
+    assert client.turn_params[0]["model"] == "gpt-adversary"
+    assert client.turn_params[0]["effort"] == "ultra"
     assert client.turn_params[0]["sandboxPolicy"] == {
         "type": "workspaceWrite",
         "writableRoots": [str(tmp_path.resolve())],

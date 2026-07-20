@@ -12,11 +12,12 @@ import click
 
 from supervisor.config_editor import run_config_editor
 from supervisor import doctor, update_check
-from supervisor.controller import DEFAULT_MODEL, SentinelController
+from supervisor.controller import SentinelController
 from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
     ProjectConfig,
     ProjectConfigError,
+    intelligence_choices_for_model,
     load_project_config,
     project_config_path,
 )
@@ -42,8 +43,17 @@ class SentinelClickGroup(click.Group):
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 @click.option("--task", "task_path", type=click.Path(exists=False, dir_okay=False, path_type=Path))
-@click.option("--coder-mod", "coder_model", default=None, help="Model to use for coder turns. Must be used with --super-mod.")
-@click.option("--super-mod", "supervisor_model", default=None, help="Model to use for supervisor turns. Must be used with --coder-mod.")
+@click.option("--coder-mod", "coder_model", default=None, help="Model to use for coder turns.")
+@click.option("--runtime-mod", "runtime_model", default=None, help="Model to use for runtime supervisor turns.")
+@click.option("--completion-mod", "completion_model", default=None, help="Model to use for completion review turns.")
+@click.option("--adversary-mod", "adversary_model", default=None, help="Model to use for adversarial tester turns.")
+@click.option(
+    "--super-mod",
+    "legacy_supervisor_model",
+    default=None,
+    hidden=True,
+    help="Legacy alias that sets both runtime and completion models.",
+)
 @click.option(
     "--coder-intelligence",
     default=None,
@@ -51,11 +61,31 @@ class SentinelClickGroup(click.Group):
     help="Reasoning effort for coder turns.",
 )
 @click.option(
-    "--super-intelligence",
-    "supervisor_intelligence",
+    "--runtime-intelligence",
+    "runtime_intelligence",
     default=None,
     type=click.Choice(INTELLIGENCE_CHOICES),
-    help="Reasoning effort for supervisor turns.",
+    help="Reasoning effort for runtime supervisor turns.",
+)
+@click.option(
+    "--completion-intelligence",
+    default=None,
+    type=click.Choice(INTELLIGENCE_CHOICES),
+    help="Reasoning effort for completion review turns.",
+)
+@click.option(
+    "--adversary-intelligence",
+    default=None,
+    type=click.Choice(INTELLIGENCE_CHOICES),
+    help="Reasoning effort for adversarial tester turns.",
+)
+@click.option(
+    "--super-intelligence",
+    "legacy_supervisor_intelligence",
+    default=None,
+    hidden=True,
+    type=click.Choice(INTELLIGENCE_CHOICES),
+    help="Legacy alias that sets both runtime and completion reasoning effort.",
 )
 @click.option(
     "--fast",
@@ -123,9 +153,15 @@ def cli(
     ctx: click.Context,
     task_path: Path | None,
     coder_model: str | None,
-    supervisor_model: str | None,
+    runtime_model: str | None,
+    completion_model: str | None,
+    adversary_model: str | None,
+    legacy_supervisor_model: str | None,
     coder_intelligence: str | None,
-    supervisor_intelligence: str | None,
+    runtime_intelligence: str | None,
+    completion_intelligence: str | None,
+    adversary_intelligence: str | None,
+    legacy_supervisor_intelligence: str | None,
     fast: bool | None,
     start_over: bool | None,
     protected_paths: tuple[Path, ...],
@@ -143,9 +179,15 @@ def cli(
             project_config=project_config,
             task_path=task_path,
             coder_model=coder_model,
-            supervisor_model=supervisor_model,
+            runtime_model=runtime_model,
+            completion_model=completion_model,
+            adversary_model=adversary_model,
+            legacy_supervisor_model=legacy_supervisor_model,
             coder_intelligence=coder_intelligence,
-            supervisor_intelligence=supervisor_intelligence,
+            runtime_intelligence=runtime_intelligence,
+            completion_intelligence=completion_intelligence,
+            adversary_intelligence=adversary_intelligence,
+            legacy_supervisor_intelligence=legacy_supervisor_intelligence,
             fast=fast,
             start_over=start_over,
             protected_paths=protected_paths,
@@ -154,22 +196,7 @@ def cli(
             adversary=adversary,
             adversary_runs=adversary_runs,
         )
-        _run_async_cleanly(
-            _run_sentinel(
-                run_settings.task_path,
-                run_settings.coder_model,
-                run_settings.supervisor_model,
-                run_settings.coder_intelligence,
-                run_settings.supervisor_intelligence,
-                run_settings.fast,
-                run_settings.start_over,
-                run_settings.protected_paths,
-                run_settings.clean,
-                run_settings.completion_review,
-                run_settings.adversary,
-                run_settings.adversary_runs,
-            )
-        )
+        _run_async_cleanly(_run_sentinel(run_settings))
     except ProjectConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     except TaskSelectionError as exc:
@@ -251,7 +278,9 @@ def config_command() -> None:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Saved Sentinel config: {project_config_path(Path.cwd())}")
     click.echo(f"coder-mod: {config.coder_mod}")
-    click.echo(f"super-mod: {config.super_mod}")
+    click.echo(f"runtime-mod: {config.runtime_mod}")
+    click.echo(f"completion-mod: {config.completion_mod}")
+    click.echo(f"adversary-mod: {config.adversary_mod}")
 
 
 def _version_callback(ctx: click.Context, value: bool) -> None:
@@ -361,34 +390,25 @@ def _run_async_cleanly(coro: Coroutine[Any, Any, Any]) -> None:
     sys.exit(exit_code)
 
 
-async def _run_sentinel(
-    task_path: Path | None,
-    coder_model: str,
-    supervisor_model: str,
-    coder_intelligence: str,
-    supervisor_intelligence: str,
-    fast: bool,
-    start_over: bool,
-    protected_paths: tuple[Path, ...],
-    clean: bool,
-    completion_review: bool,
-    adversary: bool,
-    adversary_runs: int,
-) -> int:
+async def _run_sentinel(settings: RunSettings) -> int:
     controller = SentinelController(
         Path.cwd(),
-        task_path=task_path,
-        coder_model=coder_model,
-        supervisor_model=supervisor_model,
-        coder_intelligence=coder_intelligence,
-        supervisor_intelligence=supervisor_intelligence,
-        fast=fast,
-        overwrite_state=start_over,
-        declared_grading_roots=protected_paths,
-        clean_workspace=clean,
-        adversary_enabled=adversary,
-        adversary_runs=adversary_runs,
-        completion_review=completion_review,
+        task_path=settings.task_path,
+        coder_model=settings.coder_model,
+        runtime_model=settings.runtime_model,
+        completion_model=settings.completion_model,
+        adversary_model=settings.adversary_model,
+        coder_intelligence=settings.coder_intelligence,
+        runtime_intelligence=settings.runtime_intelligence,
+        completion_intelligence=settings.completion_intelligence,
+        adversary_intelligence=settings.adversary_intelligence,
+        fast=settings.fast,
+        overwrite_state=settings.start_over,
+        declared_grading_roots=settings.protected_paths,
+        clean_workspace=settings.clean,
+        adversary_enabled=settings.adversary,
+        adversary_runs=settings.adversary_runs,
+        completion_review=settings.completion_review,
         project_config=load_project_config(Path.cwd(), create=False),
     )
     await controller.run()
@@ -398,27 +418,17 @@ async def _run_sentinel(
     return 0
 
 
-def _resolve_model_flags(
-    *,
-    coder_model: str | None,
-    supervisor_model: str | None,
-    default_coder_model: str = DEFAULT_MODEL,
-    default_supervisor_model: str = DEFAULT_MODEL,
-) -> tuple[str, str]:
-    if bool(coder_model) != bool(supervisor_model):
-        raise RuntimeError("--coder-mod and --super-mod must be used together")
-    if coder_model and supervisor_model:
-        return coder_model, supervisor_model
-    return default_coder_model, default_supervisor_model
-
-
 @dataclass(frozen=True)
 class RunSettings:
     task_path: Path | None
     coder_model: str
-    supervisor_model: str
+    runtime_model: str
+    completion_model: str
+    adversary_model: str
     coder_intelligence: str
-    supervisor_intelligence: str
+    runtime_intelligence: str
+    completion_intelligence: str
+    adversary_intelligence: str
     fast: bool
     start_over: bool
     protected_paths: tuple[Path, ...]
@@ -431,33 +441,62 @@ class RunSettings:
 def _resolve_run_settings(
     *,
     project_config: ProjectConfig,
-    task_path: Path | None,
-    coder_model: str | None,
-    supervisor_model: str | None,
-    coder_intelligence: str | None,
-    supervisor_intelligence: str | None,
-    fast: bool | None,
-    start_over: bool | None,
-    protected_paths: tuple[Path, ...],
-    clean: bool | None,
+    task_path: Path | None = None,
+    coder_model: str | None = None,
+    runtime_model: str | None = None,
+    completion_model: str | None = None,
+    adversary_model: str | None = None,
+    legacy_supervisor_model: str | None = None,
+    coder_intelligence: str | None = None,
+    runtime_intelligence: str | None = None,
+    completion_intelligence: str | None = None,
+    adversary_intelligence: str | None = None,
+    legacy_supervisor_intelligence: str | None = None,
+    fast: bool | None = None,
+    start_over: bool | None = None,
+    protected_paths: tuple[Path, ...] = (),
+    clean: bool | None = None,
     completion_review: bool | None = None,
     adversary: bool | None = None,
     adversary_runs: int | None = None,
 ) -> RunSettings:
-    selected_coder_model, selected_supervisor_model = _resolve_model_flags(
-        coder_model=coder_model,
-        supervisor_model=supervisor_model,
-        default_coder_model=project_config.coder_mod,
-        default_supervisor_model=project_config.super_mod,
-    )
+    if legacy_supervisor_model is not None:
+        if runtime_model is not None or completion_model is not None:
+            raise RuntimeError("--super-mod cannot be combined with --runtime-mod or --completion-mod")
+        runtime_model = legacy_supervisor_model
+        completion_model = legacy_supervisor_model
+    if legacy_supervisor_intelligence is not None:
+        if runtime_intelligence is not None or completion_intelligence is not None:
+            raise RuntimeError(
+                "--super-intelligence cannot be combined with --runtime-intelligence or --completion-intelligence"
+            )
+        runtime_intelligence = legacy_supervisor_intelligence
+        completion_intelligence = legacy_supervisor_intelligence
+
+    selected_coder_model = coder_model or project_config.coder_mod
+    selected_runtime_model = runtime_model or project_config.runtime_mod
+    selected_completion_model = completion_model or project_config.completion_mod
+    selected_adversary_model = adversary_model or project_config.adversary_mod
+    selected_coder_intelligence = coder_intelligence or project_config.coder_intelligence
+    selected_runtime_intelligence = runtime_intelligence or project_config.runtime_intelligence
+    selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
+    selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
+    _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
+    _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
+    _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
+    _validate_model_intelligence("adversary", selected_adversary_model, selected_adversary_intelligence)
     selected_task = task_path if task_path is not None else Path(project_config.task) if project_config.task else None
     selected_protected_paths = protected_paths or tuple(Path(path) for path in project_config.protected_path)
     return RunSettings(
         task_path=selected_task,
         coder_model=selected_coder_model,
-        supervisor_model=selected_supervisor_model,
-        coder_intelligence=coder_intelligence or project_config.coder_intelligence,
-        supervisor_intelligence=supervisor_intelligence or project_config.super_intelligence,
+        runtime_model=selected_runtime_model,
+        completion_model=selected_completion_model,
+        adversary_model=selected_adversary_model,
+        coder_intelligence=selected_coder_intelligence,
+        runtime_intelligence=selected_runtime_intelligence,
+        completion_intelligence=selected_completion_intelligence,
+        adversary_intelligence=selected_adversary_intelligence,
         fast=project_config.fast if fast is None else fast,
         start_over=project_config.start_over if start_over is None else start_over,
         protected_paths=selected_protected_paths,
@@ -471,6 +510,14 @@ def _resolve_run_settings(
         ),
         adversary_runs=project_config.adversary_runs if adversary_runs is None else adversary_runs,
     )
+
+
+def _validate_model_intelligence(role: str, model: str, intelligence: str) -> None:
+    supported = intelligence_choices_for_model(model)
+    if intelligence in supported:
+        return
+    choices = ", ".join(supported)
+    raise RuntimeError(f"{role} model {model} does not support reasoning effort {intelligence}; choose one of: {choices}")
 
 
 def _normalize_optional_bool_args(args: list[str]) -> list[str]:

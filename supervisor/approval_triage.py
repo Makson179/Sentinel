@@ -13,9 +13,9 @@ from supervisor.appserver import AppServerClient, AppServerError, last_agent_mes
 from supervisor.policy import (
     CHEAP_REVIEW_BLOCK_TAGS,
     CommandAnalysis,
-    FORBIDDEN_CHEAP_RISK_TAGS,
     analyze_command,
 )
+from supervisor.project_config import MODEL_GPT_5_6_LUNA
 from supervisor.prompts import build_cheap_approval_prompt, build_cheap_runtime_prompt
 from supervisor.schemas import (
     ApprovalContext,
@@ -34,9 +34,9 @@ from supervisor.schemas.models import (
 from supervisor.supervisor_agent import _agent_message_text_from_turns, _parse_json_object
 
 
-# Default cheap-triage model: a lightweight codex-tuned model, capable enough for the
-# narrow approve/noop routing decisions but far cheaper/faster than the full supervisor.
-DEFAULT_TRIAGE_MODEL = "gpt-5.3-codex-spark"
+# Default cheap-triage model: the efficient GPT-5.6 variant for the frequent,
+# narrow approve/noop routing decisions.
+DEFAULT_TRIAGE_MODEL = MODEL_GPT_5_6_LUNA
 
 APPROVAL_TRIAGE_ENABLED_ENV = "SENTINEL_APPROVAL_TRIAGE_ENABLED"
 APPROVAL_TRIAGE_MODEL_ENV = "SENTINEL_APPROVAL_TRIAGE_MODEL"

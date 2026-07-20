@@ -36,7 +36,7 @@ absorbing correction, and refuses to accept "done" until the work actually
 survives review. You leave. It works. You come back to a final report.
 
 ```text
-[SYSTEM]     settings: task=task.md coder-mod=gpt-5.5 super-mod=gpt-5.5 completion-review=true adversary=true
+[SYSTEM]     settings: task=task.md coder-mod=gpt-5.6-sol runtime-mod=gpt-5.6-sol completion-mod=gpt-5.6-sol adversary-mod=gpt-5.6-sol
 [CODER]      Logic tests are green. Running the browser smoke check next.
 [TOOL]       command completed: node --test  exit=0
 [APPROVAL]   accept: headless browser run against the local page is exactly the validation the task asks for
@@ -114,23 +114,32 @@ Sentinel's design attacks that directly:
 flowchart LR
     You(["You"]) -->|"task.md"| S["Sentinel"]
     S <--> C["Codex coder<br/>(persistent thread)"]
-    C -->|"commands, edits,<br/>escalations"| P{"policy"}
+    C <--> W["disposable workspace<br/>network off"]
+    C -->|"sandbox boundary<br/>request"| P{"policy"}
     P -->|"safe"| OK["auto-approve"]
     P -->|"dangerous"| NO["auto-deny"]
     P -->|"gray zone"| J["supervisor turn<br/>(fresh context)"]
     C -->|"ready"| G["completion review<br/>+ adversarial tester"]
     G -->|"defects"| C
-    G -->|"clean"| R["FINAL_REPORT.md"]
+    G -->|"clean"| A["validate + apply patch"]
+    A --> R["project + FINAL_REPORT.md"]
 ```
 
-- **Deterministic policy first:** safe inspection and normal workspace edits
-  are approved instantly; secrets, grading paths, broad deletes, and
-  deploy/publish/git-force operations are denied instantly.
+- **Sandbox first:** by default the coder works in a disposable copy of the
+  project with network access off. Normal edits and local commands stay inside
+  that copy, while the real project remains unchanged during the run.
+- **Deterministic policy at the boundary:** requests to leave the sandbox are
+  checked immediately. Secrets, grading paths, broad deletes, and
+  deploy/publish/git-force operations are denied.
 - **Judgment where it belongs:** everything in between goes to a stateless
   supervisor turn that judges the action against the task and project state:
   the same command can be legitimate in one project and cheating in another.
 - **Fail closed:** if the supervisor can't be reached or returns garbage, the
   action is declined, never waved through.
+- **Checked handoff:** after acceptance, Sentinel validates the final paths and
+  symlinks, applies the patch to the real project, and verifies the result.
+  Work from an interrupted or rejected run is kept under
+  `.supervisor/recovery/` instead of being silently discarded.
 
 ## Requirements
 
@@ -203,16 +212,25 @@ sentinel config
 It creates and edits `.supervisor/config.json`. Every value is saved as you
 press Enter; future runs in this folder use these settings automatically.
 
+Coder, runtime supervisor, completion reviewer, and adversary are configured
+independently. For each role, select the GPT-5.6 family first and then use its
+variant row to choose Sol, Terra, or Luna. GPT-5.5 remains available; older
+model families are not offered.
+
 **Resolution order:** CLI flag → project config → built-in default. Flags
 apply to one run and never rewrite the saved config.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `task` | absent | Default task file for this folder. When set, plain `sentinel` runs it; `--task` always overrides. |
-| `coder_mod` | `gpt-5.5` | Model for the coder thread. |
-| `super_mod` | `gpt-5.5` | Model for supervisor turns. This is the judging brain; don't economize here. |
-| `coder_intelligence` | `xhigh` | Coder reasoning effort: `low` / `medium` / `high` / `xhigh`. |
-| `super_intelligence` | `xhigh` | Supervisor reasoning effort. |
+| `coder_mod` | `gpt-5.6-sol` | Model for the coder thread. GPT-5.6 variants: Sol, Terra, or Luna; GPT-5.5 is also available. |
+| `runtime_mod` | `gpt-5.6-sol` | Model for short, fresh-context runtime checks, including risky-action judgment and drift detection. |
+| `completion_mod` | `gpt-5.6-sol` | Model for the independent completion review that accepts or returns finished work. |
+| `adversary_mod` | `gpt-5.6-sol` | Model for the adversarial tester. |
+| `coder_intelligence` | `xhigh` | Coder reasoning effort. Sol/Terra: `low` through `ultra`; Luna: through `max`; GPT-5.5: through `xhigh`. |
+| `runtime_intelligence` | `xhigh` | Runtime supervisor reasoning effort, limited by the selected runtime model. |
+| `completion_intelligence` | `xhigh` | Completion reviewer reasoning effort, limited by the selected completion model. |
+| `adversary_intelligence` | `xhigh` | Adversarial tester reasoning effort, limited by the selected adversary model. |
 | `speed` | `usual` | `fast` uses the Codex Fast service tier for coder and supervisor turns. |
 | `start_over` | `true` | Reinitialize `.supervisor/` state at launch: start the task fresh instead of resuming the previous run. Does **not** touch your code. |
 | `completion_review` | `true` | The final exam. `true`: the coder's "ready" triggers an independent review that accepts or returns the work. `false` (everyday mode): the coder's readiness marker finishes the run directly. |
@@ -252,8 +270,14 @@ Run flags (each overrides the saved config for one run):
 | Flag | Meaning |
 | --- | --- |
 | `--task PATH` | Task file to run. |
-| `--coder-mod M --super-mod M` | Models for coder / supervisor (must be passed together). |
-| `--coder-intelligence V` / `--super-intelligence V` | Reasoning effort: `low`–`xhigh`. |
+| `--coder-mod M` | Coder model. |
+| `--runtime-mod M` | Runtime supervisor model. |
+| `--completion-mod M` | Completion reviewer model. |
+| `--adversary-mod M` | Adversarial tester model. |
+| `--coder-intelligence V` | Coder reasoning effort. |
+| `--runtime-intelligence V` | Runtime supervisor reasoning effort. |
+| `--completion-intelligence V` | Completion reviewer reasoning effort. |
+| `--adversary-intelligence V` | Adversarial tester reasoning effort. |
 | <code>--fast[=true&#124;false]</code> | Codex Fast service tier. |
 | <code>--start-over[=true&#124;false]</code> | Fresh `.supervisor/` state. |
 | <code>--completion-review[=true&#124;false]</code> | Final review gate on/off (`false` = everyday mode, disables the adversary). |
@@ -273,9 +297,14 @@ For the curious. None of this needs configuring:
 - **Terminal lanes:** `[SYSTEM]` runtime state, `[CODER]` coder messages,
   `[TOOL]` completed actions, `[APPROVAL]`/`[DENIED]` approval outcomes,
   `[SUPERVISOR]` decisions and steering, `[ADVERSARY]` the final tester.
-- **Approvals:** Codex app-server routes every approval request to Sentinel.
-  Deterministic policy answers the clear cases; gray-zone requests get a fresh
-  stateless supervisor turn; supervisor failure or timeout fails closed.
+- **Isolation and approvals:** the coder runs in a disposable workspace-write
+  sandbox with network access disabled. Codex app-server routes requests that
+  cross that boundary to Sentinel. Deterministic policy answers the clear
+  cases; gray-zone requests get a fresh stateless supervisor turn; supervisor
+  failure or timeout fails closed. Network approvals are one-shot rather than
+  persistent command-prefix rules. App-server uses a run-local rule store, so
+  command prefixes previously approved in ordinary Codex sessions cannot
+  bypass Sentinel; authentication, config, skills, and plugins remain shared.
   The adversarial tester runs in a disposable workspace snapshot with the same
   fail-closed rules.
 - **Restarts:** a restart interrupts the coder, writes a structured
@@ -288,7 +317,8 @@ For the curious. None of this needs configuring:
 - **Prompts:** all supervisor and coder prompt text lives in one TOML file
   (`supervisor/prompts/prompts.toml`), loaded at runtime.
 - **State:** everything durable lives in `.supervisor/` as plain markdown and
-  JSONL, inspectable during the run and after it.
+  JSONL, inspectable during the run and after it. Recovery workspaces from runs
+  that did not apply cleanly are retained in `.supervisor/recovery/`.
 
 ## License
 

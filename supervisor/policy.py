@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -704,27 +705,6 @@ def parse_command(command: str) -> tuple[list[str] | None, str | None]:
     return tokens, None
 
 
-def deterministic_task_command_reason(workspace: Path, command: str, cwd: str | None = None) -> str | None:
-    """Return an allow/noop reason for narrow task-local build/test commands."""
-    tokens = _deterministic_task_command_tokens(command)
-    if not tokens:
-        return None
-    cwd_path = _resolve_outside_candidate(cwd, cwd=workspace) if cwd else workspace.resolve()
-    if cwd_path is None:
-        return None
-    if _safe_make_command(tokens):
-        return "routine make build/test command"
-    if _safe_visible_tests_command(tokens, workspace.resolve(), cwd_path):
-        return "routine visible test script"
-    if _safe_public_pytest_command(tokens, workspace.resolve(), cwd_path):
-        return "routine public pytest command"
-    if _safe_c_compiler_command(tokens, workspace.resolve(), cwd_path):
-        return "routine c_compiler command"
-    if _safe_pycache_cleanup_command(tokens, workspace.resolve(), cwd_path):
-        return "routine pycache cleanup"
-    return None
-
-
 def auto_allow_block_reason(tags: set[str]) -> str | None:
     blocked = tags & AUTO_ALLOW_BLOCK_RISK_TAGS
     if not blocked:
@@ -738,22 +718,6 @@ def auto_allow_block_reason(tags: set[str]) -> str | None:
     if "ambiguous_parse" in blocked:
         return "command path analysis is ambiguous"
     return "command risk requires LLM judgment: " + ", ".join(sorted(blocked))
-
-
-def _deterministic_task_command_tokens(command: str) -> list[str] | None:
-    tokens, problem = parse_command(command)
-    if tokens is None:
-        return None
-    shell_payload = _shell_payload_from_tokens(tokens)
-    if shell_payload is not None:
-        tokens, problem = parse_command(shell_payload)
-        if tokens is None or problem:
-            return None
-    elif problem:
-        return None
-    if not tokens or _has_env_prefix(tokens):
-        return None
-    return tokens
 
 
 def _shell_payload_from_tokens(tokens: list[str]) -> str | None:
@@ -771,220 +735,8 @@ def _shell_payload_from_tokens(tokens: list[str]) -> str | None:
     return None
 
 
-def _has_env_prefix(tokens: list[str]) -> bool:
-    if not tokens:
-        return False
-    if Path(tokens[0]).name == "env":
-        return True
-    name, sep, _value = tokens[0].partition("=")
-    return bool(sep and name and (name[0].isalpha() or name[0] == "_") and all(ch.isalnum() or ch == "_" for ch in name))
-
-
-def _command_basename(tokens: list[str]) -> str:
-    return Path(tokens[0]).name.lower() if tokens else ""
-
-
-def _safe_make_command(tokens: list[str]) -> bool:
-    if _command_basename(tokens) != "make":
-        return False
-    index = 1
-    while index < len(tokens):
-        arg = tokens[index]
-        if arg == "-j":
-            if index + 1 >= len(tokens) or not tokens[index + 1].isdigit():
-                return False
-            index += 2
-            continue
-        if arg.startswith("-j") and arg[2:].isdigit():
-            index += 1
-            continue
-        if arg == "--jobs":
-            if index + 1 >= len(tokens) or not tokens[index + 1].isdigit():
-                return False
-            index += 2
-            continue
-        if arg.startswith("--jobs=") and arg.split("=", 1)[1].isdigit():
-            index += 1
-            continue
-        return False
-    return True
-
-
-def _safe_visible_tests_command(tokens: list[str], workspace: Path, cwd: Path) -> bool:
-    if len(tokens) != 1:
-        return False
-    path = _resolve_candidate_path(tokens[0], cwd=cwd)
-    if path is None:
-        return False
-    try:
-        return path.relative_to(workspace) == Path("run_visible_tests.sh")
-    except ValueError:
-        return False
-
-
-def _safe_public_pytest_command(tokens: list[str], workspace: Path, cwd: Path) -> bool:
-    pytest_args: list[str] | None = None
-    executable = _command_basename(tokens)
-    if executable in {"pytest", "py.test"}:
-        pytest_args = tokens[1:]
-    elif _is_python_executable_name(executable) and len(tokens) >= 3 and tokens[1:3] == ["-m", "pytest"]:
-        pytest_args = tokens[3:]
-    if pytest_args is None:
-        return False
-    targets = _pytest_target_args(pytest_args)
-    if not targets:
-        return False
-    if not _pytest_option_values_are_safe(pytest_args, workspace, cwd):
-        return False
-    public_root = workspace / "tests" / "public"
-    return all(_path_arg_is_under(_strip_pytest_selector(target), public_root, cwd=cwd) for target in targets)
-
-
-def _is_python_executable_name(name: str) -> bool:
-    return name == "python" or name == "python3" or (
-        name.startswith("python3.") and name.removeprefix("python3.").isdigit()
-    )
-
-
-def _pytest_target_args(args: list[str]) -> list[str]:
-    targets: list[str] = []
-    index = 0
-    options_with_values = {
-        "-c",
-        "-k",
-        "-m",
-        "--basetemp",
-        "--cache-clear",
-        "--capture",
-        "--color",
-        "--confcutdir",
-        "--continue-on-collection-errors",
-        "--ignore",
-        "--ignore-glob",
-        "--junitxml",
-        "--maxfail",
-        "--rootdir",
-        "--tb",
-    }
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            targets.extend(item for item in args[index + 1 :] if item)
-            break
-        if arg.startswith("--") and "=" in arg:
-            index += 1
-            continue
-        if arg in options_with_values:
-            index += 2
-            continue
-        if arg.startswith("-"):
-            index += 1
-            continue
-        targets.append(arg)
-        index += 1
-    return targets
-
-
-def _pytest_option_values_are_safe(args: list[str], workspace: Path, cwd: Path) -> bool:
-    for arg in args:
-        value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else arg
-        if any(part in CHEATING_WORKSPACE_PATH_PARTS for part in _lower_pathish_parts(value)):
-            return False
-        if _looks_pathish(value):
-            resolved = _resolve_candidate_path(_strip_pytest_selector(value), cwd=cwd)
-            if resolved is None:
-                return False
-            if _is_tmp_scratch_path(resolved):
-                continue
-            if not _is_relative_to(resolved, workspace):
-                return False
-            if is_supervisor_runtime_path(workspace, resolved):
-                return False
-            if is_protected_path(workspace, resolved):
-                return False
-    return True
-
-
-def _safe_c_compiler_command(tokens: list[str], workspace: Path, cwd: Path) -> bool:
-    executable = _resolve_candidate_path(tokens[0], cwd=cwd)
-    if executable is None or executable.name != "c_compiler":
-        return False
-    try:
-        executable.relative_to(workspace)
-    except ValueError:
-        return False
-    args = tokens[1:]
-    if len(args) != 3 or "-o" not in args:
-        return False
-    output_index = args.index("-o")
-    if output_index == 0:
-        input_arg = args[2]
-        output_arg = args[1]
-    elif output_index == 1:
-        input_arg = args[0]
-        output_arg = args[2]
-    else:
-        return False
-    return _path_arg_is_workspace_or_tmp(input_arg, workspace, cwd=cwd) and _path_arg_is_workspace_or_tmp(
-        output_arg,
-        workspace,
-        cwd=cwd,
-    )
-
-
-def _safe_pycache_cleanup_command(tokens: list[str], workspace: Path, cwd: Path) -> bool:
-    if _command_basename(tokens) != "rm":
-        return False
-    recursive = any(token.startswith("-") and "r" in token for token in tokens[1:])
-    force = any(token.startswith("-") and "f" in token for token in tokens[1:])
-    targets = [token for token in tokens[1:] if token and not token.startswith("-")]
-    if not recursive or not force or len(targets) != 1:
-        return False
-    target = _resolve_candidate_path(targets[0], cwd=cwd)
-    if target is None:
-        return False
-    try:
-        return target.relative_to(workspace) == Path("tests/__pycache__")
-    except ValueError:
-        return False
-
-
 def _strip_pytest_selector(value: str) -> str:
     return value.split("::", 1)[0]
-
-
-def _path_arg_is_under(raw: str, root: Path, *, cwd: Path) -> bool:
-    path = _resolve_candidate_path(raw, cwd=cwd)
-    return path is not None and (path == root or _is_relative_to(path, root))
-
-
-def _path_arg_is_workspace_or_tmp(raw: str, workspace: Path, *, cwd: Path) -> bool:
-    path = _resolve_candidate_path(raw, cwd=cwd)
-    if path is None:
-        return False
-    if _is_tmp_scratch_path(path):
-        return True
-    if not _is_relative_to(path, workspace):
-        return False
-    if is_supervisor_runtime_path(workspace, path):
-        return False
-    return not is_protected_path(workspace, path)
-
-
-def _is_tmp_scratch_path(path: Path) -> bool:
-    tmp_root = Path("/tmp").resolve()
-    try:
-        relative = path.relative_to(tmp_root)
-    except ValueError:
-        return False
-    if any(part.lower() in CHEATING_WORKSPACE_PATH_PARTS for part in relative.parts):
-        return False
-    if any(part.lower() in SECRET_PATH_PARTS for part in relative.parts):
-        return False
-    name = path.name.lower()
-    if any(fragment in name for fragment in SECRET_NAME_PARTS):
-        return False
-    return not any(fnmatch.fnmatch(name, pattern.lower()) for pattern in SECRET_FILE_GLOBS)
 
 
 def _resolve_candidate_path(raw: str, *, cwd: Path) -> Path | None:
@@ -1178,11 +930,13 @@ def tracked_delete_problem(tokens: list[str], workspace: Path) -> str | None:
 
 
 def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, is_dir: bool) -> bool:
+    env = _isolated_git_query_environment()
     try:
         if is_dir:
             completed = subprocess.run(
-                ["git", "ls-files", "--", rel_path.rstrip("/") + "/"],
+                ["git", "-c", "core.fsmonitor=false", "ls-files", "--", rel_path.rstrip("/") + "/"],
                 cwd=workspace,
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -1190,8 +944,9 @@ def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, 
             )
             return bool(completed.stdout.strip())
         completed = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", rel_path],
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", rel_path],
             cwd=workspace,
+            env=env,
             capture_output=True,
             text=True,
             timeout=3,
@@ -1200,6 +955,30 @@ def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, 
         return completed.returncode == 0
     except Exception:
         return False
+
+
+def _isolated_git_query_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    blocked = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }
+    for key in list(env):
+        if key in blocked or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            env.pop(key, None)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
 
 
 SENTINEL_CLI_NAMES = {"sentinel", "supervisor"}
@@ -1246,7 +1025,13 @@ def command_mentions_supervisor(command: str) -> bool:
 
 
 class PolicyEngine:
-    def __init__(self, workspace: Path, *, declared_grading_roots: Iterable[str | os.PathLike[str]] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        declared_grading_roots: Iterable[str | os.PathLike[str]] | None = None,
+        immutable_paths: Iterable[str | os.PathLike[str]] | None = None,
+    ):
         self.workspace = workspace.resolve()
         roots: list[Path] = []
         for raw in declared_grading_roots or ():
@@ -1255,6 +1040,12 @@ class PolicyEngine:
                 roots.append(resolved)
         roots.extend(_declared_roots_from_env())
         self.declared_grading_roots = tuple(dict.fromkeys(roots))
+        immutable: list[Path] = []
+        for raw in immutable_paths or ():
+            resolved = _resolve_outside_candidate(raw, cwd=self.workspace)
+            if resolved is not None:
+                immutable.append(resolved)
+        self.immutable_paths = tuple(dict.fromkeys(immutable))
 
     def evaluate(self, payload: dict[str, Any]) -> PolicyDecision:
         command = payload.get("command")
@@ -1264,6 +1055,9 @@ class PolicyEngine:
         cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
 
         raw_paths = extract_paths(payload)
+        immutable_hit = self._immutable_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
+        if immutable_hit is not None and (operation == "write" or tool_name in WRITE_TOOLS):
+            return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")
         grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
         if grading_hit is not None:
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
@@ -1312,6 +1106,48 @@ class PolicyEngine:
     def _declared_grading_hit_for_raw_paths(self, raw_paths: Iterable[str], *, cwd: Path) -> str | None:
         for raw in raw_paths:
             hit = _declared_grading_path_hit(raw, cwd=cwd, roots=self.declared_grading_roots)
+            if hit is not None:
+                return hit
+        return None
+
+    def _immutable_hit_for_raw_paths(self, raw_paths: Iterable[str], *, cwd: Path) -> str | None:
+        for raw in raw_paths:
+            hit = _declared_grading_path_hit(raw, cwd=cwd, roots=self.immutable_paths)
+            if hit is not None:
+                return hit
+        return None
+
+    def _command_immutable_hit(self, analysis: CommandAnalysis, *, cwd: str | None) -> str | None:
+        if not self.immutable_paths:
+            return None
+        for immutable in self.immutable_paths:
+            immutable_text = str(immutable).rstrip(os.sep) or os.sep
+            escaped = re.escape(immutable_text)
+            if re.search(rf"(?<![\w./-]){escaped}(?=$|[/\s'\";&|()])", analysis.command):
+                return str(immutable)
+        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        if cwd_path is None:
+            cwd_path = self.workspace
+        candidates = list(analysis.tokens)
+        shell_payload = _shell_payload_from_tokens(analysis.tokens)
+        if shell_payload:
+            nested_tokens, _problem = parse_command(shell_payload)
+            if nested_tokens:
+                candidates.extend(nested_tokens)
+        for token in candidates:
+            if token in SHELL_OPERATORS or token in SHELL_REDIRECT_OPERATORS or token in {"(", ")"}:
+                continue
+            if token.startswith("-") or "=" in token and "/" not in token:
+                continue
+            token_path = Path(token.strip("'\"")).expanduser()
+            roots = self.immutable_paths
+            if not token_path.is_absolute():
+                roots = tuple(
+                    root
+                    for root in roots
+                    if not (root.is_dir() and not _is_relative_to(root, self.workspace))
+                )
+            hit = _declared_grading_path_hit(token, cwd=cwd_path, roots=roots)
             if hit is not None:
                 return hit
         return None
@@ -1378,6 +1214,9 @@ class PolicyEngine:
             analysis.risk_tags.add(GRADING_PATH_RISK_TAG)
             payload["risk_tags"] = sorted(analysis.risk_tags)
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}", **payload)
+        immutable_hit = self._command_immutable_hit(analysis, cwd=cwd)
+        if immutable_hit is not None:
+            return PolicyDecision.deny(f"immutable path access escalation denied: {immutable_hit}", **payload)
         if command_invokes_sentinel_cli(analysis):
             return PolicyDecision.deny("commands invoking Sentinel are denied", **payload)
         if command_mentions_supervisor(command):
@@ -1401,9 +1240,6 @@ class PolicyEngine:
             return PolicyDecision.deny(tracked_problem, **payload)
         if is_recursive_delete_outside(tokens, self.workspace):
             return PolicyDecision.deny("recursive deletion outside workspace denied", **payload)
-        deterministic_reason = deterministic_task_command_reason(self.workspace, command, cwd=cwd)
-        if deterministic_reason is not None:
-            return PolicyDecision.allow(deterministic_reason, **payload)
         block_reason = auto_allow_block_reason(analysis.risk_tags)
         if block_reason is not None:
             return PolicyDecision.route_llm(block_reason, **payload)
@@ -1441,9 +1277,18 @@ class PolicyEngine:
             return PolicyDecision.route_llm("apply_patch input is not a patch")
         return self._evaluate_patch_paths(patch_paths)
 
+    def evaluate_patch_paths(self, raw_paths: list[str]) -> PolicyDecision:
+        return self._evaluate_patch_paths(raw_paths)
+
     def _evaluate_patch_paths(self, raw_paths: list[str]) -> PolicyDecision:
         if not raw_paths:
             return PolicyDecision.route_llm("patch paths could not be determined")
+        immutable_hit = self._immutable_hit_for_raw_paths(raw_paths, cwd=self.workspace)
+        if immutable_hit is not None:
+            return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")
+        grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=self.workspace)
+        if grading_hit is not None:
+            return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
         paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
         if path_problem:
             return PolicyDecision.route_llm(path_problem)

@@ -6,16 +6,31 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_MODEL = "gpt-5.5"
+MODEL_GPT_5_6_SOL = "gpt-5.6-sol"
+MODEL_GPT_5_6_TERRA = "gpt-5.6-terra"
+MODEL_GPT_5_6_LUNA = "gpt-5.6-luna"
+MODEL_GPT_5_5 = "gpt-5.5"
+GPT_5_6_MODELS = (
+    MODEL_GPT_5_6_SOL,
+    MODEL_GPT_5_6_TERRA,
+    MODEL_GPT_5_6_LUNA,
+)
+SUPPORTED_MODEL_CHOICES = (*GPT_5_6_MODELS, MODEL_GPT_5_5)
+DEFAULT_MODEL = MODEL_GPT_5_6_SOL
 DEFAULT_INTELLIGENCE = "xhigh"
-INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
+BASE_INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
+INTELLIGENCE_CHOICES = (*BASE_INTELLIGENCE_CHOICES, "max", "ultra")
 SPEED_CHOICES = ("usual", "fast")
 RUNTIME_SYNC_FIELDS = (
     "task",
     "coder_mod",
-    "super_mod",
+    "runtime_mod",
+    "completion_mod",
+    "adversary_mod",
     "coder_intelligence",
-    "super_intelligence",
+    "runtime_intelligence",
+    "completion_intelligence",
+    "adversary_intelligence",
     "speed",
     "start_over",
     "completion_review",
@@ -35,9 +50,13 @@ class ProjectConfigError(RuntimeError):
 class ProjectConfig:
     task: str | None = None
     coder_mod: str = DEFAULT_MODEL
-    super_mod: str = DEFAULT_MODEL
+    runtime_mod: str = DEFAULT_MODEL
+    completion_mod: str = DEFAULT_MODEL
+    adversary_mod: str = DEFAULT_MODEL
     coder_intelligence: str = DEFAULT_INTELLIGENCE
-    super_intelligence: str = DEFAULT_INTELLIGENCE
+    runtime_intelligence: str = DEFAULT_INTELLIGENCE
+    completion_intelligence: str = DEFAULT_INTELLIGENCE
+    adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
     start_over: bool = True
     completion_review: bool = True
@@ -55,9 +74,13 @@ class ProjectConfig:
         return {
             "task": self.task,
             "coder_mod": self.coder_mod,
-            "super_mod": self.super_mod,
+            "runtime_mod": self.runtime_mod,
+            "completion_mod": self.completion_mod,
+            "adversary_mod": self.adversary_mod,
             "coder_intelligence": self.coder_intelligence,
-            "super_intelligence": self.super_intelligence,
+            "runtime_intelligence": self.runtime_intelligence,
+            "completion_intelligence": self.completion_intelligence,
+            "adversary_intelligence": self.adversary_intelligence,
             "speed": self.speed,
             "start_over": self.start_over,
             "completion_review": self.completion_review,
@@ -71,6 +94,16 @@ class ProjectConfig:
 
 def default_project_config() -> ProjectConfig:
     return ProjectConfig()
+
+
+def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
+    if model in {MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA}:
+        return INTELLIGENCE_CHOICES
+    if model == MODEL_GPT_5_6_LUNA:
+        return (*BASE_INTELLIGENCE_CHOICES, "max")
+    if model == MODEL_GPT_5_5:
+        return BASE_INTELLIGENCE_CHOICES
+    return INTELLIGENCE_CHOICES
 
 
 def project_config_path(project_root: Path) -> Path:
@@ -153,33 +186,70 @@ def changed_project_config_fields(before: ProjectConfig, after: ProjectConfig) -
 
 def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfig:
     default = default_project_config()
+    coder_mod = _required_string(
+        _first_present(payload, ("coder_mod", "coder_model", "model"), default.coder_mod, skip_none=True),
+        "coder_model",
+        path=path,
+    )
+    legacy_super_mod = _required_string(
+        _first_present(payload, ("super_mod", "supervisor_model", "model"), default.runtime_mod, skip_none=True),
+        "supervisor_model",
+        path=path,
+    )
+    runtime_mod = _required_string(
+        _first_present(payload, ("runtime_mod", "runtime_model"), legacy_super_mod, skip_none=True),
+        "runtime_model",
+        path=path,
+    )
+    completion_mod = _required_string(
+        _first_present(payload, ("completion_mod", "completion_model"), legacy_super_mod, skip_none=True),
+        "completion_model",
+        path=path,
+    )
+    adversary_mod = _required_string(
+        _first_present(payload, ("adversary_mod", "adversary_model"), default.adversary_mod, skip_none=True),
+        "adversary_model",
+        path=path,
+    )
+    legacy_super_intelligence = _first_present(
+        payload,
+        ("super_intelligence", "supervisor_intelligence"),
+        default.runtime_intelligence,
+        skip_none=True,
+    )
     return ProjectConfig(
         task=_optional_string(_first_present(payload, ("task", "task_path"), default.task, skip_none=True), "task_path", path=path),
-        coder_mod=_required_string(
-            _first_present(payload, ("coder_mod", "coder_model", "model"), default.coder_mod, skip_none=True),
-            "coder_model",
-            path=path,
-        ),
-        super_mod=_required_string(
-            _first_present(payload, ("super_mod", "supervisor_model", "model"), default.super_mod, skip_none=True),
-            "supervisor_model",
-            path=path,
-        ),
+        coder_mod=coder_mod,
         coder_intelligence=_choice(
             _first_present(payload, ("coder_intelligence",), default.coder_intelligence, skip_none=True),
             "coder_intelligence",
-            INTELLIGENCE_CHOICES,
+            intelligence_choices_for_model(coder_mod),
             path=path,
         ),
-        super_intelligence=_choice(
+        runtime_mod=runtime_mod,
+        completion_mod=completion_mod,
+        adversary_mod=adversary_mod,
+        runtime_intelligence=_choice(
+            _first_present(payload, ("runtime_intelligence",), legacy_super_intelligence, skip_none=True),
+            "runtime_intelligence",
+            intelligence_choices_for_model(runtime_mod),
+            path=path,
+        ),
+        completion_intelligence=_choice(
+            _first_present(payload, ("completion_intelligence",), legacy_super_intelligence, skip_none=True),
+            "completion_intelligence",
+            intelligence_choices_for_model(completion_mod),
+            path=path,
+        ),
+        adversary_intelligence=_choice(
             _first_present(
                 payload,
-                ("super_intelligence", "supervisor_intelligence"),
-                default.super_intelligence,
+                ("adversary_intelligence",),
+                default.adversary_intelligence,
                 skip_none=True,
             ),
-            "supervisor_intelligence",
-            INTELLIGENCE_CHOICES,
+            "adversary_intelligence",
+            intelligence_choices_for_model(adversary_mod),
             path=path,
         ),
         speed=_speed_from_payload(payload, default.speed, path=path),
@@ -302,17 +372,34 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "task" in selected:
         updates["task"] = config.task
         updates["task_path"] = config.task or ""
-    if selected.intersection({"coder_mod", "super_mod"}):
+    model_fields = {"coder_mod", "runtime_mod", "completion_mod", "adversary_mod"}
+    if "coder_mod" in selected:
         updates["coder_mod"] = config.coder_mod
-        updates["super_mod"] = config.super_mod
-        updates["model"] = config.coder_mod if config.coder_mod == config.super_mod else None
         updates["coder_model"] = config.coder_mod
-        updates["supervisor_model"] = config.super_mod
+    if "runtime_mod" in selected:
+        updates["runtime_mod"] = config.runtime_mod
+        updates["runtime_model"] = config.runtime_mod
+        updates["super_mod"] = config.runtime_mod
+        updates["supervisor_model"] = config.runtime_mod
+    if "completion_mod" in selected:
+        updates["completion_mod"] = config.completion_mod
+        updates["completion_model"] = config.completion_mod
+    if "adversary_mod" in selected:
+        updates["adversary_mod"] = config.adversary_mod
+        updates["adversary_model"] = config.adversary_mod
+    if selected.intersection(model_fields):
+        shared_models = {config.coder_mod, config.runtime_mod, config.completion_mod}
+        updates["model"] = config.coder_mod if len(shared_models) == 1 else None
     if "coder_intelligence" in selected:
         updates["coder_intelligence"] = config.coder_intelligence
-    if "super_intelligence" in selected:
-        updates["super_intelligence"] = config.super_intelligence
-        updates["supervisor_intelligence"] = config.super_intelligence
+    if "runtime_intelligence" in selected:
+        updates["runtime_intelligence"] = config.runtime_intelligence
+        updates["super_intelligence"] = config.runtime_intelligence
+        updates["supervisor_intelligence"] = config.runtime_intelligence
+    if "completion_intelligence" in selected:
+        updates["completion_intelligence"] = config.completion_intelligence
+    if "adversary_intelligence" in selected:
+        updates["adversary_intelligence"] = config.adversary_intelligence
     if "speed" in selected:
         updates["speed"] = config.speed
         updates["fast"] = config.fast

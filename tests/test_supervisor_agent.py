@@ -69,6 +69,24 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
     assert audit["decision"]["reason"] == "state is consistent"
 
 
+def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("weakened after start", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    agent = StatelessSupervisorAgent(
+        object(),  # type: ignore[arg-type]
+        store,
+        task,
+        task_contents="strict original task",
+    )
+
+    packet = agent.build_packet(wake_sequence=1, current_summary="review")
+
+    assert packet.task_path == str(task)
+    assert packet.task_contents == "strict original task"
+
+
 async def test_completion_review_persists_use_case_and_decision(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")

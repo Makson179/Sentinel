@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from supervisor.config_editor import EditorState, Theme, WidthUtils, parameter_defs, render_editor
-from supervisor.project_config import ProjectConfig
+from supervisor.project_config import MODEL_GPT_5_5, MODEL_GPT_5_6_LUNA, MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA, ProjectConfig
 
 
 @pytest.fixture(autouse=True)
@@ -74,14 +74,30 @@ def test_config_editor_render_marks_active_selected_option() -> None:
 
 
 def test_config_editor_render_shows_numeric_limit_fields() -> None:
-    output = _render(width=120, height=32)
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    max_returns_index = [param.key for param in params].index("completion_returns_per_generation")
+    output = _render(
+        config,
+        EditorState(parameter_index=max_returns_index),
+        width=120,
+        height=20,
+    )
 
     assert "max-adversary-runs" in output
     assert "max-completion-returns-per-generation" in output
 
 
 def test_config_editor_completion_review_row_and_adversary_coupling() -> None:
-    output = _render(width=120, height=32)
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    completion_review_index = [param.key for param in params].index("completion_review")
+    output = _render(
+        config,
+        EditorState(parameter_index=completion_review_index),
+        width=120,
+        height=20,
+    )
     assert "completion-review" in output
 
     params = parameter_defs(ProjectConfig(completion_review=False, adversary=True, adversary_runs=2))
@@ -108,23 +124,62 @@ def test_config_editor_render_shows_inline_edit_value_cursor() -> None:
     assert "TASK.md▏" in output
 
 
-def test_config_editor_render_uses_dynamic_model_options() -> None:
-    config = ProjectConfig(coder_mod="project-coder", super_mod="project-super")
-    params = parameter_defs(config, model_choices=("alpha-model", "beta-model"))
+def test_config_editor_render_uses_family_and_variant_model_options() -> None:
+    config = ProjectConfig(
+        coder_mod=MODEL_GPT_5_6_TERRA,
+        runtime_mod=MODEL_GPT_5_6_SOL,
+        completion_mod=MODEL_GPT_5_6_LUNA,
+        adversary_mod=MODEL_GPT_5_5,
+    )
+    model_choices = (MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA, MODEL_GPT_5_6_LUNA, MODEL_GPT_5_5)
+    params = parameter_defs(config, model_choices=model_choices)
     coder_index = [param.key for param in params].index("coder_mod")
 
     output = _render(
         config,
         EditorState(parameter_index=coder_index, expanded_index=coder_index),
-        model_choices=("alpha-model", "beta-model"),
+        model_choices=model_choices,
         width=100,
         height=22,
     )
 
-    assert "alpha-model" in output
-    assert "beta-model" in output
-    assert "project-coder" in output
-    assert "project-super" in output
+    assert "GPT-5.6" in output
+    assert "GPT-5.5" in output
+    assert "coder-5.6-variant" in output
+    assert "Terra" in output
+
+
+def test_config_editor_render_has_independent_rows_for_all_agent_roles() -> None:
+    for role in ("coder", "runtime", "completion", "adversary"):
+        config = ProjectConfig()
+        params = parameter_defs(config)
+        effort_index = [param.key for param in params].index(f"{role}_intelligence")
+        output = _render(
+            config,
+            EditorState(parameter_index=effort_index),
+            width=120,
+            height=20,
+        )
+        assert f"{role}-mod" in output
+        assert f"{role}-5.6-variant" in output
+        assert f"{role}-intelligence" in output
+
+
+def test_config_editor_render_variant_row_has_sol_terra_luna_options() -> None:
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    variant_index = [param.key for param in params].index("coder_mod_variant")
+
+    output = _render(
+        config,
+        EditorState(parameter_index=variant_index, expanded_index=variant_index),
+        width=100,
+        height=22,
+    )
+
+    assert "Sol" in output
+    assert "Terra" in output
+    assert "Luna" in output
 
 
 def test_config_editor_render_middle_truncates_long_paths() -> None:
@@ -244,9 +299,14 @@ def test_config_editor_ascii_borders_are_opt_in(monkeypatch: pytest.MonkeyPatch)
 def test_config_editor_default_design_matches_reference_structure() -> None:
     config = ProjectConfig(speed="fast", start_over=False)
     params = parameter_defs(config)
-    super_index = [param.key for param in params].index("super_mod")
+    runtime_index = [param.key for param in params].index("runtime_mod")
 
-    output = _render(config, EditorState(parameter_index=super_index, expanded_index=super_index), width=120, height=30)
+    output = _render(
+        config,
+        EditorState(parameter_index=runtime_index, expanded_index=runtime_index),
+        width=120,
+        height=30,
+    )
 
     assert "CONFIG LOADED" in output
     assert "NAVIGATION" in output
@@ -257,6 +317,13 @@ def test_config_editor_default_design_matches_reference_structure() -> None:
     assert "esc back / exit" in output
     assert "STATUS" in output
     assert "TIPS" in output
-    assert "› ▾ ☆  super-mod" in output
-    assert re.search(r"⚡  speed\s+fast", output)
-    assert re.search(r"↻  start-over\s+false", output)
+    assert "› ▾ ☆  runtime-mod" in output
+    speed_index = [param.key for param in params].index("speed")
+    lower_output = _render(
+        config,
+        EditorState(parameter_index=speed_index),
+        width=120,
+        height=20,
+    )
+    assert re.search(r"⚡  speed\s+fast", lower_output)
+    assert re.search(r"↻  start-over\s+false", lower_output)

@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -30,14 +31,14 @@ from supervisor.appserver import AppServerClient, AppServerError, AppServerMessa
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
+    CODER_SANDBOX_WORKSPACE_WRITE,
     DEFAULT_INTELLIGENCE,
     CoderSession,
     coder_sandbox_mode,
     coder_thread_params,
 )
 from supervisor.health import kill_restart_candidate, patch_health
-from supervisor.policy import deterministic_task_command_reason
-from supervisor.project_config import ProjectConfig
+from supervisor.project_config import DEFAULT_MODEL, ProjectConfig
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
@@ -82,6 +83,14 @@ from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.task_select import resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
+from supervisor.workspace_snapshot import (
+    SnapshotPatchError,
+    WorkspaceSnapshot,
+    WorkspaceSnapshotError,
+    apply_snapshot_patch,
+    create_workspace_snapshot,
+    snapshot_git_environment,
+)
 from supervisor.workspace_clean import clean_workspace_except_task
 
 
@@ -168,8 +177,7 @@ BREADTH_FEATURE_TERMS = (
     "update",
     "validation",
 )
-DEFAULT_MODEL = "gpt-5.5"
-ADVERSARY_MODEL = "gpt-5.5"
+ADVERSARY_MODEL = DEFAULT_MODEL
 
 
 @dataclass(frozen=True)
@@ -232,8 +240,14 @@ class SentinelController:
         model: str | None = None,
         coder_model: str | None = None,
         supervisor_model: str | None = None,
+        runtime_model: str | None = None,
+        completion_model: str | None = None,
+        adversary_model: str | None = None,
         coder_intelligence: str | None = DEFAULT_INTELLIGENCE,
-        supervisor_intelligence: str | None = DEFAULT_INTELLIGENCE,
+        supervisor_intelligence: str | None = None,
+        runtime_intelligence: str | None = None,
+        completion_intelligence: str | None = None,
+        adversary_intelligence: str | None = DEFAULT_INTELLIGENCE,
         fast: bool = False,
         overwrite_state: bool = False,
         clean_workspace: bool = False,
@@ -246,17 +260,33 @@ class SentinelController:
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
+        self._canonical_task_contents = self.task_path.read_text(encoding="utf-8")
+        self._canonical_task_hash = _hash_file(self.task_path)
+        self.workspace_root = self.project_root
+        self.workspace_task_path = self.task_path
+        self._coder_snapshot: WorkspaceSnapshot | None = None
+        self._snapshot_patch_applied = False
+        self._coder_started = False
         if clean_workspace:
             clean_workspace_except_task(self.project_root, self.task_path)
         self.store = StateStore(self.project_root)
-        self.coder_model, self.supervisor_model = _resolve_controller_models(
+        self.coder_model, self.runtime_model, self.completion_model, self.adversary_model = _resolve_controller_models(
             model=model,
             coder_model=coder_model,
             supervisor_model=supervisor_model,
+            runtime_model=runtime_model,
+            completion_model=completion_model,
+            adversary_model=adversary_model,
         )
-        self.model = self.coder_model if self.coder_model == self.supervisor_model else None
+        self.supervisor_model = self.runtime_model
+        shared_models = {self.coder_model, self.runtime_model, self.completion_model}
+        self.model = self.coder_model if len(shared_models) == 1 else None
         self.coder_intelligence = coder_intelligence
-        self.supervisor_intelligence = supervisor_intelligence
+        legacy_supervisor_intelligence = supervisor_intelligence or DEFAULT_INTELLIGENCE
+        self.runtime_intelligence = runtime_intelligence or legacy_supervisor_intelligence
+        self.completion_intelligence = completion_intelligence or legacy_supervisor_intelligence
+        self.adversary_intelligence = adversary_intelligence or DEFAULT_INTELLIGENCE
+        self.supervisor_intelligence = self.runtime_intelligence
         self.fast = fast
         self.overwrite_state = overwrite_state
         self.clean_workspace = clean_workspace
@@ -277,6 +307,7 @@ class SentinelController:
         )
         self.tui = tui or TerminalTUI()
         self.supervisor: StatelessSupervisorAgent | None = None
+        self.completion_supervisor: StatelessSupervisorAgent | None = None
         self.approvals: ApprovalManager | None = None
         self.approval_triage_config: CheapApprovalTriageConfig = cheap_approval_triage_config_from_env()
         self.approval_triage_reviewer: CheapApprovalReviewer | None = None
@@ -342,6 +373,7 @@ class SentinelController:
             await self.tui.start()
             self.running = True
             self.tui.render("SYSTEM", self._runtime_settings_summary())
+            self._prepare_coder_workspace()
             if self._adversary_enabled_for_config() and not self._effective_completion_review():
                 self.tui.render(
                     "SYSTEM",
@@ -354,37 +386,60 @@ class SentinelController:
                 self.client,
                 self.store,
                 self.task_path,
-                model=self._supervisor_model(),
+                workspace_root=self._active_workspace_root(),
+                task_contents=self._canonical_task_contents,
+                model=self._runtime_model(),
                 fast=self._fast_mode(),
-                intelligence=self._supervisor_intelligence(),
+                intelligence=self._runtime_intelligence(),
+            )
+            self.completion_supervisor = StatelessSupervisorAgent(
+                self.client,
+                self.store,
+                self.task_path,
+                workspace_root=self._active_workspace_root(),
+                task_contents=self._canonical_task_contents,
+                model=self._completion_model(),
+                fast=self._fast_mode(),
+                intelligence=self._completion_intelligence(),
             )
             self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
             self.approvals = ApprovalManager(
-                self.project_root,
+                self._active_workspace_root(),
                 supervisor=self,
                 cheap_reviewer=self.approval_triage_reviewer,
                 declared_grading_roots=self.declared_grading_roots,
+                immutable_paths=self._immutable_approval_paths(),
                 cheap_review_timeout_seconds=self.approval_triage_config.timeout_seconds,
             )
             self.coder = CoderSession(
                 self.client,
                 self.store,
-                self.project_root,
-                self.task_path,
+                self._active_workspace_root(),
+                self._active_task_path(),
                 model=self._coder_model(),
                 fast=self._fast_mode(),
                 intelligence=self._coder_intelligence(),
             )
             await self.coder.start_thread()
+            self._coder_started = True
             await self.coder.start_initial_turn()
             self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
             self.tui.status("supervised coder started")
             await self.event_loop()
         except (AppServerError, SupervisorAgentError) as exc:
             await self.fail_provider(f"app-server RPC failed: {exc}")
+        except WorkspaceSnapshotError as exc:
+            await self.fail_provider(f"run infrastructure failed: {exc}")
         finally:
             self.running = False
             await self._stop_supervisor_task()
+            snapshot = getattr(self, "_coder_snapshot", None)
+            if snapshot is not None and not getattr(self, "_snapshot_patch_applied", False):
+                if getattr(self, "_coder_started", False):
+                    await self._preserve_snapshot_for_recovery(snapshot, reason="unhandled_shutdown")
+                else:
+                    snapshot.cleanup()
+                    self._coder_snapshot = None
             await self.tui.stop()
             await self.client.stop()
 
@@ -396,18 +451,27 @@ class SentinelController:
             task_path=project_config.task or "",
             task_hash=_hash_file(self.task_path),
             coder_mod=project_config.coder_mod,
-            super_mod=project_config.super_mod,
+            super_mod=project_config.runtime_mod,
+            runtime_mod=project_config.runtime_mod,
+            completion_mod=project_config.completion_mod,
+            adversary_mod=project_config.adversary_mod,
             coder_intelligence=project_config.coder_intelligence,
-            super_intelligence=project_config.super_intelligence,
+            super_intelligence=project_config.runtime_intelligence,
+            runtime_intelligence=project_config.runtime_intelligence,
+            completion_intelligence=project_config.completion_intelligence,
+            adversary_intelligence=project_config.adversary_intelligence,
             speed=project_config.speed,
             start_over=project_config.start_over,
             adversary=project_config.adversary,
             clean=project_config.clean,
             protected_path=list(project_config.protected_path),
-            model=project_config.coder_mod if project_config.coder_mod == project_config.super_mod else None,
+            model=_shared_primary_model(project_config),
             coder_model=project_config.coder_mod,
-            supervisor_model=project_config.super_mod,
-            supervisor_intelligence=project_config.super_intelligence,
+            supervisor_model=project_config.runtime_mod,
+            runtime_model=project_config.runtime_mod,
+            completion_model=project_config.completion_mod,
+            adversary_model=project_config.adversary_mod,
+            supervisor_intelligence=project_config.runtime_intelligence,
             fast=project_config.fast,
             protected_paths=list(project_config.protected_path),
             max_adversary_runs=self._configured_adversary_runs(project_config),
@@ -424,10 +488,16 @@ class SentinelController:
         self.store.update_sentinel_config(
             lambda cfg: cfg.model_copy(
                 update={
-                    "model": project_config.coder_mod if project_config.coder_mod == project_config.super_mod else None,
+                    "model": _shared_primary_model(project_config),
                     "coder_model": project_config.coder_mod,
-                    "supervisor_model": project_config.super_mod,
-                    "supervisor_intelligence": project_config.super_intelligence,
+                    "supervisor_model": project_config.runtime_mod,
+                    "runtime_model": project_config.runtime_mod,
+                    "completion_model": project_config.completion_mod,
+                    "adversary_model": project_config.adversary_mod,
+                    "runtime_intelligence": project_config.runtime_intelligence,
+                    "completion_intelligence": project_config.completion_intelligence,
+                    "adversary_intelligence": project_config.adversary_intelligence,
+                    "supervisor_intelligence": project_config.runtime_intelligence,
                     "fast": project_config.fast,
                     "protected_paths": list(project_config.protected_path),
                     "max_adversary_runs": self._configured_adversary_runs(project_config),
@@ -437,11 +507,119 @@ class SentinelController:
             )
         )
 
+    def _active_workspace_root(self) -> Path:
+        return Path(getattr(self, "workspace_root", self.project_root)).resolve()
+
+    def _active_task_path(self) -> Path:
+        return Path(getattr(self, "workspace_task_path", self.task_path)).resolve()
+
+    def _canonical_task_text(self) -> str:
+        return getattr(self, "_canonical_task_contents", _read_task_text(self.task_path))
+
+    def _immutable_approval_paths(self) -> tuple[Path, ...]:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is not None:
+            return (snapshot.original_root, self.task_path)
+        task_path = getattr(self, "task_path", None)
+        return (Path(task_path),) if task_path is not None else ()
+
+    def _task_integrity_issue(self) -> str | None:
+        expected_hash = getattr(self, "_canonical_task_hash", None)
+        if expected_hash:
+            try:
+                current_hash = _hash_file(self.task_path)
+            except OSError:
+                return "the original task file is missing or unreadable"
+            if current_hash != expected_hash:
+                return "the original task file changed after the run started"
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is None:
+            return None
+        snapshot_task = snapshot.snapshot_root / snapshot.task_relative_path
+        if not snapshot_task.is_symlink():
+            return "the coder workspace replaced or removed the read-only task link"
+        try:
+            if snapshot_task.resolve(strict=True) != self.task_path.resolve(strict=True):
+                return "the coder workspace redirected the read-only task link"
+        except OSError:
+            return "the coder workspace task link is broken"
+        return None
+
+    def _repair_snapshot_runtime_controls(self, *, source: str) -> tuple[str, ...]:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is None:
+            return ()
+        repaired = list(snapshot.restore_runtime_links())
+        if snapshot.restore_git_control():
+            repaired.append("git_config")
+        if not repaired:
+            return ()
+        detail = ", ".join(repaired)
+        message = f"restored replaced coder workspace runtime control(s): {detail} ({source})"
+        self.store.append_text_locked(PROGRESS, f"- Integrity guard: {message}.\n")
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "coder_workspace_runtime_controls_restored",
+                "source": source,
+                "repaired": list(repaired),
+            }
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "integrity/runtime_controls_restored",
+            reason=message,
+        )
+        cfg = self.store.get_sentinel_config()
+        patch_health(
+            self.store,
+            HealthDelta(generation=cfg.generation, add_risk_signals=["runtime_control_replacement"]),
+        )
+        self.tui.render("INTEGRITY", message)
+        return tuple(repaired)
+
+    def _uses_coder_snapshot(self) -> bool:
+        return coder_sandbox_mode() == CODER_SANDBOX_WORKSPACE_WRITE
+
+    def _prepare_coder_workspace(self) -> None:
+        if not self._uses_coder_snapshot():
+            self.workspace_root = self.project_root
+            self.workspace_task_path = self.task_path
+            self._coder_snapshot = None
+            return
+        snapshot = create_workspace_snapshot(
+            self.project_root,
+            self.task_path,
+            declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+        )
+        self._coder_snapshot = snapshot
+        self.workspace_root = snapshot.snapshot_root
+        self.workspace_task_path = snapshot.task_path
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "coder_workspace_snapshot_created",
+                "snapshot_root": str(snapshot.snapshot_root),
+                "original_root": str(snapshot.original_root),
+                "rewritten_symlinks": [rewrite.path for rewrite in snapshot.rewritten_symlinks],
+                "excluded_external_symlinks": list(snapshot.excluded_external_symlink_paths),
+            }
+        )
+
     def _coder_model(self) -> str | None:
         return getattr(self, "coder_model", getattr(self, "model", DEFAULT_MODEL))
 
+    def _runtime_model(self) -> str | None:
+        return getattr(self, "runtime_model", getattr(self, "supervisor_model", getattr(self, "model", DEFAULT_MODEL)))
+
     def _supervisor_model(self) -> str | None:
-        return getattr(self, "supervisor_model", getattr(self, "model", DEFAULT_MODEL))
+        return self._runtime_model()
+
+    def _completion_model(self) -> str | None:
+        return getattr(self, "completion_model", getattr(self, "supervisor_model", getattr(self, "model", DEFAULT_MODEL)))
+
+    def _adversary_model(self) -> str:
+        return getattr(self, "adversary_model", ADVERSARY_MODEL)
 
     def _fast_mode(self) -> bool:
         return bool(getattr(self, "fast", False))
@@ -483,9 +661,13 @@ class SentinelController:
         return ProjectConfig(
             task=_workspace_display_path(self.project_root, str(self.task_path)),
             coder_mod=self._coder_model() or DEFAULT_MODEL,
-            super_mod=self._supervisor_model() or DEFAULT_MODEL,
+            runtime_mod=self._runtime_model() or DEFAULT_MODEL,
+            completion_mod=self._completion_model() or DEFAULT_MODEL,
+            adversary_mod=self._adversary_model(),
             coder_intelligence=self._coder_intelligence() or DEFAULT_INTELLIGENCE,
-            super_intelligence=self._supervisor_intelligence() or DEFAULT_INTELLIGENCE,
+            runtime_intelligence=self._runtime_intelligence() or DEFAULT_INTELLIGENCE,
+            completion_intelligence=self._completion_intelligence() or DEFAULT_INTELLIGENCE,
+            adversary_intelligence=self._adversary_intelligence() or DEFAULT_INTELLIGENCE,
             speed="fast" if self._fast_mode() else "usual",
             start_over=self.overwrite_state,
             adversary=self._adversary_enabled_for_config(),
@@ -504,9 +686,13 @@ class SentinelController:
             "settings: "
             f"task={_workspace_display_path(self.project_root, str(self.task_path))} "
             f"coder-mod={self._coder_model()} "
-            f"super-mod={self._supervisor_model()} "
+            f"runtime-mod={self._runtime_model()} "
+            f"completion-mod={self._completion_model()} "
+            f"adversary-mod={self._adversary_model()} "
             f"coder-intelligence={self._coder_intelligence()} "
-            f"super-intelligence={self._supervisor_intelligence()} "
+            f"runtime-intelligence={self._runtime_intelligence()} "
+            f"completion-intelligence={self._completion_intelligence()} "
+            f"adversary-intelligence={self._adversary_intelligence()} "
             f"speed={speed} "
             f"start-over={_format_bool(self.overwrite_state)} "
             f"clean={_format_bool(self.clean_workspace)} "
@@ -518,11 +704,24 @@ class SentinelController:
     def _coder_intelligence(self) -> str | None:
         return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)
 
-    def _supervisor_intelligence(self) -> str | None:
-        return getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE)
+    def _runtime_intelligence(self) -> str | None:
+        return getattr(self, "runtime_intelligence", getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE))
 
-    def _adversary_model(self) -> str:
-        return ADVERSARY_MODEL
+    def _supervisor_intelligence(self) -> str | None:
+        return self._runtime_intelligence()
+
+    def _completion_intelligence(self) -> str | None:
+        return getattr(
+            self,
+            "completion_intelligence",
+            getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE),
+        )
+
+    def _adversary_intelligence(self) -> str | None:
+        return getattr(self, "adversary_intelligence", DEFAULT_INTELLIGENCE)
+
+    def _completion_supervisor_agent(self) -> StatelessSupervisorAgent | None:
+        return getattr(self, "completion_supervisor", None) or getattr(self, "supervisor", None)
 
     async def preflight(self) -> None:
         self.tui.status("checking Codex version")
@@ -565,7 +764,7 @@ class SentinelController:
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
         thread = await self.client.thread_start(
-            coder_thread_params(self.project_root, model=self._coder_model(), fast=self._fast_mode())
+            coder_thread_params(self._active_workspace_root(), model=self._coder_model(), fast=self._fast_mode())
         )
         approval_policy = thread.get("approvalPolicy")
         sandbox = thread.get("sandbox")
@@ -573,7 +772,11 @@ class SentinelController:
         if approval_policy != "on-request":
             raise RuntimeError("app-server did not accept on-request coder approval policy")
         expected_sandbox = coder_sandbox_mode()
-        if not _sandbox_matches_mode(sandbox, expected_sandbox):
+        if not _sandbox_matches_mode(
+            sandbox,
+            expected_sandbox,
+            workspace_root=self._active_workspace_root(),
+        ):
             raise RuntimeError(f"app-server did not accept {expected_sandbox} coder sandbox")
         if isinstance(thread_id, str):
             await self._cleanup_preflight_probe_thread(thread_id)
@@ -582,7 +785,8 @@ class SentinelController:
         result = _selected_model_availability(
             models_response,
             coder_model=self._coder_model(),
-            supervisor_model=self._supervisor_model(),
+            runtime_model=self._runtime_model(),
+            completion_model=self._completion_model() if self._effective_completion_review() else None,
             adversary_model=self._adversary_model() if self._adversary_model_required_for_preflight() else None,
         )
         if result.ok:
@@ -747,8 +951,9 @@ class SentinelController:
         context = normalize_approval_request(message)
         if getattr(self, "_terminal_cleanup_started", False):
             manager = getattr(self, "approvals", None) or ApprovalManager(
-                self.project_root,
+                self._active_workspace_root(),
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                immutable_paths=self._immutable_approval_paths(),
             )
             resolution = manager._deny(context, "terminal state reached")
             await self.client.respond(context.server_request_id, manager.response_payload(context, resolution))
@@ -770,9 +975,10 @@ class SentinelController:
         if is_adversary_request:
             adversary_workspace_root = getattr(self, "_active_adversary_workspace_root", None)
             fallback_manager = ApprovalManager(
-                adversary_workspace_root or self.project_root,
+                adversary_workspace_root or self._active_workspace_root(),
                 supervisor=self,
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                immutable_paths=self._immutable_approval_paths(),
                 adversary_mode=adversary_workspace_root is not None,
             )
             if adversary_workspace_root is None:
@@ -782,8 +988,9 @@ class SentinelController:
             response = fallback_manager.response_payload(context, resolution)
         elif self.approvals is None:
             fallback_manager = ApprovalManager(
-                self.project_root,
+                self._active_workspace_root(),
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                immutable_paths=self._immutable_approval_paths(),
             )
             resolution = fallback_manager._deny(context, "approval manager not ready")
             response = fallback_manager.response_payload(context, resolution)
@@ -917,6 +1124,7 @@ class SentinelController:
                 self._current_turn_action_count = getattr(self, "_current_turn_action_count", 0) + 1
                 self.store.append_recent_action(summary)
                 triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=summary)
+                repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_action")
                 self._record_changed_files(triggering_action)
                 declared_grading_issue = self._declared_grading_access_issue(triggering_action)
                 if declared_grading_issue is not None:
@@ -961,6 +1169,11 @@ class SentinelController:
                     changed_files=changed_files,
                     validation_trigger_reasons=validation_trigger_reasons,
                 )
+                if repaired_runtime_controls:
+                    runtime_decision = RuntimeTriggerDecision(
+                        should_wake=True,
+                        reasons=tuple(dict.fromkeys((*runtime_decision.reasons, "runtime_control_replacement"))),
+                    )
                 self.tui.render("TOOL", summary)
                 self._record_runtime_trigger_trace(
                     event_type=method,
@@ -1005,6 +1218,13 @@ class SentinelController:
         return "".join(chunks.pop(item_id, []))
 
     async def _handle_coder_turn_completed(self, *, item_id: str | None) -> None:
+        repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_turn_completed")
+        if repaired_runtime_controls:
+            self._schedule_supervisor_check(
+                "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
+                triggering_item_id=item_id,
+            )
+            return
         message = self.last_coder_message
         if message is not None and _has_readiness_marker(message.text):
             if self._last_completion_marker_sequence != message.sequence:
@@ -1191,11 +1411,12 @@ class SentinelController:
                 pass
         await self._resolve_pending_approvals("restart")
         handoff = handoff or _fallback_restart_handoff(
-            task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else cfg.task_path,
+            task_contents=self._canonical_task_text(),
             reason=reason,
             last_actions=self.store.read_recent_actions(10),
         )
         self.store.write_handoff(handoff.model_dump_json(indent=2) + "\n")
+        self._repair_snapshot_runtime_controls(source="restart")
         self.prior_interventions = []
         self.no_marker_idle_nudge_count = 0
         self._last_completion_marker_sequence = None
@@ -1232,8 +1453,8 @@ class SentinelController:
         self.coder = CoderSession(
             self.client,
             self.store,
-            self.project_root,
-            self.task_path,
+            self._active_workspace_root(),
+            self._active_task_path(),
             model=self._coder_model(),
             fast=self._fast_mode(),
             intelligence=self._coder_intelligence(),
@@ -1252,6 +1473,13 @@ class SentinelController:
         self._reconcile_intervention_accounting()
         diff = await self.diff_summary()
         changed_files = await self.changed_files()
+        patch_error, recovery_path = await self._apply_final_snapshot_patch_if_needed(status)
+        if patch_error is not None:
+            status = SentinelStatus.ESCALATED
+            completion_review_accepted = False
+            result = patch_error
+        elif recovery_path is not None:
+            result = f"{result}; unaccepted coder workspace preserved at {recovery_path}"
         health = self.store.get_health()
         accepted_completion = getattr(self, "_accepted_completion_decision", None)
         report = FinalReport(
@@ -1259,7 +1487,11 @@ class SentinelController:
             status=status,
             result=result,
             files_changed=[file.path for file in changed_files]
-            or _changed_files_from_diff_summary(diff, project_root=self.project_root, task_path=self.task_path),
+            or _changed_files_from_diff_summary(
+                diff,
+                project_root=self._active_workspace_root(),
+                task_path=self._active_task_path(),
+            ),
             validations=[_format_validation(validation) for validation in self.validations],
             denied_actions=[],
             interventions=health.interventions,
@@ -1290,6 +1522,108 @@ class SentinelController:
         await self._prepare_terminal_shutdown(result)
         self.running = False
         self._wake_event_loop_for_shutdown()
+
+    async def _apply_final_snapshot_patch_if_needed(
+        self,
+        status: SentinelStatus,
+    ) -> tuple[str | None, str | None]:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is None or getattr(self, "_snapshot_patch_applied", False):
+            return None, getattr(self, "_snapshot_recovery_path", None)
+        if status != SentinelStatus.COMPLETE:
+            if not getattr(self, "_coder_started", False):
+                snapshot.cleanup()
+                self._coder_snapshot = None
+                return None, None
+            recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason=status.value)
+            return None, recovery_path
+        task_integrity_issue = self._task_integrity_issue()
+        if task_integrity_issue is not None:
+            recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason="task_integrity")
+            return (
+                "escalated: accepted snapshot failed task integrity validation; "
+                f"workspace preserved at {recovery_path}: {task_integrity_issue}",
+                recovery_path,
+            )
+        try:
+            result = await asyncio.to_thread(apply_snapshot_patch, snapshot)
+        except (SnapshotPatchError, WorkspaceSnapshotError) as exc:
+            recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason="patch_failed")
+            message = (
+                "escalated: accepted snapshot could not be applied to the real workspace; "
+                f"snapshot preserved at {recovery_path}: {exc}"
+            )
+            self.tui.render("PATCH", message)
+            self.store.append_text_locked(PROGRESS, f"- {message}\n")
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "coder_snapshot_patch_failed",
+                    "snapshot_root": recovery_path,
+                    "original_root": str(snapshot.original_root),
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                }
+            )
+            return message, recovery_path
+        self._snapshot_patch_applied = True
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "coder_snapshot_patch_applied",
+                "snapshot_root": str(snapshot.snapshot_root),
+                "original_root": str(snapshot.original_root),
+                "applied": result.applied,
+                "changed_paths": list(result.changed_paths),
+                "ignored_paths": list(result.ignored_paths),
+                "patch_bytes": result.patch_bytes,
+            }
+        )
+        if result.applied:
+            ignored_suffix = (
+                f"; ignored {len(result.ignored_paths)} generated artifact paths" if result.ignored_paths else ""
+            )
+            self.store.append_text_locked(
+                PROGRESS,
+                f"- Applied accepted coder snapshot patch to real workspace ({len(result.changed_paths)} paths{ignored_suffix}).\n",
+            )
+        else:
+            if result.ignored_paths:
+                self.store.append_text_locked(
+                    PROGRESS,
+                    "- Accepted coder snapshot produced no workspace patch after generated artifacts were ignored.\n",
+                )
+            else:
+                self.store.append_text_locked(PROGRESS, "- Accepted coder snapshot produced no workspace patch.\n")
+        snapshot.cleanup()
+        self._coder_snapshot = None
+        return None, None
+
+    async def _preserve_snapshot_for_recovery(self, snapshot: WorkspaceSnapshot, *, reason: str) -> str:
+        existing = getattr(self, "_snapshot_recovery_path", None)
+        if existing:
+            return str(existing)
+        destination = self.store.next_recovery_dir()
+        try:
+            workspace = await asyncio.to_thread(snapshot.preserve, destination)
+            recovery_path = str(workspace)
+        except WorkspaceSnapshotError:
+            recovery_path = str(snapshot.snapshot_root)
+        self._snapshot_recovery_path = recovery_path
+        self._coder_snapshot = None
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Preserved coder workspace for recovery at {recovery_path} ({reason}).\n",
+        )
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "coder_workspace_preserved",
+                "reason": reason,
+                "workspace": recovery_path,
+            }
+        )
+        return recovery_path
 
     def _archive_final_report_once(self) -> None:
         if getattr(self, "_final_report_archived", False):
@@ -1340,7 +1674,7 @@ class SentinelController:
                 )
 
     async def _close_completion_review_session(self) -> None:
-        supervisor = getattr(self, "supervisor", None)
+        supervisor = self._completion_supervisor_agent()
         if supervisor is None or not hasattr(supervisor, "close_completion_review"):
             return
         thread_id = getattr(supervisor, "completion_thread_id", None) or "unknown"
@@ -1474,7 +1808,6 @@ class SentinelController:
         self,
         *,
         action: TriggeringAction,
-        validation: ValidationRun | None,
         reasons: list[str],
     ) -> str | None:
         if not reasons:
@@ -1486,24 +1819,10 @@ class SentinelController:
             return None
         if reason_set == {"large_diff"} and _is_file_change_activity(action):
             return "routine file-change large diff"
-        command = action.command or ""
-        if not command:
-            return None
-        task_command_reason = deterministic_task_command_reason(self.project_root, command, cwd=action.cwd)
-        if task_command_reason is None:
-            return None
-        if reason_set == {"large_diff"} and action.exit_code == 0:
-            return task_command_reason
-        if reason_set <= {"nonzero_exit", "timeout", "large_diff"} and (
-            action.exit_code is None or action.exit_code != 0 or _action_timed_out(action)
-        ):
-            if validation is not None and validation.trusted_validation_outcome == "masked_or_unknown":
-                return None
-            return task_command_reason
         return None
 
     def _update_relevant_edit_state(self, changed_files: list[ChangedFile]) -> None:
-        task_contents = _read_task_text(self.task_path)
+        task_contents = self._canonical_task_text()
         relevant_sequences = [
             changed.sequence
             for changed in changed_files
@@ -1556,7 +1875,6 @@ class SentinelController:
         reasons = list(dict.fromkeys(reasons))
         if self._deterministic_runtime_noop_reason(
             action=action,
-            validation=validation,
             reasons=reasons,
         ):
             return RuntimeTriggerDecision(should_wake=False, reasons=())
@@ -1624,7 +1942,11 @@ class SentinelController:
             return None
         manager = getattr(self, "approvals", None)
         if manager is None:
-            manager = ApprovalManager(self.project_root, declared_grading_roots=roots)
+            manager = ApprovalManager(
+                self._active_workspace_root(),
+                declared_grading_roots=roots,
+                immutable_paths=self._immutable_approval_paths(),
+            )
         decision = manager.policy.evaluate(payload)
         if decision.kind.value != "deny" or "declared grading/hidden path access denied" not in decision.reason:
             return None
@@ -1727,7 +2049,8 @@ class SentinelController:
         patch_summary: str | None,
         completion_review: bool = False,
     ) -> None:
-        if self.supervisor is None:
+        agent = self._completion_supervisor_agent() if completion_review else self.supervisor
+        if agent is None:
             return
         self._reconcile_intervention_accounting()
         cfg = self.store.get_sentinel_config()
@@ -1756,7 +2079,7 @@ class SentinelController:
             completion_details["prior_uncovered_edge_candidates"] = list(
                 self._completion_knowledge()["uncovered_edge_candidates"]
             )
-        packet = self.supervisor.build_packet(
+        packet = agent.build_packet(
             wake_sequence=wake_sequence,
             current_summary=summary,
             diff_summary=await self.diff_summary(),
@@ -1779,7 +2102,7 @@ class SentinelController:
             validation_freshness_summary=freshness_summary,
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
-            completion_review_thread_id=getattr(self.supervisor, "completion_thread_id", None),
+            completion_review_thread_id=getattr(agent, "completion_thread_id", None),
             pending_accept_gate_rejection=(
                 getattr(self, "_pending_completion_gate_rejection", None) if completion_review else None
             ),
@@ -1796,7 +2119,7 @@ class SentinelController:
         try:
             if completion_review:
                 self.completion_attempt_count = getattr(self, "completion_attempt_count", 0) + 1
-                decision = await self.supervisor.decide_completion(packet)
+                decision = await agent.decide_completion(packet)
             else:
                 # Cheap-model triage: let a lightweight model route clear non-events to noop
                 # before paying for the full supervisor. Never short-circuit human messages or
@@ -1811,7 +2134,7 @@ class SentinelController:
                     cheap = await self._cheap_runtime_route(packet)
                     if cheap is not None and cheap.decision == "noop":
                         return
-                decision = await self.supervisor.decide(packet)
+                decision = await agent.decide(packet)
         except SupervisorAgentError as exc:
             failure_kind = _classify_supervisor_agent_error(exc)
             message = f"supervisor check failed ({failure_kind}): {exc}"
@@ -1885,8 +2208,9 @@ class SentinelController:
         if attempts >= budget:
             return False
         counts[key] = attempts + 1
-        if self.supervisor is not None and hasattr(self.supervisor, "close_completion_review"):
-            await self.supervisor.close_completion_review()
+        completion_supervisor = self._completion_supervisor_agent()
+        if completion_supervisor is not None and hasattr(completion_supervisor, "close_completion_review"):
+            await completion_supervisor.close_completion_review()
         self.store.append_text_locked(
             PROGRESS,
             f"- Provider recovery: completion review turn timed out; retrying once on a fresh review "
@@ -1939,8 +2263,12 @@ class SentinelController:
         )
         if attempts < budget:
             counts[count_key] = attempts + 1
-            if completion_review and self.supervisor is not None and hasattr(self.supervisor, "close_completion_review"):
-                await self.supervisor.close_completion_review()
+            completion_supervisor = self._completion_supervisor_agent()
+            if completion_review and completion_supervisor is not None and hasattr(
+                completion_supervisor,
+                "close_completion_review",
+            ):
+                await completion_supervisor.close_completion_review()
             backoff = 0.0
             if completion_review:
                 schedule = getattr(self, "_no_message_backoff_seconds", NO_MESSAGE_RETRY_BACKOFF_SECONDS)
@@ -2006,7 +2334,7 @@ class SentinelController:
         since_sequence = getattr(self, "completion_review_return_sequence", None)
         if since_sequence is None:
             return "full", None
-        task_contents = _read_task_text(self.task_path)
+        task_contents = self._canonical_task_text()
         has_unknown_relevant_sequence = any(
             changed.sequence is None and _is_relevant_changed_path(changed.path, task_contents=task_contents)
             for changed in changed_files
@@ -2165,7 +2493,6 @@ class SentinelController:
         *,
         packet: SupervisorWakePacket | None,
     ) -> None:
-        cfg = self.store.get_sentinel_config()
         if packet is None:
             await self._complete_after_adversary_unavailable(
                 decision,
@@ -2182,12 +2509,12 @@ class SentinelController:
             PROGRESS,
             f"- Adversarial tester starting before final complete ({adversary_run_count}/{max_adversary_runs}).\n",
         )
-        workspace_state_id = _workspace_state_id(self.project_root)
+        workspace_state_id = _workspace_state_id(self._active_workspace_root())
         snapshot_root: Path | None = None
         previous_report = getattr(self, "_pending_adversary_report", None)
         previous_report_payload = previous_report.model_dump(mode="json") if previous_report is not None else None
         try:
-            snapshot_root = _create_adversary_snapshot(self.project_root)
+            snapshot_root = _create_adversary_snapshot(self._active_workspace_root())
         except Exception as exc:
             await self._complete_after_adversary_unavailable(
                 decision,
@@ -2201,6 +2528,7 @@ class SentinelController:
             self.client,
             snapshot_root,
             model=self._adversary_model(),
+            intelligence=self._adversary_intelligence(),
             on_thread_start=self._mark_adversary_thread_started,
             on_thread_done=self._mark_adversary_thread_done,
             denied_probes=lambda: list(getattr(self, "_adversary_denied_commands", [])),
@@ -2370,7 +2698,7 @@ class SentinelController:
             completion_wake_sequence=decision.wake_sequence,
             latest_relevant_change_sequence=packet.latest_relevant_change_sequence if packet is not None else None,
             validation_sequence=_latest_validation_sequence(packet.validations) if packet is not None else None,
-            workspace_state_id=_workspace_state_id(self.project_root),
+            workspace_state_id=_workspace_state_id(self._active_workspace_root()),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self.tui.render(
@@ -2466,7 +2794,7 @@ class SentinelController:
             return None
         if report.latest_relevant_change_sequence != latest_relevant_change_sequence:
             return None
-        if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self.project_root):
+        if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self._active_workspace_root()):
             return None
         return report
 
@@ -2480,7 +2808,7 @@ class SentinelController:
             return False
         if report.latest_relevant_change_sequence != packet.latest_relevant_change_sequence:
             return False
-        if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self.project_root):
+        if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self._active_workspace_root()):
             return False
         return True
 
@@ -2579,8 +2907,9 @@ class SentinelController:
             )
             return
         self.completion_decision_staleness_rerun_count = reruns + 1
-        if self.supervisor is not None:
-            await self.supervisor.close_completion_review()
+        completion_supervisor = self._completion_supervisor_agent()
+        if completion_supervisor is not None:
+            await completion_supervisor.close_completion_review()
         self.store.append_text_locked(
             PROGRESS,
             f"- Controller starting fresh completion_review: repeated stale decision anchors ({stale_fields})\n",
@@ -2657,6 +2986,17 @@ class SentinelController:
         code_review_files = _material_code_review_files(changed_files)
         passed_checks: list[str] = []
 
+        task_integrity_issue = self._task_integrity_issue()
+        if task_integrity_issue is not None:
+            original_changed = task_integrity_issue.startswith("the original task file")
+            return AcceptGateResult(
+                passed=False,
+                failure_type=ACCEPT_GATE_AUDIT_FAILURE if original_changed else ACCEPT_GATE_CODER_CORRECTABLE,
+                check_name="task_integrity",
+                reason=task_integrity_issue,
+            )
+        passed_checks.append("task_integrity")
+
         if packet is not None:
             if decision.wake_sequence != packet.wake_sequence:
                 return AcceptGateResult(
@@ -2721,6 +3061,20 @@ class SentinelController:
         check_name = gate_result.check_name or "unknown"
         failure_type = gate_result.failure_type or ACCEPT_GATE_CODER_CORRECTABLE
         self._record_accept_gate_failure(gate_result)
+
+        if failure_type == ACCEPT_GATE_AUDIT_FAILURE:
+            self._append_event(
+                AppEventSource.SUPERVISOR,
+                "completion/accept_gate_audit_failure",
+                decision=ACCEPT_GATE_AUDIT_FAILURE,
+                reason=f"{check_name}: {reason}",
+            )
+            self._increment_accept_gate_counter("accept_gate_audit_failures")
+            await self.finalize(
+                f"escalated: controller-side integrity failure: {check_name}: {reason}",
+                status=SentinelStatus.ESCALATED,
+            )
+            return
 
         if failure_type == ACCEPT_GATE_REVIEWER_INCOMPLETE:
             reruns = getattr(self, "completion_reviewer_rerun_count", 0)
@@ -2913,8 +3267,9 @@ class SentinelController:
             return
         self.completion_return_freshness_rerun_count = reruns + 1
         self.completion_review_return_sequence = None
-        if self.supervisor is not None:
-            await self.supervisor.close_completion_review()
+        completion_supervisor = self._completion_supervisor_agent()
+        if completion_supervisor is not None:
+            await completion_supervisor.close_completion_review()
         self.store.append_text_locked(
             PROGRESS,
             f"- Controller starting fresh completion_review: repeated stale delta return ({reason})\n",
@@ -2991,7 +3346,7 @@ class SentinelController:
         if returns_this_generation > cfg.max_completion_returns_per_generation:
             if cfg.restart_count < cfg.max_restarts:
                 handoff = _fallback_restart_handoff(
-                    task_contents=self.task_path.read_text(encoding="utf-8") if self.task_path.exists() else cfg.task_path,
+                    task_contents=self._canonical_task_text(),
                     reason="completion return cap reached",
                     last_actions=self.store.read_recent_actions(10),
                 )
@@ -3011,7 +3366,7 @@ class SentinelController:
         # model context window within a generation, forcing lossy auto-compaction. Prior
         # returns are still carried into the next review via previous_completion_returns,
         # and the reviewer re-reads the workspace live, so no context is lost.
-        supervisor = getattr(self, "supervisor", None)
+        supervisor = self._completion_supervisor_agent()
         if supervisor is not None and hasattr(supervisor, "close_completion_review"):
             await supervisor.close_completion_review()
 
@@ -3019,8 +3374,9 @@ class SentinelController:
         approvals = getattr(self, "approvals", None)
         if approvals is None:
             manager = ApprovalManager(
-                self.project_root,
+                self._active_workspace_root(),
                 declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                immutable_paths=self._immutable_approval_paths(),
             )
         else:
             manager = approvals
@@ -3055,8 +3411,8 @@ class SentinelController:
                 output = _filter_internal_git_output(
                     output,
                     command=command,
-                    project_root=self.project_root,
-                    task_path=self.task_path,
+                    project_root=self._active_workspace_root(),
+                    task_path=self._active_task_path(),
                 )
                 parts.append(f"$ {' '.join(command)}\n{output}")
         return "\n\n".join(parts)
@@ -3078,7 +3434,7 @@ class SentinelController:
             path = _path_from_git_status_line(line)
             if " -> " in path:
                 path = path.rsplit(" -> ", 1)[1].strip()
-            if path and not _is_ignored_changed_path(path, project_root=self.project_root, task_path=self.task_path):
+            if path and not _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
                 files[path] = ChangedFile(path=path, status=status)
         for line in (numstat_text or "").splitlines():
             parts = line.split("\t")
@@ -3089,7 +3445,7 @@ class SentinelController:
             path = parts[2].strip()
             if " => " in path:
                 path = path.rsplit(" => ", 1)[1].strip("{}")
-            if not path or _is_ignored_changed_path(path, project_root=self.project_root, task_path=self.task_path):
+            if not path or _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
                 continue
             existing = files.get(path)
             status = existing.status if existing else "modified"
@@ -3109,8 +3465,8 @@ class SentinelController:
             observed = {}
             self.observed_changed_files = observed
         for raw_path in action.paths:
-            path = _workspace_display_path(self.project_root, raw_path)
-            if path and not _is_ignored_changed_path(path, project_root=self.project_root, task_path=self.task_path):
+            path = _workspace_display_path(self._active_workspace_root(), raw_path)
+            if path and not _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
                 observed[path] = ChangedFile(path=path, status="modified", sequence=getattr(self, "_sequence", None))
 
     async def _is_git_work_tree(self) -> bool:
@@ -3119,9 +3475,20 @@ class SentinelController:
 
     async def _git_output(self, command: list[str]) -> str | None:
         try:
+            exec_command = command
+            env = None
+            snapshot = getattr(self, "_coder_snapshot", None)
+            if snapshot is not None and command and command[0] == "git":
+                if not snapshot.git_control_is_trusted():
+                    return None
+                exec_command = ["git", "-c", "core.fsmonitor=false", *command[1:]]
+                if len(command) > 1 and command[1] == "diff":
+                    exec_command = [*exec_command[:4], "--no-ext-diff", "--no-textconv", *exec_command[4:]]
+                env = snapshot_git_environment()
             proc = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=str(self.project_root),
+                *exec_command,
+                cwd=str(self._active_workspace_root()),
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -3217,7 +3584,7 @@ class SentinelController:
             if is_git:
                 diff_text = await self._changed_file_diff(changed.path)
             if not diff_text and change_kind == "added":
-                file_text = _read_workspace_file(self.project_root, changed.path, limit=diff_limit)
+                file_text = _read_workspace_file(self._active_workspace_root(), changed.path, limit=diff_limit)
                 if file_text is not None:
                     diff_text = f"<new file snapshot>\n{file_text.text}"
             if not diff_text:
@@ -3243,7 +3610,7 @@ class SentinelController:
 
             if change_kind == "deleted":
                 continue
-            context = _read_workspace_file(self.project_root, changed.path, limit=context_limit)
+            context = _read_workspace_file(self._active_workspace_root(), changed.path, limit=context_limit)
             if context is None:
                 continue
             total_context_chars += len(context.text)
@@ -3272,7 +3639,7 @@ class SentinelController:
                 since_sequence=since_sequence,
             ),
             "breadth_risk_summary": _breadth_risk_summary(
-                task_contents=_read_task_text(self.task_path),
+                task_contents=self._canonical_task_text(),
                 changed_files=changed_files,
             ),
             "diff_packet_limits": DiffPacketLimits(
@@ -3385,9 +3752,11 @@ class SentinelController:
             self.client,
             self.store,
             self.task_path,
-            model=self._supervisor_model(),
+            workspace_root=self._active_workspace_root(),
+            task_contents=self._canonical_task_text(),
+            model=self._runtime_model(),
             fast=self._fast_mode(),
-            intelligence=self._supervisor_intelligence(),
+            intelligence=self._runtime_intelligence(),
         )
         cfg = self.store.get_sentinel_config()
         packet = SupervisorWakePacket(
@@ -3430,7 +3799,7 @@ class SentinelController:
             return
         reviewer = CheapApprovalReviewer(
             self.client,
-            self.project_root,
+            self._active_workspace_root(),
             model=config.model,
             timeout_seconds=config.timeout_seconds,
         )
@@ -3457,13 +3826,14 @@ class SentinelController:
             server_request_method="item/commandExecution/requestApproval",
             request_type=ApprovalRequestType.COMMAND,
             command=command,
-            cwd=str(self.project_root),
+            cwd=str(self._active_workspace_root()),
             available_decisions=["accept", "decline", "cancel"],
         )
         evaluation = ApprovalManager(
-            self.project_root,
+            self._active_workspace_root(),
             declared_grading_roots=getattr(self, "declared_grading_roots", ()),
-        ).policy.evaluate({"command": command, "cwd": str(self.project_root)})
+            immutable_paths=self._immutable_approval_paths(),
+        ).policy.evaluate({"command": command, "cwd": str(self._active_workspace_root())})
         decision = await asyncio.wait_for(reviewer.review(context, evaluation), timeout=reviewer.timeout_seconds)
         if decision.decision not in {"approve_low_impact", "escalate"}:
             raise RuntimeError("cheap approval structured-output self-test returned an unexpected decision")
@@ -3476,7 +3846,7 @@ class SentinelController:
             return None
         return CheapApprovalReviewer(
             self.client,
-            self.project_root,
+            self._active_workspace_root(),
             model=config.model,
             timeout_seconds=config.timeout_seconds,
         )
@@ -3516,7 +3886,7 @@ class SentinelController:
             return
         reviewer = CheapRuntimeReviewer(
             self.client,
-            self.project_root,
+            self._active_workspace_root(),
             model=config.model,
             timeout_seconds=config.timeout_seconds,
         )
@@ -6339,17 +6709,43 @@ class _BoundedFileText:
 
 
 def _read_workspace_file(root: Path, path: str, *, limit: int) -> _BoundedFileText | None:
-    candidate = (root / path).resolve()
-    if not ensure_relative_to(candidate, root):
-        return None
-    if not candidate.is_file():
-        return None
     try:
-        raw = candidate.read_text(encoding="utf-8", errors="replace")
+        candidate = (root / path).resolve()
     except OSError:
         return None
+    if not ensure_relative_to(candidate, root):
+        return None
+    descriptor: int | None = None
+    try:
+        descriptor = _open_regular_file_no_follow(candidate)
+        byte_limit = max(4, (limit + 1) * 4)
+        data = bytearray()
+        while len(data) < byte_limit:
+            chunk = os.read(descriptor, min(1024 * 1024, byte_limit - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        bytes_truncated = os.fstat(descriptor).st_size > len(data)
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    raw = bytes(data).decode("utf-8", errors="replace")
     bounded = _bounded_text(raw, limit=limit)
-    return _BoundedFileText(text=bounded, truncated=len(raw) > len(bounded))
+    return _BoundedFileText(text=bounded, truncated=bytes_truncated or len(raw) > len(bounded))
+
+
+def _open_regular_file_no_follow(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"not a regular file: {path}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def _file_kind(path: str) -> str:
@@ -7070,7 +7466,14 @@ def _parse_numstat(value: str) -> int | None:
 
 
 def _hash_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    descriptor = _open_regular_file_no_follow(path)
+    digest = hashlib.sha256()
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
 
 
 def _schema_file_exists(out_dir: Path, name: str) -> bool:
@@ -7104,23 +7507,38 @@ def _resolve_controller_models(
     model: str | None,
     coder_model: str | None,
     supervisor_model: str | None,
-) -> tuple[str, str]:
-    if model and (coder_model or supervisor_model):
-        raise RuntimeError("model cannot be combined with coder_model or supervisor_model")
-    if bool(coder_model) != bool(supervisor_model):
-        raise RuntimeError("coder_model and supervisor_model must be used together")
+    runtime_model: str | None,
+    completion_model: str | None,
+    adversary_model: str | None,
+) -> tuple[str, str, str, str]:
+    if model and (coder_model or supervisor_model or runtime_model or completion_model):
+        raise RuntimeError(
+            "model cannot be combined with coder_model, supervisor_model, runtime_model, or completion_model"
+        )
+    if supervisor_model and (runtime_model or completion_model):
+        raise RuntimeError("supervisor_model cannot be combined with runtime_model or completion_model")
     if model:
-        return model, model
-    if coder_model and supervisor_model:
-        return coder_model, supervisor_model
-    return DEFAULT_MODEL, DEFAULT_MODEL
+        return model, model, model, adversary_model or DEFAULT_MODEL
+    legacy_supervisor_model = supervisor_model or DEFAULT_MODEL
+    return (
+        coder_model or DEFAULT_MODEL,
+        runtime_model or legacy_supervisor_model,
+        completion_model or legacy_supervisor_model,
+        adversary_model or DEFAULT_MODEL,
+    )
+
+
+def _shared_primary_model(config: ProjectConfig) -> str | None:
+    models = {config.coder_mod, config.runtime_mod, config.completion_mod}
+    return config.coder_mod if len(models) == 1 else None
 
 
 def _selected_model_availability(
     models_response: dict[str, Any],
     *,
     coder_model: str | None,
-    supervisor_model: str | None,
+    runtime_model: str | None,
+    completion_model: str | None,
     adversary_model: str | None = None,
 ) -> ModelAvailabilityResult:
     available_models = tuple(sorted(_extract_model_ids(models_response)))
@@ -7128,8 +7546,10 @@ def _selected_model_availability(
     missing: list[str] = []
     if coder_model and coder_model not in available:
         missing.append(f"coder={coder_model}")
-    if supervisor_model and supervisor_model not in available:
-        missing.append(f"supervisor={supervisor_model}")
+    if runtime_model and runtime_model not in available:
+        missing.append(f"runtime={runtime_model}")
+    if completion_model and completion_model not in available:
+        missing.append(f"completion={completion_model}")
     if adversary_model and adversary_model not in available:
         missing.append(f"adversary={adversary_model}")
     return ModelAvailabilityResult(missing_roles=tuple(missing), available_models=available_models)
@@ -7159,17 +7579,35 @@ def _sandbox_is_read_only(value: Any) -> bool:
     if value == "read-only":
         return True
     if isinstance(value, dict):
-        return value.get("type") == "readOnly"
+        return value.get("type") == "readOnly" and value.get("networkAccess") is False
     return False
 
 
-def _sandbox_matches_mode(value: Any, mode: str) -> bool:
+def _sandbox_matches_mode(value: Any, mode: str, *, workspace_root: Path | None = None) -> bool:
     if mode == CODER_SANDBOX_DANGER_FULL_ACCESS:
         if value == "danger-full-access":
             return True
         if isinstance(value, dict):
             return value.get("type") == "dangerFullAccess"
         return False
+    if mode == CODER_SANDBOX_WORKSPACE_WRITE:
+        if not isinstance(value, dict) or value.get("type") != "workspaceWrite":
+            return False
+        if value.get("networkAccess") is not False:
+            return False
+        roots = value.get("writableRoots")
+        if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
+            return False
+        if workspace_root is None:
+            return not roots
+        expected = workspace_root.resolve()
+        for raw in roots:
+            try:
+                if Path(raw).expanduser().resolve(strict=False) != expected:
+                    return False
+            except OSError:
+                return False
+        return True
     return _sandbox_is_read_only(value)
 
 
@@ -7256,73 +7694,22 @@ def _is_generated_or_cache_artifact_path(path: str, *, project_root: Path | None
         ".mypy_cache",
         ".ruff_cache",
         ".tox",
-        ".cache",
-        ".next",
         ".parcel-cache",
         "node_modules",
-        "vendor",
-        "dist",
-        "build",
-        "target",
-        "coverage",
     }:
         return True
     name = normalized.rsplit("/", 1)[-1].lower()
     if name.endswith(
         (
-            ".o",
-            ".obj",
-            ".lo",
             ".pyc",
             ".pyo",
-            ".class",
-            ".so",
-            ".dylib",
-            ".dll",
-            ".exe",
-            ".a",
-            ".lib",
-            ".rlib",
-            ".wasm",
             ".gcda",
             ".gcno",
+            ".tsbuildinfo",
         )
     ):
         return True
-    return _is_probably_compiled_binary_artifact(normalized, project_root=project_root)
-
-
-def _is_probably_compiled_binary_artifact(normalized_path: str, *, project_root: Path | None) -> bool:
-    if project_root is None:
-        return False
-    name = normalized_path.rsplit("/", 1)[-1]
-    if "." in name:
-        return False
-    workspace_path = Path(normalized_path)
-    candidate = workspace_path if workspace_path.is_absolute() else Path(project_root) / workspace_path
-    try:
-        resolved = candidate.resolve()
-        resolved.relative_to(Path(project_root).resolve())
-        if not resolved.is_file():
-            return False
-        head = resolved.read_bytes()[:4096]
-    except (OSError, ValueError):
-        return False
-    if not head:
-        return False
-    binary_magic = (
-        b"\x7fELF",
-        b"MZ",
-        b"\x00asm",
-        b"\xca\xfe\xba\xbe",
-        b"\xfe\xed\xfa\xce",
-        b"\xce\xfa\xed\xfe",
-        b"\xfe\xed\xfa\xcf",
-        b"\xcf\xfa\xed\xfe",
-        b"\xbe\xba\xfe\xca",
-        b"BC\xc0\xde",
-    )
-    return head.startswith(binary_magic) or b"\0" in head
+    return False
 
 
 def _task_relative_workspace_path(*, project_root: Path | None, task_path: Path | str | None) -> str | None:
@@ -7477,18 +7864,43 @@ def _init_snapshot_git(snapshot_root: Path) -> None:
         "-c",
         "commit.gpgsign=false",
     ]
+    git_env = snapshot_git_environment()
     try:
-        subprocess.run(
-            [git, "init", "-q"],
+        initialized = subprocess.run(
+            [git, "-c", "init.templateDir=", "init", "-q"],
             cwd=snapshot_root,
+            env=git_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        if initialized.returncode != 0:
+            return
+        subprocess.run(
+            [git, "config", "--local", "core.hooksPath", os.devnull],
+            cwd=snapshot_root,
+            env=git_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=30,
             check=False,
         )
         subprocess.run(
-            [git, *identity, "commit", "-q", "--allow-empty", "-m", "sentinel adversary snapshot baseline"],
+            [
+                git,
+                "-c",
+                "core.fsmonitor=false",
+                *identity,
+                "commit",
+                "-q",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "sentinel adversary snapshot baseline",
+            ],
             cwd=snapshot_root,
+            env=git_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=30,
@@ -7524,29 +7936,57 @@ def _workspace_state_id(project_root: Path) -> str:
         ".venv",
         "venv",
     }
-    for current, dirs, files in os.walk(root):
-        dirs[:] = sorted(name for name in dirs if name not in skip_dirs)
-        rel_dir = Path(current).resolve().relative_to(root)
+    for current, dirs, files in os.walk(root, followlinks=False):
+        rel_dir = Path(current).relative_to(root)
+        traversable_dirs: list[str] = []
+        for name in sorted(dirs):
+            if name in skip_dirs:
+                continue
+            path = Path(current) / name
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                _update_workspace_entry_digest(digest, path, (rel_dir / name).as_posix())
+                continue
+            if stat.S_ISDIR(mode):
+                traversable_dirs.append(name)
+            else:
+                _update_workspace_entry_digest(digest, path, (rel_dir / name).as_posix())
+        dirs[:] = traversable_dirs
         for name in sorted(files):
             path = Path(current) / name
             rel = (rel_dir / name).as_posix()
+            _update_workspace_entry_digest(digest, path, rel)
+    return digest.hexdigest()
+
+
+def _update_workspace_entry_digest(digest: Any, path: Path, relative_path: str) -> None:
+    encoded_path = relative_path.encode("utf-8", errors="surrogateescape")
+    digest.update(encoded_path)
+    digest.update(b"\0")
+    try:
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            digest.update(b"symlink\0")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        elif stat.S_ISREG(mode):
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
             try:
-                digest.update(rel.encode("utf-8", errors="surrogateescape"))
-                digest.update(b"\0")
-                if path.is_symlink():
-                    digest.update(b"symlink\0")
-                    digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+                opened_mode = os.fstat(descriptor).st_mode
+                if not stat.S_ISREG(opened_mode):
+                    digest.update(f"special:{stat.S_IFMT(opened_mode):o}".encode("ascii"))
                 else:
                     digest.update(b"file\0")
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                digest.update(b"\0")
-            except OSError:
-                digest.update(b"unreadable\0")
-                digest.update(rel.encode("utf-8", errors="surrogateescape"))
-                digest.update(b"\0")
-    return digest.hexdigest()
+                    while chunk := os.read(descriptor, 1024 * 1024):
+                        digest.update(chunk)
+            finally:
+                os.close(descriptor)
+        else:
+            digest.update(f"special:{stat.S_IFMT(mode):o}".encode("ascii"))
+    except OSError:
+        digest.update(b"unreadable\0")
+    digest.update(b"\0")
 
 
 def _latest_validation_sequence(validations: list[ValidationRun]) -> int | None:

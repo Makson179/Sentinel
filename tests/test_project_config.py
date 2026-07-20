@@ -12,10 +12,16 @@ from supervisor.main import cli
 from supervisor.project_config import (
     DEFAULT_INTELLIGENCE,
     DEFAULT_MODEL,
+    INTELLIGENCE_CHOICES,
+    MODEL_GPT_5_5,
+    MODEL_GPT_5_6_LUNA,
+    MODEL_GPT_5_6_SOL,
+    MODEL_GPT_5_6_TERRA,
     ProjectConfig,
     ProjectConfigError,
     changed_project_config_fields,
     ensure_runtime_state_initialized,
+    intelligence_choices_for_model,
     load_project_config,
     project_config_path,
     save_project_config,
@@ -29,9 +35,13 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     config = load_project_config(tmp_path)
 
     assert config.coder_mod == DEFAULT_MODEL
-    assert config.super_mod == DEFAULT_MODEL
+    assert config.runtime_mod == DEFAULT_MODEL
+    assert config.completion_mod == DEFAULT_MODEL
+    assert config.adversary_mod == DEFAULT_MODEL
     assert config.coder_intelligence == DEFAULT_INTELLIGENCE
-    assert config.super_intelligence == DEFAULT_INTELLIGENCE
+    assert config.runtime_intelligence == DEFAULT_INTELLIGENCE
+    assert config.completion_intelligence == DEFAULT_INTELLIGENCE
+    assert config.adversary_intelligence == DEFAULT_INTELLIGENCE
     assert config.start_over is True
     assert config.adversary is True
     assert config.adversary_runs == 1
@@ -44,6 +54,15 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert not (tmp_path / ".sentinel").exists()
 
 
+def test_gpt_56_sol_is_default_and_reasoning_choices_are_model_specific() -> None:
+    assert DEFAULT_MODEL == MODEL_GPT_5_6_SOL
+    assert INTELLIGENCE_CHOICES == ("low", "medium", "high", "xhigh", "max", "ultra")
+    assert intelligence_choices_for_model(MODEL_GPT_5_6_SOL) == INTELLIGENCE_CHOICES
+    assert intelligence_choices_for_model(MODEL_GPT_5_6_TERRA) == INTELLIGENCE_CHOICES
+    assert intelligence_choices_for_model(MODEL_GPT_5_6_LUNA) == ("low", "medium", "high", "xhigh", "max")
+    assert intelligence_choices_for_model(MODEL_GPT_5_5) == ("low", "medium", "high", "xhigh")
+
+
 def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     path = project_config_path(tmp_path)
     path.parent.mkdir()
@@ -52,7 +71,9 @@ def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     config = load_project_config(tmp_path)
 
     assert config.coder_mod == "gpt-coder"
-    assert config.super_mod == DEFAULT_MODEL
+    assert config.runtime_mod == DEFAULT_MODEL
+    assert config.completion_mod == DEFAULT_MODEL
+    assert config.adversary_mod == DEFAULT_MODEL
     assert config.start_over is True
 
 
@@ -80,6 +101,9 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["fast"] is True
     assert payload["clean"] is True
     assert payload["max_completion_returns_per_generation"] == 10
+    assert payload["runtime_mod"] == DEFAULT_MODEL
+    assert payload["completion_mod"] == DEFAULT_MODEL
+    assert payload["adversary_mod"] == DEFAULT_MODEL
 
 
 def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
@@ -107,9 +131,13 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
 
     assert config.task == "TASK.md"
     assert config.coder_mod == "gpt-coder"
-    assert config.super_mod == "gpt-supervisor"
+    assert config.runtime_mod == "gpt-supervisor"
+    assert config.completion_mod == "gpt-supervisor"
+    assert config.adversary_mod == DEFAULT_MODEL
     assert config.coder_intelligence == "low"
-    assert config.super_intelligence == "high"
+    assert config.runtime_intelligence == "high"
+    assert config.completion_intelligence == "high"
+    assert config.adversary_intelligence == DEFAULT_INTELLIGENCE
     assert config.speed == "fast"
     assert config.start_over is False
     assert config.clean is True
@@ -117,6 +145,35 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     assert config.adversary is False
     assert config.adversary_runs == 0
     assert config.completion_returns_per_generation == 4
+
+
+def test_project_config_loads_independent_role_models_and_efforts(tmp_path: Path) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps(
+            {
+                "coder_mod": MODEL_GPT_5_6_SOL,
+                "runtime_mod": MODEL_GPT_5_5,
+                "completion_mod": MODEL_GPT_5_6_TERRA,
+                "adversary_mod": MODEL_GPT_5_6_SOL,
+                "coder_intelligence": "ultra",
+                "runtime_intelligence": "xhigh",
+                "completion_intelligence": "ultra",
+                "adversary_intelligence": "max",
+            }
+        ),
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.coder_mod == MODEL_GPT_5_6_SOL
+    assert config.runtime_mod == MODEL_GPT_5_5
+    assert config.completion_mod == MODEL_GPT_5_6_TERRA
+    assert config.adversary_mod == MODEL_GPT_5_6_SOL
+    assert config.coder_intelligence == "ultra"
+    assert config.runtime_intelligence == "xhigh"
+    assert config.completion_intelligence == "ultra"
+    assert config.adversary_intelligence == "max"
 
 
 def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> None:
@@ -173,7 +230,7 @@ def test_config_change_patches_only_changed_runtime_fields(tmp_path: Path) -> No
 
     sync_runtime_config_fields(
         tmp_path,
-        ProjectConfig(coder_mod="config-coder", super_mod="config-super", speed="fast", clean=True),
+        ProjectConfig(coder_mod="config-coder", runtime_mod="config-super", speed="fast", clean=True),
         ("speed",),
     )
 
@@ -314,25 +371,59 @@ def test_config_editor_inline_number_rejects_invalid_input() -> None:
     assert state.edit_error == "enter a non-negative integer"
 
 
-def test_config_editor_model_choices_come_from_available_models() -> None:
-    config = ProjectConfig(coder_mod="gpt-5.4", super_mod="gpt-5.3-codex-spark")
-    params = parameter_defs(config, model_choices=("gpt-5.4-mini", "gpt-5.4"))
-    coder_param = next(param for param in params if param.key == "coder_mod")
-    super_param = next(param for param in params if param.key == "super_mod")
+def test_config_editor_groups_gpt_56_variants_and_filters_older_models() -> None:
+    config = ProjectConfig()
+    params = parameter_defs(
+        config,
+        model_choices=(
+            MODEL_GPT_5_6_SOL,
+            MODEL_GPT_5_6_TERRA,
+            MODEL_GPT_5_6_LUNA,
+            MODEL_GPT_5_5,
+            "gpt-5.4",
+            "gpt-5.3-codex-spark",
+        ),
+    )
+    for role in ("coder", "runtime", "completion", "adversary"):
+        model_param = next(param for param in params if param.key == f"{role}_mod")
+        variant_param = next(param for param in params if param.key == f"{role}_mod_variant")
+        assert [option.label for option in model_param.options] == ["GPT-5.6", "GPT-5.5"]
+        assert [option.label for option in variant_param.options] == ["Sol", "Terra", "Luna"]
+        assert all(option.action is None for option in model_param.options)
 
-    assert [option.label for option in coder_param.options] == [
-        "gpt-5.5",
-        "gpt-5.4-mini",
-        "gpt-5.4",
-        "gpt-5.3-codex-spark",
-    ]
-    assert [option.label for option in super_param.options] == [
-        "gpt-5.5",
-        "gpt-5.4-mini",
-        "gpt-5.4",
-        "gpt-5.3-codex-spark",
-    ]
-    assert all(option.action is None for option in coder_param.options)
+
+def test_config_editor_switching_variants_clamps_incompatible_reasoning() -> None:
+    config = ProjectConfig(coder_mod=MODEL_GPT_5_6_SOL, coder_intelligence="ultra")
+    params = parameter_defs(config)
+    variant_index = [param.key for param in params].index("coder_mod_variant")
+    luna_index = [option.label for option in params[variant_index].options].index("Luna")
+
+    config, state, _action = select_current(
+        config,
+        EditorState(parameter_index=variant_index, expanded_index=variant_index, option_index=luna_index),
+    )
+
+    assert config.coder_mod == MODEL_GPT_5_6_LUNA
+    assert config.coder_intelligence == "max"
+    assert state.parameter_index == variant_index + 1
+    coder_effort = next(param for param in parameter_defs(config) if param.key == "coder_intelligence")
+    assert [option.label for option in coder_effort.options] == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_config_editor_switching_to_gpt_55_hides_variant_and_clamps_reasoning() -> None:
+    config = ProjectConfig(coder_mod=MODEL_GPT_5_6_SOL, coder_intelligence="ultra")
+    params = parameter_defs(config)
+    family_index = [param.key for param in params].index("coder_mod")
+    gpt_55_index = [option.label for option in params[family_index].options].index("GPT-5.5")
+
+    config, _state, _action = select_current(
+        config,
+        EditorState(parameter_index=family_index, expanded_index=family_index, option_index=gpt_55_index),
+    )
+
+    assert config.coder_mod == MODEL_GPT_5_5
+    assert config.coder_intelligence == "xhigh"
+    assert "coder_mod_variant" not in {parameter.key for parameter in parameter_defs(config)}
 
 
 def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -345,7 +436,10 @@ def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.M
             {
                 "models": [
                     {"slug": "gpt-5.4", "visibility": "list"},
-                    {"slug": "gpt-5.5", "visibility": "list"},
+                    {"slug": MODEL_GPT_5_5, "visibility": "list"},
+                    {"slug": MODEL_GPT_5_6_SOL, "visibility": "list"},
+                    {"slug": MODEL_GPT_5_6_TERRA, "visibility": "list"},
+                    {"slug": MODEL_GPT_5_6_LUNA, "visibility": "list"},
                     {"slug": "hidden-model", "visibility": "hidden"},
                     {"slug": "gpt-5.3-codex-spark", "visibility": "list"},
                 ]
@@ -354,7 +448,32 @@ def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.M
         encoding="utf-8",
     )
 
-    assert available_model_choices(tmp_path) == ("gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark")
+    assert available_model_choices(tmp_path) == (
+        MODEL_GPT_5_6_SOL,
+        MODEL_GPT_5_6_TERRA,
+        MODEL_GPT_5_6_LUNA,
+        MODEL_GPT_5_5,
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_field"),
+    [
+        ('{"coder_mod": "gpt-5.6-luna", "coder_intelligence": "ultra"}', "coder_intelligence"),
+        ('{"runtime_mod": "gpt-5.5", "runtime_intelligence": "max"}', "runtime_intelligence"),
+        ('{"completion_mod": "gpt-5.6-luna", "completion_intelligence": "ultra"}', "completion_intelligence"),
+        ('{"adversary_mod": "gpt-5.5", "adversary_intelligence": "max"}', "adversary_intelligence"),
+    ],
+)
+def test_project_config_rejects_reasoning_effort_unsupported_by_model(
+    tmp_path: Path,
+    payload: str,
+    error_field: str,
+) -> None:
+    _write_config_payload(tmp_path, payload)
+
+    with pytest.raises(ProjectConfigError, match=error_field):
+        load_project_config(tmp_path, create=False)
 
 
 def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -366,6 +485,9 @@ def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert result.exit_code == 0
     assert "Saved Sentinel config:" in result.output
     assert "coder-mod: gpt-coder" in result.output
+    assert f"runtime-mod: {DEFAULT_MODEL}" in result.output
+    assert f"completion-mod: {DEFAULT_MODEL}" in result.output
+    assert f"adversary-mod: {DEFAULT_MODEL}" in result.output
 
 
 def _write_config_payload(tmp_path: Path, payload: str) -> None:

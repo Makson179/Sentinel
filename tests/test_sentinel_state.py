@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -22,7 +23,10 @@ from supervisor.controller import (
     _has_passing_behavioral_validation,
     _has_readiness_marker,
     _inspection_from_action,
+    _hash_file,
     _path_from_git_status_line,
+    _read_workspace_file,
+    _sandbox_matches_mode,
     _evidence_provenance_summary,
     _file_kind,
     _validation_from_action,
@@ -33,17 +37,16 @@ from supervisor.approvals import normalize_approval_request
 from supervisor.appserver import APP_SERVER_CODER_RPC_TIMEOUT_SECONDS, AppServerError, AppServerMessage, AppServerTimeoutError
 from supervisor.coder import CODEX_FAST_SERVICE_TIER, CoderSession, coder_thread_params, coder_turn_params
 from supervisor.main import _run_async_cleanly
+from supervisor.project_config import DEFAULT_MODEL, MODEL_GPT_5_5, MODEL_GPT_5_6_SOL
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
     AdversaryReport,
     ApprovalDecisionKind,
-    BreadthRiskSummary,
     ChangedFile,
     ChangedFileDiff,
     CheapRuntimeDecision,
     CoderMessage,
-    CompletionReturnRecord,
     CompletionReviewDecision,
     FinalReport,
     PriorIntervention,
@@ -54,7 +57,6 @@ from supervisor.schemas import (
     SupervisorDecisionKind,
     SupervisorWakePacket,
     TriggeringAction,
-    InspectionRun,
     ValidationRun,
 )
 from supervisor.state import (
@@ -66,12 +68,14 @@ from supervisor.state import (
     LOG,
     PREVIOUS_RUNS,
     PROGRESS,
+    RECOVERY,
     RUNTIME_METRICS,
     RUNTIME_TRACE,
     SUPERVISOR_WAKES,
     StateStore,
 )
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
+from supervisor.workspace_snapshot import create_workspace_snapshot
 
 
 def test_sentinel_state_initializes_required_files(tmp_path: Path) -> None:
@@ -165,14 +169,14 @@ async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(
 
     assert "src/app.c" in paths
     assert "run_demo" in paths
-    assert "src/app.o" not in paths
+    assert "src/app.o" in paths
     assert "__pycache__/app.cpython-312.pyc" not in paths
-    assert "compiler" not in paths
+    assert "compiler" in paths
     assert "src/app.c" in diff_summary
     assert "run_demo" in diff_summary
-    assert "src/app.o" not in diff_summary
+    assert "src/app.o" in diff_summary
     assert "__pycache__" not in diff_summary
-    assert "compiler" not in diff_summary
+    assert "compiler" in diff_summary
 
     controller.use_git_diff = False
     controller.observed_changed_files = {
@@ -187,11 +191,53 @@ async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(
     }
 
     observed_paths = {file.path for file in await controller.changed_files()}
-    assert observed_paths == {"src/app.c"}
+    assert observed_paths == {"src/app.c", "src/app.o", "compiler"}
 
 
-def test_coder_sandbox_defaults_to_read_only(tmp_path: Path, monkeypatch) -> None:
+def test_coder_sandbox_defaults_to_workspace_write(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SENTINEL_CODER_SANDBOX", raising=False)
+
+    assert coder_thread_params(tmp_path)["sandbox"] == "workspace-write"
+    assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {
+        "type": "workspaceWrite",
+        "writableRoots": [str(tmp_path.resolve())],
+        "networkAccess": False,
+    }
+
+
+def test_snapshot_mode_protects_entire_original_workspace_from_approval_commands(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    controller = SentinelController.__new__(SentinelController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller._coder_snapshot = SimpleNamespace(original_root=tmp_path)
+
+    assert controller._immutable_approval_paths() == (tmp_path, task)
+
+
+def test_workspace_write_preflight_rejects_network_or_extra_writable_roots(tmp_path: Path) -> None:
+    valid = {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False}
+    same_root = {
+        "type": "workspaceWrite",
+        "writableRoots": [str(tmp_path.resolve())],
+        "networkAccess": False,
+    }
+    network_enabled = {"type": "workspaceWrite", "writableRoots": [], "networkAccess": True}
+    extra_root = {
+        "type": "workspaceWrite",
+        "writableRoots": [str(tmp_path.parent.resolve())],
+        "networkAccess": False,
+    }
+
+    assert _sandbox_matches_mode(valid, "workspace-write", workspace_root=tmp_path) is True
+    assert _sandbox_matches_mode(same_root, "workspace-write", workspace_root=tmp_path) is True
+    assert _sandbox_matches_mode(network_enabled, "workspace-write", workspace_root=tmp_path) is False
+    assert _sandbox_matches_mode(extra_root, "workspace-write", workspace_root=tmp_path) is False
+
+
+def test_coder_sandbox_can_use_read_only(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SENTINEL_CODER_SANDBOX", "read-only")
 
     assert coder_thread_params(tmp_path)["sandbox"] == "read-only"
     assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {
@@ -300,6 +346,9 @@ def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_p
     store.path(LOG).write_text("old log\n", encoding="utf-8")
     (previous_runs / "run9").mkdir()
     (previous_runs / "run9" / "FINAL_REPORT.md").write_text("old report", encoding="utf-8")
+    recovery = store.path(RECOVERY)
+    (recovery / "run9" / "workspace").mkdir(parents=True)
+    (recovery / "run9" / "workspace" / "app.py").write_text("recovery", encoding="utf-8")
     (store.state_dir / "scratch.txt").write_text("scratch", encoding="utf-8")
 
     store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
@@ -309,6 +358,7 @@ def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_p
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
     assert store.path(PREVIOUS_RUNS).is_dir()
     assert list(store.path(PREVIOUS_RUNS).iterdir()) == []
+    assert not store.path(RECOVERY).exists()
     assert not (store.state_dir / "scratch.txt").exists()
 
 
@@ -331,6 +381,9 @@ def test_resume_initialization_preserves_history_and_resets_runtime_files(tmp_pa
     store.path(SUPERVISOR_WAKES).write_text("stale wake\n", encoding="utf-8")
     store.path(RUNTIME_TRACE).write_text("stale trace\n", encoding="utf-8")
     store.path(RUNTIME_METRICS).write_text('{"old": true}\n', encoding="utf-8")
+    recovery_workspace = store.path(RECOVERY) / "run2" / "workspace"
+    recovery_workspace.mkdir(parents=True)
+    (recovery_workspace / "app.py").write_text("recover me", encoding="utf-8")
     (store.state_dir / "scratch.txt").write_text("scratch", encoding="utf-8")
     (store.state_dir / "scratch_dir").mkdir()
 
@@ -346,6 +399,7 @@ def test_resume_initialization_preserves_history_and_resets_runtime_files(tmp_pa
     assert store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8") == ""
     assert store.path(RUNTIME_TRACE).read_text(encoding="utf-8") == ""
     assert store.path(RUNTIME_METRICS).read_text(encoding="utf-8") == "{}\n"
+    assert (recovery_workspace / "app.py").read_text(encoding="utf-8") == "recover me"
     assert not (store.state_dir / "scratch.txt").exists()
     assert not (store.state_dir / "scratch_dir").exists()
 
@@ -452,6 +506,131 @@ async def test_final_report_non_git_omits_git_usage_and_includes_validations(tmp
 
     controller._archive_final_report_once()
     assert sorted(path.name for path in store.path(PREVIOUS_RUNS).iterdir()) == ["run1"]
+
+
+async def test_finalize_applies_accepted_snapshot_patch_to_real_workspace(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.use_git_diff = True
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller._snapshot_patch_applied = False
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+    await controller.finalize("task complete", status=SentinelStatus.COMPLETE, completion_review_accepted=True)
+
+    assert source.read_text(encoding="utf-8") == "value = 2\n"
+    assert not snapshot.temp_root.exists()
+    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert "- app.py" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+
+
+async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_rejected(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.use_git_diff = True
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller._snapshot_patch_applied = False
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    (snapshot.snapshot_root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+
+    await controller.finalize("task complete", status=SentinelStatus.COMPLETE, completion_review_accepted=True)
+
+    assert not (tmp_path / ".env").exists()
+    assert not snapshot.temp_root.exists()
+    recovery_workspace = tmp_path / ".supervisor" / "recovery" / "run1" / "workspace"
+    assert recovery_workspace.is_dir()
+    assert (recovery_workspace / ".env").read_text(encoding="utf-8") == "TOKEN=secret\n"
+    assert not (recovery_workspace / ".git").exists()
+    assert not (recovery_workspace / ".supervisor").exists()
+    assert not (recovery_workspace / "TASK.md").is_symlink()
+    assert (recovery_workspace / "TASK.md").read_text(encoding="utf-8") == "# Task"
+    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "accepted snapshot could not be applied" in report
+    assert "snapshot preserved" in report
+
+
+async def test_noncomplete_run_preserves_workspace_without_applying_it(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller._snapshot_patch_applied = False
+    controller._coder_started = True
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+    await controller.finalize("exited by user", status=SentinelStatus.EXITED)
+
+    recovery_workspace = tmp_path / ".supervisor" / "recovery" / "run1" / "workspace"
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
+    assert (recovery_workspace / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert not (recovery_workspace / ".git").exists()
+    assert not (recovery_workspace / ".supervisor").exists()
+    assert store.get_sentinel_config().status == SentinelStatus.EXITED
+    assert str(recovery_workspace) in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+
+
+async def test_preflight_failure_cleans_unused_snapshot_without_recovery(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller._snapshot_patch_applied = False
+    controller._coder_started = False
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+
+    await controller.finalize("preflight failed", status=SentinelStatus.PROVIDER_FAILURE)
+
+    assert not snapshot.temp_root.exists()
+    assert not (store.state_dir / "recovery").exists()
+    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+
+
+def test_task_integrity_detects_replaced_snapshot_link(tmp_path: Path) -> None:
+    controller, _store, _ = _runtime_controller(tmp_path)
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    try:
+        assert controller._task_integrity_issue() is None
+        snapshot.task_path.unlink()
+        snapshot.task_path.write_text("weakened\n", encoding="utf-8")
+
+        assert controller._task_integrity_issue() == "the coder workspace replaced or removed the read-only task link"
+    finally:
+        snapshot.cleanup()
+
+
+async def test_runtime_git_inspection_waits_for_trusted_snapshot_config(tmp_path: Path) -> None:
+    controller, _store, _ = _runtime_controller(tmp_path)
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    try:
+        subprocess.run(
+            ["git", "config", "--local", "filter.untrusted.clean", "false"],
+            cwd=snapshot.snapshot_root,
+            check=True,
+        )
+
+        assert await controller._git_output(["git", "status", "--short"]) is None
+
+        repaired = controller._repair_snapshot_runtime_controls(source="test")
+
+        assert repaired == ("git_config",)
+        assert await controller._git_output(["git", "status", "--short"]) == ""
+    finally:
+        snapshot.cleanup()
 
 
 def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
@@ -670,6 +849,9 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert direct_script.type == "behavior_demo"
     assert direct_script.captured_output == "hello world\n"
     assert direct_script.validation_id.startswith("validation-")
+    assert python_unittest is not None
+    assert python_unittest.type == "behavioral"
+    assert python_unittest.trusted_validation_outcome == "passed"
     assert shell_visible_script is not None
     assert shell_visible_script.type == "behavioral"
     assert shell_visible_script.trusted_validation_outcome == "passed"
@@ -1318,7 +1500,7 @@ def test_file_change_large_diff_noops_without_runtime_model(tmp_path: Path) -> N
     assert decision.reasons == ()
 
 
-def test_safe_task_validation_large_diff_noops_without_runtime_model(tmp_path: Path) -> None:
+def test_project_execution_large_diff_wakes_runtime_supervisor(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     decision = controller.should_wake_runtime_supervisor(
@@ -1333,11 +1515,11 @@ def test_safe_task_validation_large_diff_noops_without_runtime_model(tmp_path: P
         changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
     )
 
-    assert decision.should_wake is False
-    assert decision.reasons == ()
+    assert decision.should_wake is True
+    assert decision.reasons == ("large_diff",)
 
 
-def test_safe_task_validation_nonzero_noops_without_protected_reason(tmp_path: Path) -> None:
+def test_project_execution_nonzero_wakes_runtime_supervisor(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     action = TriggeringAction(
         kind="commandExecution",
@@ -1361,11 +1543,11 @@ def test_safe_task_validation_nonzero_noops_without_protected_reason(tmp_path: P
         changed_files=[],
     )
 
-    assert decision.should_wake is False
-    assert decision.reasons == ()
+    assert decision.should_wake is True
+    assert decision.reasons == ("nonzero_exit",)
 
 
-def test_protected_runtime_reason_overrides_safe_task_validation_noop(tmp_path: Path) -> None:
+def test_protected_runtime_reason_stays_visible_for_project_execution(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     decision = controller.should_wake_runtime_supervisor(
@@ -1385,7 +1567,7 @@ def test_protected_runtime_reason_overrides_safe_task_validation_noop(tmp_path: 
     assert decision.reasons == ("repeated_same_failing_validation", "nonzero_exit")
 
 
-def test_unresolved_masked_validation_blocks_safe_task_validation_noop(tmp_path: Path) -> None:
+def test_unresolved_masked_validation_still_wakes_for_project_execution(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     controller.validation_runtime_state = {
         "validation-old": {
@@ -1827,7 +2009,7 @@ def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
     assert bare_pass.masking_reason == "behavior_demo_self_verdict_only"
 
 
-def test_command_aggregated_output_is_attached_to_validation_ledger() -> None:
+def test_validation_ledger_reads_aggregated_output_field() -> None:
     validation = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -2696,7 +2878,10 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
         async def close_completion_review(self) -> None:
             self.closed += 1
 
-    controller.supervisor = _CloseTrackingSupervisor()
+    runtime_supervisor = _CloseTrackingSupervisor()
+    completion_supervisor = _CloseTrackingSupervisor()
+    controller.supervisor = runtime_supervisor
+    controller.completion_supervisor = completion_supervisor
 
     await controller.apply_completion_decision(
         CompletionReviewDecision(
@@ -2723,7 +2908,8 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     assert "Completion review returned missing fallback coverage" in store.path("PROGRESS.md").read_text(encoding="utf-8")
     # Fresh completion-review thread per review: a normal return closes the session so the
     # next readiness review starts a new thread instead of accumulating prior turns.
-    assert controller.supervisor.closed == 1
+    assert runtime_supervisor.closed == 0
+    assert completion_supervisor.closed == 1
 
 
 async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validation(tmp_path: Path) -> None:
@@ -3049,14 +3235,25 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     controller.adversary_enabled = True
     controller.client = object()
     controller.model = None
-    controller.coder_model = "gpt-5.4"
-    controller.supervisor_model = "gpt-5.4"
+    controller.coder_model = MODEL_GPT_5_5
+    controller.supervisor_model = MODEL_GPT_5_5
+    controller.adversary_model = "gpt-adversary"
+    controller.adversary_intelligence = "ultra"
     controller.running = True
     controller.observed_changed_files = {"src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)}
 
     class FakeAdversary:
-        def __init__(self, *args, model=None, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
-            assert model == ADVERSARY_MODEL
+        def __init__(
+            self,
+            *args,
+            model=None,
+            intelligence=None,
+            on_thread_start=None,
+            on_thread_done=None,
+            **kwargs,
+        ) -> None:
+            assert model == "gpt-adversary"
+            assert intelligence == "ultra"
             self.on_thread_start = on_thread_start
             self.on_thread_done = on_thread_done
 
@@ -3802,7 +3999,7 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-5.4"}, {"id": "gpt-5.5"}]}
+            return {"data": [{"id": MODEL_GPT_5_6_SOL}, {"id": MODEL_GPT_5_5}]}
 
         async def thread_start(self, params):
             self.thread_started = True
@@ -3815,8 +4012,8 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
         task_path=task,
         client=client,  # type: ignore[arg-type]
         tui=_FakeTUI(),
-        coder_model="gpt-5.44",
-        supervisor_model="gpt-5.4",
+        coder_model="gpt-5.6-unknown",
+        supervisor_model=MODEL_GPT_5_6_SOL,
         overwrite_state=True,
         use_git_diff=False,
     )
@@ -3828,8 +4025,8 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
     assert controller.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in report
     assert "model availability preflight failed before coder start" in report
-    assert "coder=gpt-5.44" in report
-    assert "Available models: gpt-5.4, gpt-5.5" in report
+    assert "coder=gpt-5.6-unknown" in report
+    assert "Available models: gpt-5.5, gpt-5.6-sol" in report
     assert ".supervisor/FINAL_REPORT.md" in report
     assert client.thread_started is False
     assert client.stopped is True
@@ -3863,7 +4060,7 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-5.4"}]}
+            return {"data": [{"id": MODEL_GPT_5_5}]}
 
         async def thread_start(self, params):
             self.thread_started = True
@@ -3876,8 +4073,8 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
         task_path=task,
         client=client,  # type: ignore[arg-type]
         tui=_FakeTUI(),
-        coder_model="gpt-5.4",
-        supervisor_model="gpt-5.4",
+        coder_model=MODEL_GPT_5_5,
+        supervisor_model=MODEL_GPT_5_5,
         overwrite_state=True,
         use_git_diff=False,
     )
@@ -3890,7 +4087,7 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
     assert "- Status: provider_failure" in report
     assert "model availability preflight failed before coder start" in report
     assert f"adversary={ADVERSARY_MODEL}" in report
-    assert "Available models: gpt-5.4" in report
+    assert "Available models: gpt-5.5" in report
     assert client.thread_started is False
     assert client.stopped is True
 
@@ -3913,17 +4110,17 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
+            return {"data": [{"id": DEFAULT_MODEL}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}
 
         async def thread_start(self, params):
-            return {
-                "thread": {"id": "probe-thread"},
-                "approvalPolicy": "on-request",
-                "sandbox": {"type": "readOnly", "networkAccess": False},
-            }
+                return {
+                    "thread": {"id": "probe-thread"},
+                    "approvalPolicy": "on-request",
+                    "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False},
+                }
 
         async def thread_archive(self, thread_id):
             raise AssertionError("preflight probe cleanup should not archive threads without rollouts")
@@ -3950,9 +4147,9 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
 
     assert client.unsubscribed == ["probe-thread"]
     config = controller.store.get_sentinel_config()
-    assert config.model == "gpt-5.5"
-    assert config.coder_model == "gpt-5.5"
-    assert config.supervisor_model == "gpt-5.5"
+    assert config.model == DEFAULT_MODEL
+    assert config.coder_model == DEFAULT_MODEL
+    assert config.supervisor_model == DEFAULT_MODEL
     log_lines = controller.store.path(LOG).read_text(encoding="utf-8").splitlines()
     assert log_lines
     entry = json.loads(log_lines[-1])
@@ -3979,17 +4176,17 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
             )
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
+            return {"data": [{"id": DEFAULT_MODEL}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}
 
         async def thread_start(self, params):
-            return {
-                "thread": {"id": "probe-thread"},
-                "approvalPolicy": "on-request",
-                "sandbox": {"type": "readOnly", "networkAccess": False},
-            }
+                return {
+                    "thread": {"id": "probe-thread"},
+                    "approvalPolicy": "on-request",
+                    "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False},
+                }
 
         async def thread_unsubscribe(self, thread_id):
             self.unsubscribed.append(thread_id)
@@ -4013,9 +4210,9 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
     await controller.preflight()
 
     config = controller.store.get_sentinel_config()
-    assert config.model == "gpt-5.5"
-    assert config.coder_model == "gpt-5.5"
-    assert config.supervisor_model == "gpt-5.5"
+    assert config.model == DEFAULT_MODEL
+    assert config.coder_model == DEFAULT_MODEL
+    assert config.supervisor_model == DEFAULT_MODEL
     assert client.unsubscribed == ["probe-thread"]
     assert any("rate limit check unavailable" in message for _, message in tui.messages)
     log_lines = controller.store.path(LOG).read_text(encoding="utf-8").splitlines()
@@ -4042,7 +4239,7 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
+            return {"data": [{"id": DEFAULT_MODEL}, {"id": "gpt-test"}]}
 
         async def config_requirements_read(self):
             return {}
@@ -4710,7 +4907,14 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
             return {}
 
         async def model_list(self):
-            return {"data": [{"id": "gpt-5.5"}, {"id": "gpt-test"}]}
+            return {
+                "data": [
+                    {"id": DEFAULT_MODEL},
+                    {"id": "gpt-coder"},
+                    {"id": "gpt-runtime"},
+                    {"id": "gpt-completion"},
+                ]
+            }
 
         async def config_requirements_read(self):
             return {}
@@ -4720,7 +4924,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
             return {
                 "thread": {"id": f"thread-{self.thread_count}"},
                 "approvalPolicy": "on-request",
-                "sandbox": {"type": "readOnly", "networkAccess": False},
+                "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False},
             }
 
         async def thread_unsubscribe(self, thread_id, **kwargs):
@@ -4737,6 +4941,13 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
         task_path=task,
         client=client,  # type: ignore[arg-type]
         tui=_FakeTUI(),
+        coder_model="gpt-coder",
+        runtime_model="gpt-runtime",
+        completion_model="gpt-completion",
+        coder_intelligence="ultra",
+        runtime_intelligence="xhigh",
+        completion_intelligence="high",
+        adversary_enabled=False,
         overwrite_state=True,
         use_git_diff=False,
     )
@@ -4748,6 +4959,16 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     await controller.finalize("task complete", status=SentinelStatus.COMPLETE)
     await asyncio.wait_for(run_task, timeout=1)
 
+    assert controller.coder is not None
+    assert controller.coder.model == "gpt-coder"
+    assert controller.coder.intelligence == "ultra"
+    assert controller.supervisor is not None
+    assert controller.supervisor.model == "gpt-runtime"
+    assert controller.supervisor.intelligence == "xhigh"
+    assert controller.completion_supervisor is not None
+    assert controller.completion_supervisor is not controller.supervisor
+    assert controller.completion_supervisor.model == "gpt-completion"
+    assert controller.completion_supervisor.intelligence == "high"
     assert client.stopped is True
     assert controller.running is False
 
@@ -5172,6 +5393,69 @@ def test_adversary_snapshot_gets_functional_git_repo(tmp_path: Path) -> None:
         assert "?? app.py" in status.stdout
     finally:
         _shutil.rmtree(snapshot.parent, ignore_errors=True)
+
+
+def test_adversary_snapshot_git_ignores_global_template_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from supervisor.controller import _create_adversary_snapshot
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("print('x')\n", encoding="utf-8")
+    marker = tmp_path / "global-hook-ran"
+    template = tmp_path / "git-template"
+    hooks = template / "hooks"
+    hooks.mkdir(parents=True)
+    hook = hooks / "post-commit"
+    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+    hook.chmod(0o755)
+    global_config = tmp_path / "global-gitconfig"
+    global_config.write_text(f"[init]\n\ttemplateDir = {template}\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+    snapshot = _create_adversary_snapshot(project)
+    try:
+        assert not marker.exists()
+        assert not (snapshot / ".git" / "hooks" / "post-commit").exists()
+        hooks_path = subprocess.check_output(
+            ["git", "config", "--local", "--get", "core.hooksPath"],
+            cwd=snapshot,
+            text=True,
+        ).strip()
+        assert hooks_path == os.devnull
+    finally:
+        import shutil as _shutil
+
+        _shutil.rmtree(snapshot.parent, ignore_errors=True)
+
+
+def test_workspace_state_id_does_not_open_fifo(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO files are not supported on this platform")
+    from supervisor.controller import _workspace_state_id
+
+    fifo = tmp_path / "coder-output"
+    os.mkfifo(fifo)
+
+    fifo_state = _workspace_state_id(tmp_path)
+    fifo.unlink()
+    fifo.write_text("regular file\n", encoding="utf-8")
+    file_state = _workspace_state_id(tmp_path)
+
+    assert fifo_state != file_state
+
+
+def test_workspace_context_reader_and_hasher_reject_fifo(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO files are not supported on this platform")
+    fifo = tmp_path / "coder-output"
+    os.mkfifo(fifo)
+
+    assert _read_workspace_file(tmp_path, "coder-output", limit=1000) is None
+    with pytest.raises(OSError, match="not a regular file"):
+        _hash_file(fifo)
 
 
 def test_effective_max_adversary_runs_cli_override(tmp_path: Path) -> None:

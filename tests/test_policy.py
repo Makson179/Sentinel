@@ -1,12 +1,65 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+import supervisor.policy as policy_module
 from supervisor.approval_triage import command_analysis_from_policy_decision
 from supervisor.policy import PolicyEngine
 from supervisor.schemas import PolicyDecisionKind
+
+
+def test_tracked_path_git_query_uses_isolated_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "src/app.py\n"
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return Completed()
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "untrusted-gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "malicious-hook")
+    monkeypatch.setattr(policy_module.subprocess, "run", fake_run)
+
+    assert policy_module._git_path_is_tracked_or_contains_tracked(tmp_path, "src/app.py", is_dir=False)
+    assert captured["command"][:4] == ["git", "-c", "core.fsmonitor=false", "ls-files"]
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GIT_CONFIG_GLOBAL"] == policy_module.os.devnull
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "GIT_CONFIG_COUNT" not in env
+    assert "GIT_CONFIG_KEY_0" not in env
+    assert "GIT_CONFIG_VALUE_0" not in env
+
+
+def test_external_immutable_root_does_not_block_relative_dependency_execution(tmp_path: Path) -> None:
+    original = tmp_path / "original"
+    executable = original / ".venv" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("", encoding="utf-8")
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    os.symlink(original / ".venv", snapshot / ".venv")
+
+    decision = PolicyEngine(snapshot, immutable_paths=(original,)).evaluate(
+        {
+            "command": ".venv/bin/python -c 'print(1)'",
+            "cwd": str(snapshot),
+        }
+    )
+
+    assert "immutable path" not in decision.reason
 
 
 def test_workspace_policy_rejects_symlink_escape(workspace: Path, tmp_path: Path) -> None:
@@ -293,6 +346,50 @@ def test_protected_or_escaping_read_only_commands_do_not_auto_allow(
     assert decision.kind != PolicyDecisionKind.ALLOW
     assert analysis is not None
     assert expected_tag in analysis.risk_tags
+
+
+def test_patch_paths_deny_declared_grading_root(workspace: Path) -> None:
+    decision = PolicyEngine(workspace, declared_grading_roots=("hidden",)).evaluate_patch_paths(
+        ["hidden/private.txt"]
+    )
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert "declared grading/hidden path access denied" in decision.reason
+
+
+def test_patch_paths_deny_immutable_task(workspace: Path) -> None:
+    task = workspace / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    decision = PolicyEngine(workspace, immutable_paths=(task,)).evaluate_patch_paths(["TASK.md"])
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert "immutable path write denied" in decision.reason
+
+
+def test_shell_escalation_targeting_immutable_task_is_denied(workspace: Path) -> None:
+    task = workspace / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    decision = PolicyEngine(workspace, immutable_paths=(task,)).evaluate(
+        {"command": "/bin/bash -lc 'printf weakened > TASK.md'", "cwd": str(workspace)}
+    )
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert "immutable path" in decision.reason
+
+
+def test_interpreter_escalation_with_embedded_immutable_task_path_is_denied(workspace: Path) -> None:
+    task = workspace / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    command = f'python -c "from pathlib import Path; Path({str(task)!r}).write_text(\"weakened\")"'
+
+    decision = PolicyEngine(workspace, immutable_paths=(task,)).evaluate(
+        {"command": command, "cwd": str(workspace)}
+    )
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert "immutable path" in decision.reason
 
 
 @pytest.mark.parametrize(

@@ -189,6 +189,158 @@ async def test_accept_with_execpolicy_amendment_only_for_command(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_network_approval_never_persists_broad_execpolicy_amendment(tmp_path: Path) -> None:
+    amendment = ["curl", "-L"]
+    supervisor = FakeFullSupervisor(
+        SupervisorDecision(
+            decision=SupervisorDecisionKind.APPROVE,
+            approval_decision=ApprovalDecisionKind.ACCEPT,
+            execpolicy_amendment=amendment,
+            persistent_decision="allow this command prefix",
+            reason="reference host is required by the task",
+        )
+    )
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            120,
+            {
+                "command": "curl -L https://example.com",
+                "cwd": str(tmp_path),
+                "networkApprovalContext": {"host": "example.com", "protocol": "https", "port": 443},
+                "proposedExecpolicyAmendment": amendment,
+                "availableDecisions": [
+                    "accept",
+                    {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}},
+                    "decline",
+                ],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=supervisor).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert decision.persistent_decision is None
+
+
+@pytest.mark.asyncio
+async def test_network_approval_cannot_write_to_immutable_original_workspace(tmp_path: Path) -> None:
+    original = tmp_path / "original"
+    original.mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    supervisor = FakeFullSupervisor()
+    ctx = command_context(
+        snapshot,
+        f"curl -fsSL https://example.com/ -o {original / 'download.html'}",
+    )
+    ctx = ctx.model_copy(
+        update={
+            "network_approval_context": {
+                "host": "example.com",
+                "protocol": "https",
+                "port": 443,
+            }
+        }
+    )
+
+    decision = await ApprovalManager(
+        snapshot,
+        supervisor=supervisor,
+        immutable_paths=(original,),
+    ).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "immutable path" in decision.reason
+    assert supervisor.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_network_command_without_protocol_context_still_cannot_persist_amendment(tmp_path: Path) -> None:
+    amendment = ["set", "-o", "pipefail"]
+    supervisor = FakeFullSupervisor(
+        SupervisorDecision(
+            decision=SupervisorDecisionKind.APPROVE,
+            approval_decision=ApprovalDecisionKind.ACCEPT,
+            execpolicy_amendment=amendment,
+            persistent_decision="allow this command prefix",
+            reason="reference host is required by the task",
+        )
+    )
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            121,
+            {
+                "command": "set -o pipefail\ncurl -L https://example.com | sed -n '1p'",
+                "cwd": str(tmp_path),
+                "proposedExecpolicyAmendment": amendment,
+                "availableDecisions": [
+                    "accept",
+                    {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}},
+                    "decline",
+                ],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=supervisor).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert decision.persistent_decision is None
+
+
+@pytest.mark.asyncio
+async def test_network_policy_amendment_cannot_be_accepted_for_session(tmp_path: Path) -> None:
+    supervisor = FakeFullSupervisor(
+        SupervisorDecision(
+            decision=SupervisorDecisionKind.APPROVE,
+            approval_decision=ApprovalDecisionKind.ACCEPT_FOR_SESSION,
+            reason="repeatable network access",
+        )
+    )
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            122,
+            {
+                "command": "curl https://example.com",
+                "cwd": str(tmp_path),
+                "proposedNetworkPolicyAmendments": [{"host": "example.com"}],
+                "availableDecisions": ["acceptForSession", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=supervisor).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
+async def test_file_change_to_immutable_task_is_denied(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    ctx = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            121,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": str(task),
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, immutable_paths=(task,)).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "immutable path" in decision.reason
+
+
+@pytest.mark.asyncio
 async def test_file_change_does_not_emit_execpolicy_amendment(tmp_path: Path) -> None:
     class Reviewer:
         async def decide_approval(self, context, reason):
@@ -371,7 +523,7 @@ async def test_deterministic_allow_bypasses_cheap_and_full_review(tmp_path: Path
     ],
 )
 @pytest.mark.asyncio
-async def test_task_validation_commands_bypass_cheap_and_full_review(tmp_path: Path, command: str) -> None:
+async def test_project_execution_commands_use_full_supervisor_review(tmp_path: Path, command: str) -> None:
     cheap = FakeCheapReviewer()
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, command.format(workspace=tmp_path))
@@ -380,7 +532,7 @@ async def test_task_validation_commands_bypass_cheap_and_full_review(tmp_path: P
 
     assert decision.decision == "accept"
     assert cheap.calls == 0
-    assert full.calls == 0
+    assert full.calls == 1
 
 
 @pytest.mark.asyncio
@@ -471,7 +623,7 @@ async def test_workspace_escaping_write_bypasses_cheap_review(tmp_path: Path) ->
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, "cp parser.c /tmp/leak.c")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
 
     assert cheap.calls == 0
     assert full.calls == 1
