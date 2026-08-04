@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "server_identity": "bello_context_mode",
+  "tools": [
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_batch_execute",
+    "ctx_index",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_doctor",
+    "ctx_purge"
+  ],
+  "forbidden_tools": [
+    "ctx_fetch_and_index",
+    "ctx_insight",
+    "ctx_upgrade"
+  ],
+  "hooks": [
+    "PreToolUse",
+    "PostToolUse",
+    "SessionStart",
+    "PreCompact",
+    "UserPromptSubmit",
+    "Stop"
+  ]
+}

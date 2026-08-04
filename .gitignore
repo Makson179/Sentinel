@@ -5,5 +5,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 build/
+!release/context_mode_offline_fork/build/
+!release/context_mode_offline_fork/build/**
 dist/
 .supervisor/

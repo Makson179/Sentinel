@@ -27,6 +27,8 @@ MUTED = "#5B5B5B"
 GRID = "#D7D7D7"
 PAIR_LINE = "#A8A8A8"
 FONT = "Georgia, 'Times New Roman', serif"
+
+
 @dataclass(frozen=True)
 class Run:
     task: str
@@ -34,19 +36,15 @@ class Run:
     model: str
     mode: str
     completion: float
-    runtime_seconds: int | None
+    runtime_seconds: int
     runtime_label: str
 
     @property
     def runtime_hours(self) -> float:
-        if self.runtime_seconds is None:
-            raise ValueError(f"No runtime recorded for {self.task} / {self.model}")
         return self.runtime_seconds / 3600
 
 
-def parse_runtime(value: str) -> int | None:
-    if value.strip() in {"", "—"}:
-        return None
+def parse_runtime(value: str) -> int:
     hours, minutes, seconds = (int(part) for part in value.split(":"))
     return hours * 3600 + minutes * 60 + seconds
 
@@ -276,50 +274,28 @@ def overview_figure(runs: list[Run]) -> str:
 
 def task_bar_figure(task: str, runs: list[Run], panel_letter: str) -> str:
     task_runs = [run for run in runs if run.task == task]
-    indexed = {
-        (run.agent, run.model, run.mode): run
-        for run in task_runs
-    }
-    requested = (
-        ("Raw Codex", "gpt-5.5", "xhigh"),
-        ("Bello", "gpt-5.5", "xhigh"),
-        ("Raw Codex", "gpt-5.6-sol", "ultra"),
-        ("Bello", "gpt-5.6-sol", "ultra"),
-        ("Raw Codex", "gpt-5.6-sol", "xhigh"),
-        ("Bello", "gpt-5.6-sol", "xhigh"),
-    )
-    selected = [indexed[key] for key in requested]
-
-    selected.sort(
-        key=lambda run: (
-            run.completion,
-            0 if run.agent == "Bello" else 1,
-            run.model,
-            run.mode,
-        )
-    )
-
-    width, height = 1240, 420
-    plot_x, plot_width = 105.0, 850.0
-    plot_top, plot_bottom = 95.0, 315.0
+    indexed = {(run.mode, run.agent): run for run in task_runs}
+    plot_x, plot_width = 105.0, 565.0
+    plot_top, plot_bottom = 95.0, 306.0
     plot_height = plot_bottom - plot_top
-    centers = (155.0, 310.0, 465.0, 620.0, 775.0, 930.0)
-    bar_width = 78.0
-    legend_x = 1030.0
+    group_centers = {"ultra": 260.0, "xhigh": 515.0}
+    bar_width = 70.0
+    bar_offset = 44.0
+    legend_x = 750.0
 
     svg: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" role="img" '
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" '
+        f'viewBox="0 0 {WIDTH} {HEIGHT}" role="img" '
         f'aria-labelledby="title-{task.lower()} desc-{task.lower()}">',
-        f'<title id="title-{task.lower()}">{escape(task)} configuration profile</title>',
-        f'<desc id="desc-{task.lower()}">Six bars compare GPT-5.5 xhigh and '
-        f'GPT-5.6 Sol ultra and xhigh configurations, sorted by score.</desc>',
-        f'<rect width="{width}" height="{height}" fill="#FFFFFF"/>',
+        f'<title id="title-{task.lower()}">{escape(task)} completion scores</title>',
+        f'<desc id="desc-{task.lower()}">Grouped bars compare Raw Codex and '
+        f'Bello completion percentages in ultra and xhigh modes.</desc>',
+        f'<rect width="{WIDTH}" height="{HEIGHT}" fill="#FFFFFF"/>',
         text(48, 38, f"({panel_letter})  {task}", size=21, weight="bold"),
         text(
             48,
             62,
-            "Six model–effort configurations · ordered by completion score",
+            "ProgramBench completion score · gpt-5.6-sol",
             size=12,
             fill=MUTED,
         ),
@@ -338,43 +314,54 @@ def task_bar_figure(task: str, runs: list[Run], panel_letter: str) -> str:
         ]
     )
 
-    for center, run in zip(centers, selected, strict=True):
-        completion = run.completion
-        bar_height = (completion / 100) * plot_height
-        y = plot_bottom - bar_height
-        is_raw = run.agent == "Raw Codex"
-        fill = RAW_FILL if is_raw else BELLO_FILL
-        stroke = RAW_COLOR if is_raw else BELLO_COLOR
-        method_label = "Codex" if is_raw else "Bello"
-        model_label = (
-            "5.5 · xhigh"
-            if run.model == "gpt-5.5"
-            else f"5.6 Sol · {run.mode}"
-        )
-        svg.append(
-            rectangle(
-                center - bar_width / 2,
-                y,
-                bar_width,
-                bar_height,
-                fill=fill,
-                stroke=stroke,
-                stroke_width="1.8",
+    for mode, center in group_centers.items():
+        svg.append(text(center, plot_bottom + 27, mode, size=13, anchor="middle", weight="bold"))
+        for agent, x_center in (
+            ("Raw Codex", center - bar_offset),
+            ("Bello", center + bar_offset),
+        ):
+            run = indexed.get((mode, agent))
+            if run is None:
+                svg.append(
+                    line(
+                        x_center - bar_width / 2,
+                        plot_bottom - 2,
+                        x_center + bar_width / 2,
+                        plot_bottom - 2,
+                        stroke=BELLO_COLOR,
+                        stroke_width="2",
+                        stroke_dasharray="5 4",
+                    )
+                )
+                svg.append(text(x_center, plot_bottom - 12, "n/a", size=11, anchor="middle", fill=MUTED, style="italic"))
+                continue
+
+            height = (run.completion / 100) * plot_height
+            y = plot_bottom - height
+            fill = RAW_FILL if agent == "Raw Codex" else BELLO_FILL
+            stroke = RAW_COLOR if agent == "Raw Codex" else BELLO_COLOR
+            svg.append(
+                rectangle(
+                    x_center - bar_width / 2,
+                    y,
+                    bar_width,
+                    height,
+                    fill=fill,
+                    stroke=stroke,
+                    stroke_width="1.8",
+                )
             )
-        )
-        svg.append(
-            text(
-                center,
-                y - 9,
-                f"{completion:.2f}%",
-                size=12,
-                anchor="middle",
-                fill=stroke,
-                weight="bold",
+            svg.append(
+                text(
+                    x_center,
+                    y - 9,
+                    f"{run.completion:g}%",
+                    size=12,
+                    anchor="middle",
+                    fill=stroke,
+                    weight="bold",
+                )
             )
-        )
-        svg.append(text(center, plot_bottom + 24, method_label, size=12, anchor="middle", weight="bold"))
-        svg.append(text(center, plot_bottom + 42, model_label, size=11, anchor="middle", fill=MUTED))
 
     svg.extend(
         [
@@ -385,8 +372,8 @@ def task_bar_figure(task: str, runs: list[Run], panel_letter: str) -> str:
             text(legend_x + 38, 188, "Bello", size=12),
             text(
                 48,
-                404,
-                "All panels use matched Raw Codex and Bello runs; labels use the reported precision.",
+                369,
+                "Bars report observed completion percentages; a missing run is shown as n/a, not zero.",
                 size=11,
                 fill=MUTED,
             ),
@@ -396,165 +383,163 @@ def task_bar_figure(task: str, runs: list[Run], panel_letter: str) -> str:
     return "\n".join(svg) + "\n"
 
 
-def cross_task_summary_figure(runs: list[Run]) -> str:
-    width, height = 1200, 1025
-    plot_x, plot_width = 90.0, 880.0
-    panel_tops = (95.0, 400.0, 705.0)
-    panel_plot_height = 175.0
-    centers = (190.0, 410.0, 630.0, 850.0)
-    bar_width, bar_offset = 52.0, 31.0
-    tasks = ("Solar", "Samtools", "Rumdl")
-    indexed = {(run.task, run.model, run.mode, run.agent): run for run in runs}
-    panels = (
-        ("(a)  GPT-5.6 Sol · ultra", "gpt-5.6-sol", "ultra", "matched internal runs"),
-        ("(b)  GPT-5.6 Sol · xhigh", "gpt-5.6-sol", "xhigh", "matched internal runs"),
-        ("(c)  GPT-5.5 · xhigh", "gpt-5.5", "xhigh", "matched internal runs"),
+def mode_summary_figure(
+    runs: list[Run], mode: str, tasks: tuple[str, ...]
+) -> str:
+    width, height = 1040, 420
+    plot_x, plot_width = 95.0, 680.0
+    plot_top, plot_bottom = 92.0, 326.0
+    plot_height = plot_bottom - plot_top
+    legend_x = 835.0
+    indexed = {(run.task, run.mode, run.agent): run for run in runs}
+
+    raw_values = [
+        indexed[(task, mode, "Raw Codex")].completion
+        for task in tasks
+    ]
+    bello_values = [
+        indexed[(task, mode, "Bello")].completion
+        for task in tasks
+    ]
+    categories = [
+        (task, raw_value, bello_value)
+        for task, raw_value, bello_value in zip(
+            tasks, raw_values, bello_values, strict=True
+        )
+    ] + [
+        (
+            "Macro mean",
+            sum(raw_values) / len(raw_values),
+            sum(bello_values) / len(bello_values),
+        ),
+    ]
+    centers = (
+        (180.0, 350.0, 520.0, 690.0)
+        if len(categories) == 4
+        else (220.0, 445.0, 670.0)
     )
+    bar_width, bar_offset = 48.0, 29.0
 
     svg: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img" '
-        'aria-labelledby="cross-task-title cross-task-desc">',
-        '<title id="cross-task-title">ProgramBench cross-task completion summary</title>',
-        '<desc id="cross-task-desc">Three vertically aligned panels compare Raw Codex and Bello '
-        'completion percentages for Solar, Samtools, Rumdl, and their unweighted macro mean.</desc>',
+        f'aria-labelledby="{mode}-title {mode}-desc">',
+        f'<title id="{mode}-title">ProgramBench {mode} completion scores</title>',
+        f'<desc id="{mode}-desc">Grouped bars compare Raw Codex and Bello '
+        f'completion percentages for {len(tasks)} tasks and their macro mean.</desc>',
         f'<rect width="{width}" height="{height}" fill="#FFFFFF"/>',
-        text(48, 38, "Cross-task completion summary", size=22, weight="bold"),
+        text(
+            48,
+            38,
+            f"{'Primary' if mode == 'ultra' else 'Secondary'} comparison: {mode}",
+            size=21,
+            weight="bold",
+        ),
         text(
             48,
             62,
-            "Task-level completion scores and unweighted macro means · common 0–100% scale",
+            "Task-level completion scores and unweighted macro mean",
             size=12,
             fill=MUTED,
         ),
-        text(925, 30, "Method", size=13, weight="bold"),
-        rectangle(925, 43, 24, 17, fill=RAW_FILL, stroke=RAW_COLOR, stroke_width="1.5"),
-        text(959, 56, "Raw Codex", size=11),
-        rectangle(1065, 43, 24, 17, fill=BELLO_FILL, stroke=BELLO_COLOR, stroke_width="1.5"),
-        text(1099, 56, "Bello", size=11),
+        text(plot_x, 83, "Completion (%)", size=13, weight="bold"),
     ]
 
-    for panel_top, (panel_label, model, mode, note) in zip(
-        panel_tops, panels, strict=True
-    ):
-        plot_top = panel_top + 52
-        plot_bottom = plot_top + panel_plot_height
-        raw_values = [
-            indexed[(task, model, mode, "Raw Codex")].completion
-            for task in tasks
-        ]
-        bello_values = [
-            indexed[(task, model, mode, "Bello")].completion
-            for task in tasks
-        ]
-        categories = [
-            (task, raw_value, bello_value)
-            for task, raw_value, bello_value in zip(
-                tasks, raw_values, bello_values, strict=True
-            )
-        ] + [
-            (
-                "Macro mean",
-                sum(raw_values) / len(raw_values),
-                sum(bello_values) / len(bello_values),
-            )
-        ]
-
-        svg.append(text(plot_x, panel_top + 20, panel_label, size=17, weight="bold"))
+    for tick in range(0, 101, 20):
+        y = plot_bottom - (tick / 100) * plot_height
         svg.append(
-            text(
+            line(
+                plot_x,
+                y,
                 plot_x + plot_width,
-                panel_top + 20,
-                note,
-                size=11,
-                anchor="end",
-                fill=MUTED,
-                style="italic",
+                y,
+                stroke=GRID,
+                stroke_width="1",
+                stroke_dasharray="3 4",
             )
         )
-        svg.append(text(plot_x, plot_top - 10, "Completion (%)", size=12, weight="bold"))
+        svg.append(
+            text(plot_x - 12, y + 4, str(tick), size=11, anchor="end", fill=MUTED)
+        )
+    svg.extend(
+        [
+            line(plot_x, plot_top, plot_x, plot_bottom, stroke=INK, stroke_width="1.2"),
+            line(
+                plot_x,
+                plot_bottom,
+                plot_x + plot_width,
+                plot_bottom,
+                stroke=INK,
+                stroke_width="1.2",
+            ),
+        ]
+    )
 
-        for tick in range(0, 101, 20):
-            y = plot_bottom - (tick / 100) * panel_plot_height
+    for center, (label, raw_value, bello_value) in zip(
+        centers, categories, strict=True
+    ):
+        svg.append(
+            text(center, plot_bottom + 26, label, size=12, anchor="middle", weight="bold")
+        )
+        for value, agent, x_center in (
+            (raw_value, "Raw Codex", center - bar_offset),
+            (bello_value, "Bello", center + bar_offset),
+        ):
+            bar_height = (value / 100) * plot_height
+            y = plot_bottom - bar_height
+            fill = RAW_FILL if agent == "Raw Codex" else BELLO_FILL
+            stroke = RAW_COLOR if agent == "Raw Codex" else BELLO_COLOR
+            value_label = f"{value:.1f}%" if label == "Macro mean" else f"{value:g}%"
             svg.append(
-                line(
-                    plot_x,
+                rectangle(
+                    x_center - bar_width / 2,
                     y,
-                    plot_x + plot_width,
-                    y,
-                    stroke=GRID,
-                    stroke_width="1",
-                    stroke_dasharray="3 4",
+                    bar_width,
+                    bar_height,
+                    fill=fill,
+                    stroke=stroke,
+                    stroke_width="1.7",
                 )
             )
             svg.append(
-                text(plot_x - 12, y + 4, str(tick), size=10, anchor="end", fill=MUTED)
-            )
-        svg.extend(
-            [
-                line(plot_x, plot_top, plot_x, plot_bottom, stroke=INK, stroke_width="1.2"),
-                line(
-                    plot_x,
-                    plot_bottom,
-                    plot_x + plot_width,
-                    plot_bottom,
-                    stroke=INK,
-                    stroke_width="1.2",
-                ),
-            ]
-        )
-
-        for center, (label, raw_value, bello_value) in zip(
-            centers, categories, strict=True
-        ):
-            svg.append(
                 text(
-                    center,
-                    plot_bottom + 22,
-                    label,
+                    x_center,
+                    y - 8,
+                    value_label,
                     size=11,
                     anchor="middle",
+                    fill=stroke,
                     weight="bold",
                 )
             )
-            for value, agent, x_center in (
-                (raw_value, "Raw Codex", center - bar_offset),
-                (bello_value, "Bello", center + bar_offset),
-            ):
-                bar_height = (value / 100) * panel_plot_height
-                y = plot_bottom - bar_height
-                fill = RAW_FILL if agent == "Raw Codex" else BELLO_FILL
-                stroke = RAW_COLOR if agent == "Raw Codex" else BELLO_COLOR
-                value_label = f"{value:.2f}%"
-                svg.append(
-                    rectangle(
-                        x_center - bar_width / 2,
-                        y,
-                        bar_width,
-                        bar_height,
-                        fill=fill,
-                        stroke=stroke,
-                        stroke_width="1.7",
-                    )
-                )
-                svg.append(
-                    text(
-                        x_center,
-                        y - 7,
-                        value_label,
-                        size=10,
-                        anchor="middle",
-                        fill=stroke,
-                        weight="bold",
-                    )
-                )
 
     svg.extend(
         [
+            text(legend_x, 116, "Method", size=14, weight="bold"),
+            rectangle(
+                legend_x,
+                140,
+                26,
+                18,
+                fill=RAW_FILL,
+                stroke=RAW_COLOR,
+                stroke_width="1.5",
+            ),
+            text(legend_x + 38, 154, "Raw Codex", size=12),
+            rectangle(
+                legend_x,
+                177,
+                26,
+                18,
+                fill=BELLO_FILL,
+                stroke=BELLO_COLOR,
+                stroke_width="1.5",
+            ),
+            text(legend_x + 38, 191, "Bello", size=12),
             text(
                 48,
-                1004,
-                "Macro means are unweighted; all panels use matched Raw Codex and Bello runs.",
+                399,
+                "One observed run per task and method; no uncertainty intervals are estimated.",
                 size=11,
                 fill=MUTED,
             ),
@@ -564,47 +549,38 @@ def cross_task_summary_figure(runs: list[Run]) -> str:
     return "\n".join(svg) + "\n"
 
 
-def matched_effect_figure(
-    runs: list[Run], model: str, modes: tuple[str, ...]
-) -> str:
-    tasks = ("Solar", "Samtools", "Rumdl")
-    indexed = {
-        (run.task, run.model, run.mode, run.agent): run
-        for run in runs
-    }
+def matched_effect_figure(runs: list[Run]) -> str:
+    width, height = 1000, 445
+    plot_x, plot_width = 245.0, 560.0
+    plot_top, plot_bottom = 93.0, 365.0
+    indexed = {(run.task, run.mode, run.agent): run for run in runs}
     pairs = [
-        (f"{task} — {mode}", task, mode)
-        for mode in modes
-        for task in tasks
+        ("Solar — ultra", "Solar", "ultra"),
+        ("Samtools — ultra", "Samtools", "ultra"),
+        ("Rumdl — ultra", "Rumdl", "ultra"),
+        ("Solar — xhigh", "Solar", "xhigh"),
+        ("Samtools — xhigh", "Samtools", "xhigh"),
     ]
     effects = []
     for label, task, mode in pairs:
-        raw = indexed[(task, model, mode, "Raw Codex")]
-        bello = indexed[(task, model, mode, "Bello")]
+        raw = indexed[(task, mode, "Raw Codex")]
+        bello = indexed[(task, mode, "Bello")]
         effects.append((label, mode, bello.completion - raw.completion))
-
-    model_label = "GPT-5.6 Sol" if model == "gpt-5.6-sol" else "GPT-5.5"
     mean_effect = sum(effect for _, _, effect in effects) / len(effects)
-    row_y = tuple(112.0 + index * 40 for index in range(len(effects)))
-    summary_rule_y = row_y[-1] + 26
-    summary_y = summary_rule_y + 20
-    plot_x, plot_width = 245.0, 560.0
-    plot_top, plot_bottom = 93.0, summary_y + 20
-    width, height = 1000, int(plot_bottom + 82)
-    upper = max(25, int(math.ceil(max(effect for _, _, effect in effects) / 5) * 5))
+    row_y = (112.0, 157.0, 202.0, 257.0, 302.0)
 
     def effect_x(value: float) -> float:
-        return plot_x + (value / upper) * plot_width
+        return plot_x + (value / 27.0) * plot_width
 
     svg: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img" '
-        f'aria-labelledby="effect-{model}-title effect-{model}-desc">',
-        f'<title id="effect-{model}-title">{model_label} completion-score differences</title>',
-        f'<desc id="effect-{model}-desc">{len(effects)} comparisons favor Bello, '
-        f'with an unweighted mean difference of {mean_effect:.2f} percentage points.</desc>',
+        'aria-labelledby="effect-title effect-desc">',
+        '<title id="effect-title">Matched completion-score differences</title>',
+        '<desc id="effect-desc">Five paired comparisons all favor Bello, '
+        'with an unweighted mean difference of 17.4 percentage points.</desc>',
         f'<rect width="{width}" height="{height}" fill="#FFFFFF"/>',
-        text(48, 38, f"{model_label}: completion-score differences", size=21, weight="bold"),
+        text(48, 38, "Matched completion-score differences", size=21, weight="bold"),
         text(
             48,
             62,
@@ -614,25 +590,36 @@ def matched_effect_figure(
         ),
     ]
 
-    for tick in range(0, upper + 1, 5):
+    for tick in (0, 5, 10, 15, 20, 25):
         x = effect_x(tick)
-        svg.append(
-            line(
-                x,
-                plot_top,
-                x,
-                plot_bottom,
-                stroke=INK if tick == 0 else GRID,
-                stroke_width="1.3" if tick == 0 else "1",
-                **({} if tick == 0 else {"stroke_dasharray": "3 4"}),
+        if tick == 0:
+            svg.append(
+                line(
+                    x,
+                    plot_top,
+                    x,
+                    plot_bottom,
+                    stroke=INK,
+                    stroke_width="1.3",
+                )
             )
-        )
+        else:
+            svg.append(
+                line(
+                    x,
+                    plot_top,
+                    x,
+                    plot_bottom,
+                    stroke=GRID,
+                    stroke_width="1",
+                    stroke_dasharray="3 4",
+                )
+            )
         svg.append(
             text(x, plot_bottom + 23, f"{tick:+d}", size=11, anchor="middle", fill=MUTED)
         )
 
     for y, (label, mode, effect) in zip(row_y, effects, strict=True):
-        color = BELLO_COLOR if mode == "ultra" else RAW_COLOR
         svg.append(text(plot_x - 18, y + 4, label, size=12, anchor="end"))
         svg.append(
             line(
@@ -644,6 +631,7 @@ def matched_effect_figure(
                 stroke_width="2",
             )
         )
+        color = BELLO_COLOR if mode == "ultra" else RAW_COLOR
         if mode == "ultra":
             svg.append(
                 f'<circle cx="{effect_x(effect):.1f}" cy="{y:.1f}" r="7" '
@@ -665,25 +653,26 @@ def matched_effect_figure(
             text(
                 effect_x(effect) + 13,
                 y + 4,
-                f"+{effect:.2f} pp",
+                f"+{effect:g} pp",
                 size=12,
                 fill=color,
                 weight="bold",
             )
         )
 
+    summary_y = 344.0
     svg.append(
         line(
             plot_x - 150,
-            summary_rule_y,
+            326,
             plot_x + plot_width,
-            summary_rule_y,
+            326,
             stroke=GRID,
             stroke_width="1",
         )
     )
     svg.append(
-        text(plot_x - 18, summary_y + 4, "Unweighted mean", size=12, anchor="end", weight="bold")
+        text(plot_x - 18, summary_y + 4, "Matched mean", size=12, anchor="end", weight="bold")
     )
     diamond_x = effect_x(mean_effect)
     diamond_points = (
@@ -694,36 +683,46 @@ def matched_effect_figure(
     )
     svg.extend(
         [
-            line(effect_x(0), summary_y, diamond_x, summary_y, stroke=INK, stroke_width="2.2"),
+            line(
+                effect_x(0),
+                summary_y,
+                diamond_x,
+                summary_y,
+                stroke=INK,
+                stroke_width="2.2",
+            ),
             f'<polygon points="{diamond_points}" fill="{INK}" stroke="{INK}"/>',
-            text(diamond_x + 14, summary_y + 4, f"+{mean_effect:.2f} pp", size=12, weight="bold"),
+            text(
+                diamond_x + 14,
+                summary_y + 4,
+                f"+{mean_effect:.1f} pp",
+                size=12,
+                weight="bold",
+            ),
             text(
                 plot_x + plot_width / 2,
-                height - 28,
+                413,
                 "Completion-score difference (percentage points)",
                 size=13,
                 anchor="middle",
                 weight="bold",
             ),
+            f'<circle cx="844" cy="113" r="6.5" fill="{BELLO_COLOR}" '
+            f'stroke="{BELLO_COLOR}" stroke-width="1.5"/>',
+            text(860, 118, "ultra", size=12, fill=BELLO_COLOR, weight="bold"),
+            rectangle(
+                837.5,
+                136.5,
+                13,
+                13,
+                fill=RAW_COLOR,
+                stroke=RAW_COLOR,
+                stroke_width="1.5",
+            ),
+            text(860, 148, "xhigh", size=12, fill=RAW_COLOR, weight="bold"),
+            "</svg>",
         ]
     )
-    if "ultra" in modes:
-        svg.extend(
-            [
-                f'<circle cx="844" cy="113" r="6.5" fill="{BELLO_COLOR}" '
-                f'stroke="{BELLO_COLOR}" stroke-width="1.5"/>',
-                text(860, 118, "ultra", size=12, fill=BELLO_COLOR, weight="bold"),
-            ]
-        )
-    if "xhigh" in modes:
-        legend_y = 137 if "ultra" in modes else 107
-        svg.extend(
-            [
-                rectangle(837.5, legend_y, 13, 13, fill=RAW_COLOR, stroke=RAW_COLOR, stroke_width="1.5"),
-                text(860, legend_y + 11.5, "xhigh", size=12, fill=RAW_COLOR, weight="bold"),
-            ]
-        )
-    svg.append("</svg>")
     return "\n".join(svg) + "\n"
 
 
@@ -736,22 +735,27 @@ def main() -> None:
         raise ValueError(f"Missing expected tasks: {', '.join(sorted(missing))}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    cross_task_output = OUTPUT_DIR / "programbench-cross-task-completion.svg"
-    cross_task_output.write_text(
-        cross_task_summary_figure(runs),
+    ultra_output = OUTPUT_DIR / "programbench-ultra-completion.svg"
+    ultra_output.write_text(
+        mode_summary_figure(runs, "ultra", ("Solar", "Samtools", "Rumdl")),
         encoding="utf-8",
     )
-    print(cross_task_output.relative_to(ROOT))
+    print(ultra_output.relative_to(ROOT))
 
-    for model, modes, filename in (
-        ("gpt-5.6-sol", ("ultra",), "programbench-5-6-ultra-matched-differences.svg"),
-        ("gpt-5.6-sol", ("xhigh",), "programbench-5-6-xhigh-matched-differences.svg"),
-    ):
-        effect_output = OUTPUT_DIR / filename
-        effect_output.write_text(
-            matched_effect_figure(runs, model, modes), encoding="utf-8"
-        )
-        print(effect_output.relative_to(ROOT))
+    xhigh_output = OUTPUT_DIR / "programbench-xhigh-completion.svg"
+    xhigh_output.write_text(
+        mode_summary_figure(runs, "xhigh", ("Solar", "Samtools")),
+        encoding="utf-8",
+    )
+    print(xhigh_output.relative_to(ROOT))
+
+    effect_output = OUTPUT_DIR / "programbench-matched-differences.svg"
+    effect_output.write_text(matched_effect_figure(runs), encoding="utf-8")
+    print(effect_output.relative_to(ROOT))
+
+    overview_output = OUTPUT_DIR / "programbench-completion-vs-runtime.svg"
+    overview_output.write_text(overview_figure(runs), encoding="utf-8")
+    print(overview_output.relative_to(ROOT))
 
     for letter, task in zip(("a", "b", "c"), tasks, strict=True):
         output = OUTPUT_DIR / f"programbench-{task.lower()}.svg"

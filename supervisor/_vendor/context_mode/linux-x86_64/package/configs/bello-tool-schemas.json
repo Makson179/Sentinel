@@ -1,0 +1,219 @@
+{
+  "ctx_batch_execute": {
+    "additionalProperties": false,
+    "properties": {
+      "commands": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "maxLength": 65536,
+              "minLength": 1,
+              "type": "string"
+            },
+            "label": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "label"
+          ],
+          "type": "object"
+        },
+        "maxItems": 32,
+        "minItems": 1,
+        "type": "array"
+      },
+      "concurrency": {
+        "const": 1,
+        "type": "integer"
+      },
+      "cwd": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "queries": {
+        "items": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
+      "timeout": {
+        "maximum": 3600000,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "commands"
+    ],
+    "type": "object"
+  },
+  "ctx_doctor": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "ctx_execute": {
+    "additionalProperties": false,
+    "properties": {
+      "code": {
+        "maxLength": 65536,
+        "minLength": 1,
+        "type": "string"
+      },
+      "cwd": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "intent": {
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": "string"
+      },
+      "language": {
+        "enum": [
+          "javascript",
+          "python",
+          "shell"
+        ],
+        "type": "string"
+      },
+      "timeout": {
+        "maximum": 3600000,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "code",
+      "language"
+    ],
+    "type": "object"
+  },
+  "ctx_execute_file": {
+    "additionalProperties": false,
+    "properties": {
+      "code": {
+        "maxLength": 65536,
+        "minLength": 1,
+        "type": "string"
+      },
+      "intent": {
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": "string"
+      },
+      "language": {
+        "enum": [
+          "javascript",
+          "python",
+          "shell"
+        ],
+        "type": "string"
+      },
+      "path": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "timeout": {
+        "maximum": 3600000,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "code",
+      "language",
+      "path"
+    ],
+    "type": "object"
+  },
+  "ctx_index": {
+    "additionalProperties": false,
+    "properties": {
+      "content": {
+        "maxLength": 8388608,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxDepth": {
+        "maximum": 20,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxFiles": {
+        "maximum": 1000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "path": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "source": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "ctx_purge": {
+    "additionalProperties": false,
+    "properties": {
+      "confirm": {
+        "const": true,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "confirm"
+    ],
+    "type": "object"
+  },
+  "ctx_search": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "maximum": 10,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "queries": {
+        "items": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      },
+      "source": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "queries"
+    ],
+    "type": "object"
+  },
+  "ctx_stats": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  }
+}

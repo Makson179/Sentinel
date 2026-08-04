@@ -8,13 +8,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from supervisor.review_limits import (
-    EXPLICIT_REVIEW_LIMIT_FORMAT,
-    REVIEW_LIMIT_FIELDS,
-    ReviewLimit,
-    normalize_review_limit,
-)
-
 
 class PolicyDecisionKind(str, Enum):
     ALLOW = "allow"
@@ -51,6 +44,7 @@ class ApprovalRequestType(str, Enum):
     TOOL_USER_INPUT = "tool_user_input"
     DYNAMIC_TOOL_CALL = "dynamic_tool_call"
     MCP_ELICITATION = "mcp_elicitation"
+    MCP_TOOL_CALL = "mcp_tool_call"
     UNKNOWN = "unknown"
 
 
@@ -163,9 +157,8 @@ class BelloConfig(BaseModel):
     # Legacy run-state fallback. New projects persist the explicit ProjectConfig defaults.
     adversary: bool = True
     max_no_marker_idle_nudges: int = 2
-    review_limit_format: Literal["explicit"] = EXPLICIT_REVIEW_LIMIT_FORMAT
-    max_completion_returns_before_adversary: ReviewLimit = 1
-    max_completion_returns_after_adversary: ReviewLimit = 0
+    max_completion_returns_before_adversary: int = 4
+    max_completion_returns_after_adversary: int = 2
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
     cheap_runtime: bool = True
@@ -181,21 +174,19 @@ class BelloConfig(BaseModel):
     last_validation_sequence: int | None = None
     last_trusted_behavioral_validation_sequence: int | None = None
     last_trusted_passing_behavioral_validation_sequence: int | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def validate_review_limits(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        for field in REVIEW_LIMIT_FIELDS:
-            if field not in normalized:
-                continue
-            try:
-                normalized[field] = normalize_review_limit(normalized[field])
-            except ValueError as exc:
-                raise ValueError(f"{field} {exc}") from exc
-        return normalized
+    context_mode_enabled: bool = False
+    context_mode_keep_data: bool = False
+    context_mode_debug: bool = False
+    run_id: str | None = None
+    workspace_id: str | None = None
+    context_session_id: str | None = None
+    context_state_epoch: int = 0
+    context_binding_version: int = 0
+    coder_generation_lease_id: str | None = None
+    coder_process_epoch: int = 0
+    supervisor_process_epoch: int = 0
+    coder_process_recoveries: int = 0
+    coder_process_controlled_recycles: int = 0
 
 
 class AppEvent(BaseModel):
@@ -210,6 +201,9 @@ class AppEvent(BaseModel):
     decision: str | dict[str, Any] | None = None
     reason: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    client_role: Literal["coder", "supervisor"] | None = None
+    process_epoch: int | None = None
+    app_server_instance_id: str | None = None
 
 
 class NetworkApprovalContext(BaseModel):
@@ -237,6 +231,15 @@ class ApprovalContext(BaseModel):
     proposed_network_policy_amendments: list[Any] | None = None
     available_decisions: list[Any] | None = None
     raw_params: dict[str, Any] = Field(default_factory=dict)
+    client_role: Literal["coder", "supervisor"] | None = None
+    process_epoch: int = 0
+    app_server_instance_id: str | None = None
+    binding_version: int | None = None
+    coder_generation: int | None = None
+    generation_lease_id: str | None = None
+    tool_name: str | None = None
+    canonical_cwd: str | None = None
+    normalized_arguments_digest: str | None = None
 
     @property
     def available_decision_keys(self) -> set[str] | None:
@@ -406,6 +409,12 @@ class ApprovalWakeContext(BaseModel):
     method: str
     available_decisions: list[Any] | None = None
     command: str | None = None
+    # Context Mode execution approval receives only this bounded, pre-redacted
+    # view.  Raw MCP parameters and lifecycle/binding capabilities never enter
+    # the supervisor packet.
+    context_arguments_summary: dict[str, Any] | None = None
+    context_arguments_correlation_digest: str | None = None
+    context_arguments_redacted_or_truncated: bool | None = None
     file_changes: list[dict[str, Any]] = Field(default_factory=list)
     paths: list[str] = Field(default_factory=list)
     cwd: str | None = None

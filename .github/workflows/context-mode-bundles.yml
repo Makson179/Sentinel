@@ -1,0 +1,160 @@
+name: Context Mode platform bundles
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_input_root:
+        description: Absolute path to air-gapped, pre-provisioned attested Bello offline-fork inputs
+        required: true
+        default: /opt/bello-release-inputs/context-mode-v1.0.169
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: context-mode-bundles-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: '["self-hosted","bello-context-release","linux","x64"]'
+          - platform: linux-arm64
+            runner: '["self-hosted","bello-context-release","linux","arm64"]'
+          - platform: macos-x86_64
+            runner: '["self-hosted","bello-context-release","macos","x64"]'
+          - platform: macos-arm64
+            runner: '["self-hosted","bello-context-release","macos","arm64"]'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # This is intentionally before every build step. The adapter and
+      # Controller loader are present, but the signed production authority,
+      # reviewed fork/Node/dependency pins, and platform payloads are external
+      # release inputs. Publication must fail until all of them verify.
+      - name: Require signed native authority and production adapter wiring
+        env:
+          RELEASE_INPUT_ROOT: ${{ inputs.release_input_root }}
+          PLATFORM_TAG: ${{ matrix.platform }}
+        run: |
+          python3 scripts/verify_context_mode_release_readiness.py \
+            --project-root . \
+            --platform "$PLATFORM_TAG" \
+            --authority-root "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority"
+
+      - name: Assert pre-provisioned offline Python build tooling
+        run: |
+          python3 -c "import build, wheel"
+
+      - name: Build universal Bello base wheel without isolation
+        id: base
+        shell: bash
+        run: |
+          mkdir -p dist/base-wheel
+          python3 -m build --wheel --no-isolation --outdir dist/base-wheel
+          base_wheels=(dist/base-wheel/*.whl)
+          test -e "${base_wheels[0]}"
+          test "${#base_wheels[@]}" -eq 1
+          case "${base_wheels[0]}" in
+            *-py3-none-any.whl) ;;
+            *) echo "Base build did not produce one py3-none-any wheel" >&2; exit 1 ;;
+          esac
+          printf 'base_wheel=%s\n' "${base_wheels[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Assert pre-provisioned inputs
+        env:
+          RELEASE_INPUT_ROOT: ${{ inputs.release_input_root }}
+          PLATFORM_TAG: ${{ matrix.platform }}
+        run: |
+          test -d "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/context-mode"
+          test -f "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/context-mode/bello-offline-fork.json"
+          test -x "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/node/bin/node"
+          test -d "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/context-mode/node_modules"
+          test -x "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority/bin/bello-context-broker"
+          test -x "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority/bin/bello-context-launcher"
+          test -s "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority/LICENSE"
+          test -s "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority/authority.json"
+          test -s "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority/authority.sig"
+          test -s "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority/release-public-key.pem"
+
+      - name: Build and native-verify offline bundle
+        env:
+          RELEASE_INPUT_ROOT: ${{ inputs.release_input_root }}
+          PLATFORM_TAG: ${{ matrix.platform }}
+        run: |
+          python3 scripts/build_context_mode_bundle.py build \
+            --context-source "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/context-mode" \
+            --node-tree "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/node" \
+            --authority-source "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority" \
+            --platform "$PLATFORM_TAG" \
+            --output "dist/context-mode-$PLATFORM_TAG" \
+            --archive "dist/context-mode-$PLATFORM_TAG.tar.gz"
+
+      - name: Repeat static verification
+        env:
+          PLATFORM_TAG: ${{ matrix.platform }}
+        run: |
+          python3 scripts/build_context_mode_bundle.py verify \
+            --bundle "dist/context-mode-$PLATFORM_TAG" \
+            --platform "$PLATFORM_TAG"
+
+      - name: Assemble and verify platform-tagged Bello wheel
+        id: platform_wheel
+        shell: bash
+        env:
+          BASE_WHEEL: ${{ steps.base.outputs.base_wheel }}
+          RELEASE_INPUT_ROOT: ${{ inputs.release_input_root }}
+          PLATFORM_TAG: ${{ matrix.platform }}
+        run: |
+          python3 scripts/build_context_mode_wheel.py assemble \
+            --base-wheel "$BASE_WHEEL" \
+            --bundle "dist/context-mode-$PLATFORM_TAG" \
+            --platform "$PLATFORM_TAG" \
+            --authority-root "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority" \
+            --output-dir dist/wheels
+          platform_wheels=(dist/wheels/*.whl)
+          test -e "${platform_wheels[0]}"
+          test "${#platform_wheels[@]}" -eq 1
+          case "${platform_wheels[0]}" in
+            *-py3-none-any.whl) echo "Native payload must not use a universal wheel tag" >&2; exit 1 ;;
+          esac
+          python3 scripts/build_context_mode_wheel.py verify \
+            --wheel "${platform_wheels[0]}" \
+            --platform "$PLATFORM_TAG" \
+            --authority-root "$RELEASE_INPUT_ROOT/$PLATFORM_TAG/authority"
+          printf 'wheel=%s\n' "${platform_wheels[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Install wheel and verify installed bundle fully offline
+        shell: bash
+        env:
+          PLATFORM_TAG: ${{ matrix.platform }}
+          PLATFORM_WHEEL: ${{ steps.platform_wheel.outputs.wheel }}
+        run: |
+          python3 -m venv "dist/install-$PLATFORM_TAG"
+          "dist/install-$PLATFORM_TAG/bin/python" -m pip install --no-index --no-deps "$PLATFORM_WHEEL"
+          platlib=$("dist/install-$PLATFORM_TAG/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')
+          test -d "$platlib/supervisor/_vendor/context_mode/$PLATFORM_TAG"
+          python3 scripts/build_context_mode_bundle.py verify \
+            --bundle "$platlib/supervisor/_vendor/context_mode/$PLATFORM_TAG" \
+            --platform "$PLATFORM_TAG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bello-context-mode-wheel-${{ matrix.platform }}
+          path: |
+            dist/wheels/*.whl
+            dist/context-mode-${{ matrix.platform }}.tar.gz
+            dist/context-mode-${{ matrix.platform }}/manifest.json
+            dist/context-mode-${{ matrix.platform }}/manifest.sha256
+          if-no-files-found: error
+          compression-level: 0

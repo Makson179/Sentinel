@@ -36,7 +36,7 @@ from supervisor.controller import (
 )
 from supervisor.adversary_agent import AdversaryAgentError
 from supervisor.approvals import normalize_approval_request
-from supervisor.appserver import APP_SERVER_CODER_RPC_TIMEOUT_SECONDS, AppServerError, AppServerMessage, AppServerTimeoutError
+from supervisor.appserver import APP_SERVER_CODER_RPC_TIMEOUT_SECONDS, AppServerError, AppServerMessage, AppServerTimeoutError, ClientRole
 from supervisor.coder import CODEX_FAST_SERVICE_TIER, CoderSession, coder_thread_params, coder_turn_params
 from supervisor.main import _run_async_cleanly
 from supervisor.project_config import DEFAULT_MODEL, MODEL_GPT_5_5, MODEL_GPT_5_6_SOL
@@ -70,6 +70,7 @@ from supervisor.state import (
     LOG,
     PREVIOUS_RUNS,
     PROGRESS,
+    PROVIDER_TOKEN_USAGE,
     RECOVERY,
     RUNTIME_METRICS,
     RUNTIME_TRACE,
@@ -88,7 +89,57 @@ def test_bello_state_initializes_required_files(tmp_path: Path) -> None:
 
     assert store.path(EVENTS).exists()
     assert store.path(FINAL_REPORT).exists()
+    assert store.path(PROVIDER_TOKEN_USAGE).exists()
     assert store.get_bello_config().task_path == str(task)
+
+
+def test_provider_token_usage_ledger_keeps_every_raw_sample_and_role(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    controller = BelloController(tmp_path, task_path=task)
+    controller.initialize_state()
+    controller._mark_supervisor_thread_started("completion-thread", "completion")
+
+    first_usage = {
+        "total": {
+            "inputTokens": 10,
+            "cachedInputTokens": 4,
+            "outputTokens": 5,
+            "reasoningOutputTokens": 2,
+            "totalTokens": 15,
+        },
+        "last": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+        "providerExtension": {"preserved": True},
+    }
+    params = {
+        "threadId": "completion-thread",
+        "turnId": "turn-1",
+        "tokenUsage": first_usage,
+    }
+    controller._record_provider_token_usage(
+        ClientRole.SUPERVISOR,
+        params,
+        process_epoch=3,
+        app_server_instance_id="instance-1",
+    )
+    controller._record_provider_token_usage(ClientRole.SUPERVISOR, params)
+
+    samples = [
+        json.loads(line)
+        for line in controller.store.path(PROVIDER_TOKEN_USAGE).read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(samples) == 2
+    assert samples[0]["tokenUsage"] == first_usage
+    assert samples[0]["transportRole"] == "supervisor"
+    assert samples[0]["role"] == "completion"
+    assert samples[0]["threadId"] == "completion-thread"
+    assert samples[0]["turnId"] == "turn-1"
+    assert samples[0]["processEpoch"] == 3
+    assert samples[0]["appServerInstanceId"] == "instance-1"
+    assert samples[0]["cumulative"]["authoritativeTotalTokens"] == 15
+    assert samples[0]["cumulative"]["liveDeltaTokens"] == 15
+    assert samples[1]["tokenUsage"] == first_usage
+    assert samples[1]["cumulative"]["liveDeltaTokens"] == 0
 
 
 def test_internal_supervisor_dir_is_added_to_git_info_exclude(tmp_path: Path) -> None:
@@ -674,7 +725,7 @@ def test_task_integrity_detects_replaced_snapshot_link(tmp_path: Path) -> None:
         snapshot.task_path.unlink()
         snapshot.task_path.write_text("weakened\n", encoding="utf-8")
 
-        assert controller._task_integrity_issue() == "the coder workspace replaced or removed the read-only task link"
+        assert controller._task_integrity_issue() == "the coder workspace replaced or modified the immutable task copy"
     finally:
         snapshot.cleanup()
 
@@ -935,6 +986,36 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert absolute_go_test.passed is True
     assert "github.com/example/project/core" in absolute_go_test.captured_output
     assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script, shell_visible_script, direct_visible_script, absolute_go_test])
+
+
+def test_behavioral_validation_rejects_runner_names_embedded_in_echo_output() -> None:
+    forged = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="echo pytest",
+            exit_code=0,
+            status="completed",
+            summary="broker-attested Context command",
+        ),
+        sequence=1,
+        item={"stdout": "pytest\n1 passed\n"},
+    )
+
+    assert forged is None
+
+    piped_forgery = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command="echo pytest | cat",
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=2,
+        item={"stdout": "pytest\n1 passed\n"},
+    )
+
+    assert piped_forgery is None
 
 
 async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
@@ -1260,7 +1341,7 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
     controller.adversary_enabled = False
     controller.tui = _FakeTUI()
     controller.running = True
-    controller.client = None
+    controller.coder_client = controller.supervisor_client = None
     controller.event_queue = asyncio.Queue()
     controller._sequence = 0
     controller._supervisor_dirty = False
@@ -3402,7 +3483,7 @@ async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.tui = _FakeTUI()
     controller._terminal_cleanup_started = True
@@ -3417,7 +3498,7 @@ async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_
         )
     )
 
-    assert controller.client.responses == [(99, {"decision": "decline"})]
+    assert controller.coder_client.responses == [(99, {"decision": "decline"})]
 
 
 async def test_completion_return_sends_message_and_continues_same_generation(tmp_path: Path) -> None:
@@ -3598,7 +3679,7 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     controller.adversary_enabled = None
-    controller.client = object()
+    controller.coder_client = controller.supervisor_client = object()
     controller.model = None
     controller.running = False
     controller._pending_adversary_report = None
@@ -3722,7 +3803,7 @@ async def test_adversary_infra_failure_completes_with_recorded_gap(
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     controller.adversary_enabled = True
-    controller.client = object()
+    controller.coder_client = controller.supervisor_client = object()
     controller.model = None
     controller.running = False
     controller._pending_adversary_report = None
@@ -3818,7 +3899,7 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     fake = _RuntimeFakeSupervisor(store, task)
     controller.supervisor = fake
     controller.adversary_enabled = True
-    controller.client = object()
+    controller.coder_client = controller.supervisor_client = object()
     controller.model = None
     controller.coder_model = MODEL_GPT_5_5
     controller.supervisor_model = MODEL_GPT_5_5
@@ -3826,6 +3907,14 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     controller.adversary_intelligence = "ultra"
     controller.running = True
     controller.observed_changed_files = {"src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)}
+    fresh_coder = _GateFakeCoder()
+    rollovers: list[tuple[str, bool]] = []
+
+    async def rollover(reason, *, handoff=None, phase_rollover=False):
+        rollovers.append((reason, phase_rollover))
+        controller.coder = fresh_coder
+
+    monkeypatch.setattr(controller, "restart_coder_generation", rollover)
 
     class FakeAdversary:
         def __init__(
@@ -3870,7 +3959,9 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     assert fake.completion_packets[0].adversary_report is not None
     assert fake.completion_packets[0].adversary_report.candidate_finding is True
     assert store.get_bello_config().adversary_run_count == 1
-    assert "Adversarial tester report:" in coder.messages[0]
+    assert coder.messages == []
+    assert rollovers and rollovers[0][1] is True
+    assert "Adversarial tester report:" in fresh_coder.messages[0]
 
 
 async def test_completion_return_budget_waits_for_coder_readiness_before_forcing_adversary(
@@ -3950,28 +4041,13 @@ async def test_completion_only_review_budget_finalizes_without_restart_or_extra_
     ]
 
 
-def test_completion_only_zero_review_budget_skips_review(tmp_path: Path) -> None:
+def test_completion_only_zero_review_budget_is_unlimited(tmp_path: Path) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     controller.adversary_enabled = False
     store.update_bello_config(
         lambda cfg: cfg.model_copy(
             update={
                 "max_completion_returns_before_adversary": 0,
-                "completion_return_count": 100,
-            }
-        )
-    )
-
-    assert controller._completion_review_budget_action() == "complete"
-
-
-def test_completion_only_unlimited_review_budget_has_no_cap(tmp_path: Path) -> None:
-    controller, store, _ = _runtime_controller(tmp_path)
-    controller.adversary_enabled = False
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(
-            update={
-                "max_completion_returns_before_adversary": "unlimited",
                 "completion_return_count": 100,
             }
         )
@@ -3980,77 +4056,13 @@ def test_completion_only_unlimited_review_budget_has_no_cap(tmp_path: Path) -> N
     assert controller._completion_review_budget_action() is None
 
 
-def test_zero_pre_adversary_review_budget_starts_adversary(tmp_path: Path) -> None:
-    controller, store, _ = _runtime_controller(tmp_path)
-    controller.adversary_enabled = True
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(
-            update={
-                "max_adversary_runs": 1,
-                "max_completion_returns_before_adversary": 0,
-                "completion_return_count": 0,
-            }
-        )
-    )
-
-    assert controller._completion_review_budget_action() == "adversary"
-
-
-def test_zero_post_adversary_review_budget_completes(tmp_path: Path) -> None:
-    controller, store, _ = _runtime_controller(tmp_path)
-    controller.adversary_enabled = True
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(
-            update={
-                "max_adversary_runs": 1,
-                "max_completion_returns_after_adversary": 0,
-                "adversary_run_count": 1,
-                "completion_returns_since_adversary": 0,
-            }
-        )
-    )
-
-    assert controller._completion_review_budget_action() == "complete"
-
-
-def test_zero_post_adversary_budget_allows_one_candidate_adjudication(tmp_path: Path) -> None:
-    controller, store, task, _ = _completion_gate_controller(tmp_path, validations=[])
-    controller.adversary_enabled = True
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(
-            update={
-                "max_adversary_runs": 1,
-                "max_completion_returns_after_adversary": 0,
-                "adversary_run_count": 1,
-                "completion_returns_since_adversary": 0,
-            }
-        )
-    )
-    packet = _gate_packet(task, validations=[])
-    packet.adversary_report = AdversaryReport(
-        candidate_finding=True,
-        report_text="attacked: edge\nfindings: candidate defect\noverall: broke",
-        generation=packet.generation,
-        completion_wake_sequence=packet.wake_sequence,
-        latest_relevant_change_sequence=packet.latest_relevant_change_sequence,
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
-
-    assert controller._completion_review_budget_action(packet=packet) is None
-
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"completion_returns_since_adversary": 1})
-    )
-    assert controller._completion_review_budget_action(packet=packet) == "complete"
-
-
 async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_completion_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     controller.adversary_enabled = True
-    controller.client = object()
+    controller.coder_client = controller.supervisor_client = object()
     controller.model = None
     controller.adversary_model = "gpt-adversary"
     controller.adversary_intelligence = "ultra"
@@ -4155,7 +4167,7 @@ async def test_required_budget_adversary_failure_is_not_reported_as_success(
 ) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     controller.adversary_enabled = True
-    controller.client = object()
+    controller.coder_client = controller.supervisor_client = object()
     store.update_bello_config(
         lambda cfg: cfg.model_copy(
             update={
@@ -4216,7 +4228,7 @@ async def test_adversary_receives_previous_report_as_regression_context(
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     controller.adversary_enabled = True
-    controller.client = object()
+    controller.coder_client = controller.supervisor_client = object()
     controller.model = None
     controller.running = False
     store.update_bello_config(
@@ -4268,7 +4280,10 @@ async def test_adversary_receives_previous_report_as_regression_context(
     assert coder.messages == []
 
 
-async def test_completion_return_after_adversary_includes_report_for_coder(tmp_path: Path) -> None:
+async def test_completion_return_after_adversary_includes_report_for_fresh_coder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -4281,6 +4296,14 @@ async def test_completion_return_after_adversary_includes_report_for_coder(tmp_p
         )
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    fresh_coder = _GateFakeCoder()
+    rollovers: list[tuple[str, bool]] = []
+
+    async def rollover(reason, *, handoff=None, phase_rollover=False):
+        rollovers.append((reason, phase_rollover))
+        controller.coder = fresh_coder
+
+    monkeypatch.setattr(controller, "restart_coder_generation", rollover)
     packet = _gate_packet(task, validations=validations)
     packet.adversary_report = AdversaryReport(
         report_text="attacked: stack args\nfindings: crash on seven args\nraw observed output: SIGSEGV\noverall: broke",
@@ -4313,9 +4336,11 @@ async def test_completion_return_after_adversary_includes_report_for_coder(tmp_p
     await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
 
     assert len(controller.completion_returns) == 1
-    assert "Fix the reproduced stack-argument crash." in coder.messages[0]
-    assert "Adversarial tester report:" in coder.messages[0]
-    assert "SIGSEGV" in coder.messages[0]
+    assert coder.messages == []
+    assert rollovers and rollovers[0][1] is True
+    assert "Fix the reproduced stack-argument crash." in fresh_coder.messages[0]
+    assert "Adversarial tester report:" in fresh_coder.messages[0]
+    assert "SIGSEGV" in fresh_coder.messages[0]
 
 
 async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(tmp_path: Path) -> None:
@@ -4529,7 +4554,7 @@ async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_p
     controller.task_path = task
     controller.store = store
     controller.model = None
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = None
     controller.pending_approvals = {}
@@ -4575,7 +4600,7 @@ async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_p
     assert store.get_bello_config().generation == 1
     assert "repeated completion miss" in store.path(HANDOFF).read_text(encoding="utf-8")
     assert controller.completion_restarts == 1
-    assert controller.client.started_turns
+    assert controller.coder_client.started_turns
 
 
 async def test_transport_error_writes_provider_failure_final_report(tmp_path: Path) -> None:
@@ -4880,6 +4905,33 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
     assert "- Status: provider_failure" in text
     assert "app-server RPC failed" in text
     assert "account/read response timed out" in text
+
+
+async def test_startup_runtime_error_is_recorded_as_provider_failure(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    class FailingStartupClient:
+        async def start(self):
+            raise RuntimeError("native role launcher rejected startup")
+
+        async def stop(self):
+            return None
+
+    controller = BelloController(
+        tmp_path,
+        task_path=task,
+        client=FailingStartupClient(),  # type: ignore[arg-type]
+        tui=_FakeTUI(),
+        overwrite_state=True,
+        use_git_diff=False,
+    )
+
+    await controller.run()
+
+    report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert controller.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
+    assert "run infrastructure failed: native role launcher rejected startup" in report
 
 
 async def test_missing_selected_model_interrupts_before_coder_and_writes_final_report(
@@ -5208,7 +5260,7 @@ async def test_server_request_respond_timeout_writes_provider_failure_final_repo
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
-    controller.client = RespondTimeoutClient()
+    controller.coder_client = controller.supervisor_client = RespondTimeoutClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = None
     controller.pending_approvals = {}
@@ -5261,10 +5313,10 @@ async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
-    controller.client = CoderTurnTimeoutClient()
+    controller.coder_client = controller.supervisor_client = CoderTurnTimeoutClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = CoderSession(
-        controller.client,  # type: ignore[arg-type]
+        controller.coder_client,  # type: ignore[arg-type]
         store,
         tmp_path,
         task,
@@ -5324,7 +5376,7 @@ async def test_restart_preserves_coder_intelligence(tmp_path: Path) -> None:
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
-    controller.client = client
+    controller.coder_client = controller.supervisor_client = client
     controller.tui = _FakeTUI()
     controller.supervisor = None
     controller.approvals = None
@@ -5496,7 +5548,7 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path, supervisor=FakeSupervisor())
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
@@ -5505,7 +5557,7 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
 
     await controller.handle_server_request(AppServerMessage({"id": 51, "method": context.server_request_method, "params": context.raw_params}))
 
-    assert controller.client.responses == [(51, {"decision": "decline"})]
+    assert controller.coder_client.responses == [(51, {"decision": "decline"})]
     assert controller.coder.messages == ["Network access is not required by the task."]
 
 
@@ -5536,7 +5588,7 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
@@ -5556,7 +5608,7 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
         )
     )
 
-    assert controller.client.responses == [(52, {"decision": "decline"})]
+    assert controller.coder_client.responses == [(52, {"decision": "decline"})]
     assert controller.coder.messages == ["writes to supervisor runtime/state files are denied"]
 
 
@@ -5587,7 +5639,7 @@ async def test_adversary_file_change_request_is_denied_without_steering_coder(tm
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
@@ -5610,7 +5662,7 @@ async def test_adversary_file_change_request_is_denied_without_steering_coder(tm
         )
     )
 
-    assert controller.client.responses == [(53, {"decision": "decline"})]
+    assert controller.coder_client.responses == [(53, {"decision": "decline"})]
     assert controller.coder.messages == []
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Adversary approval denied without steering coder" in progress
@@ -5653,7 +5705,7 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = coder
     controller.pending_approvals = {}
@@ -5674,7 +5726,7 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
     )
 
     health = store.get_health()
-    assert controller.client.responses == [(55, {"decision": "decline"})]
+    assert controller.coder_client.responses == [(55, {"decision": "decline"})]
     assert health.denied_requests == 1
     assert health.last_denial == "writes to supervisor runtime/state files are denied"
     assert coder.started_messages == ["writes to supervisor runtime/state files are denied"]
@@ -5709,7 +5761,7 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path)
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
@@ -5726,7 +5778,7 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
         )
     )
 
-    assert controller.client.responses == [(53, {"decision": "accept"})]
+    assert controller.coder_client.responses == [(53, {"decision": "accept"})]
     assert controller.coder.messages == []
 
 
@@ -5768,7 +5820,7 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path:
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
-    controller.client = FakeClient()
+    controller.coder_client = controller.supervisor_client = FakeClient()
     controller.approvals = ApprovalManager(tmp_path, supervisor=FakeSupervisor())
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
@@ -5789,7 +5841,7 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path:
         )
     )
 
-    assert controller.client.responses == [(54, {"decision": offered_decision})]
+    assert controller.coder_client.responses == [(54, {"decision": offered_decision})]
     assert controller.tui.messages[0][0] == "APPROVAL"
     assert controller.coder.messages == []
 
@@ -5886,23 +5938,26 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     assert controller.running is False
 
 
-async def test_finalize_writes_report_and_status_before_terminal_shutdown(tmp_path: Path) -> None:
+async def test_finalize_arms_terminal_shutdown_before_reading_or_writing_report(tmp_path: Path) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     shutdown_seen = False
 
     async def fake_prepare_terminal_shutdown(reason: str) -> None:
         nonlocal shutdown_seen
         shutdown_seen = True
-        assert store.get_bello_config().status == BelloStatus.COMPLETE
-        report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-        assert "# Final Report" in report
-        assert "task complete" in report
+        assert controller._terminal_cleanup_started is True
+        assert controller.running is False
+        assert store.get_bello_config().status != BelloStatus.COMPLETE
 
     controller._prepare_terminal_shutdown = fake_prepare_terminal_shutdown  # type: ignore[method-assign]
 
     await controller.finalize("task complete", status=BelloStatus.COMPLETE)
 
     assert shutdown_seen is True
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "# Final Report" in report
+    assert "task complete" in report
     assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8").strip()
 

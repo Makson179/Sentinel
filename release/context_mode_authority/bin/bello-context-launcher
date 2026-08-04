@@ -1,0 +1,248 @@
+#!/usr/bin/python3
+"""Thin, non-authoritative launcher for the Linux Context Mode broker."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import socket
+import stat
+import sys
+import threading
+from pathlib import Path
+from typing import Any, Mapping
+
+
+PROXY_PROTOCOL = "bello-context-proxy-v1"
+MAX_BOOTSTRAP = 64 * 1024
+MAX_CONTROL_LINE = 8 * 1024 * 1024
+MAX_HOOK_INPUT = 256 * 1024
+REQUIRED_HOOKS = (
+    "PreToolUse",
+    "PostToolUse",
+    "SessionStart",
+    "PreCompact",
+    "UserPromptSubmit",
+    "Stop",
+)
+
+
+class LauncherError(RuntimeError):
+    pass
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                return digest.hexdigest()
+            digest.update(block)
+
+
+def _read_bootstrap(path: Path, *, expected_kind: str, event: str | None = None) -> dict[str, Any]:
+    path = Path(path)
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise LauncherError("bootstrap must be a regular non-symlink file")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise LauncherError("bootstrap owner/mode mismatch")
+    if info.st_size <= 0 or info.st_size > MAX_BOOTSTRAP:
+        raise LauncherError("bootstrap size is invalid")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            payload = stream.read(MAX_BOOTSTRAP + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise LauncherError("bootstrap is invalid JSON") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise LauncherError("bootstrap schema mismatch")
+    if value.get("kind") != expected_kind:
+        raise LauncherError("bootstrap kind mismatch")
+    if expected_kind == "hook" and (event not in REQUIRED_HOOKS or value.get("event") != event):
+        raise LauncherError("hook bootstrap event mismatch")
+    endpoint = value.get("public_endpoint")
+    if not isinstance(endpoint, Mapping) or set(endpoint) != {"channel"}:
+        raise LauncherError("bootstrap endpoint schema mismatch")
+    channel = endpoint.get("channel")
+    if not isinstance(channel, str) or not channel or len(channel.encode("utf-8")) > 256:
+        raise LauncherError("bootstrap channel is invalid")
+    expected_launcher = value.get("launcher_sha256")
+    if not isinstance(expected_launcher, str) or _sha256(Path(__file__).resolve(strict=True)) != expected_launcher:
+        raise LauncherError("launcher digest does not match bootstrap")
+    return value
+
+
+def _connect(bootstrap: Mapping[str, Any], *, kind: str, event: str | None = None) -> socket.socket:
+    endpoint = bootstrap["public_endpoint"]
+    channel = endpoint["channel"]
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(30.0)
+    try:
+        connection.connect("\0" + channel)
+        handshake = {
+            "protocol": PROXY_PROTOCOL,
+            "kind": kind,
+            "event": event,
+            "bootstrap": dict(bootstrap),
+            "pid": os.getpid(),
+            "cwd": os.path.realpath(os.getcwd()),
+        }
+        connection.sendall(_canonical(handshake) + b"\n")
+        acknowledgement = _recv_line(connection)
+        value = json.loads(acknowledgement)
+        if not isinstance(value, Mapping) or value.get("protocol") != PROXY_PROTOCOL or value.get("accepted") is not True:
+            raise LauncherError(f"broker rejected launcher handshake: {value}")
+        connection.settimeout(None)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _recv_line(connection: socket.socket) -> bytes:
+    result = bytearray()
+    while True:
+        block = connection.recv(1)
+        if not block:
+            raise LauncherError("broker closed before completing a control frame")
+        result.extend(block)
+        if len(result) > MAX_CONTROL_LINE:
+            raise LauncherError("broker control frame exceeds hard limit")
+        if block == b"\n":
+            return bytes(result)
+
+
+def _proxy_mcp(bootstrap_path: Path) -> int:
+    bootstrap = _read_bootstrap(bootstrap_path, expected_kind="mcp")
+    connection = _connect(bootstrap, kind="mcp")
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    copy_error: list[BaseException] = []
+
+    def copy_input() -> None:
+        try:
+            while True:
+                # BufferedReader.read(size) may wait for the full requested
+                # size on a long-lived pipe. MCP frames are normally much
+                # smaller, so use one unbuffered fd read and forward promptly.
+                block = os.read(stdin.fileno(), 65536)
+                if not block:
+                    try:
+                        connection.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    return
+                connection.sendall(block)
+        except BaseException as exc:
+            copy_error.append(exc)
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    input_thread = threading.Thread(target=copy_input, name="bello-mcp-stdin", daemon=True)
+    input_thread.start()
+    try:
+        while True:
+            block = connection.recv(65536)
+            if not block:
+                if copy_error:
+                    raise LauncherError(f"MCP stdin proxy failed: {copy_error[0]}")
+                return 0
+            stdout.write(block)
+            stdout.flush()
+    finally:
+        connection.close()
+
+
+def _invoke_hook(bootstrap_path: Path, event: str) -> int:
+    bootstrap = _read_bootstrap(bootstrap_path, expected_kind="hook", event=event)
+    payload = sys.stdin.buffer.read(MAX_HOOK_INPUT + 1)
+    if len(payload) > MAX_HOOK_INPUT:
+        raise LauncherError("hook stdin exceeds 256 KiB")
+    connection = _connect(bootstrap, kind="hook", event=event)
+    try:
+        connection.sendall(
+            _canonical({"payload": base64.b64encode(payload).decode("ascii")}) + b"\n"
+        )
+        response = json.loads(_recv_line(connection))
+        if not isinstance(response, Mapping) or set(response) != {"output"}:
+            raise LauncherError("broker hook response schema mismatch")
+        encoded = response.get("output")
+        if not isinstance(encoded, str):
+            raise LauncherError("broker hook output is not base64")
+        output = base64.b64decode(encoded, validate=True)
+        if len(output) > 32 * 1024:
+            raise LauncherError("broker hook output exceeds 32 KiB")
+        sys.stdout.buffer.write(output)
+        sys.stdout.buffer.flush()
+        return 0
+    finally:
+        connection.close()
+
+
+def _launch_app_server(channel: str, role: str, command: list[str]) -> int:
+    if not channel or len(channel.encode("utf-8")) > 256:
+        raise LauncherError("app-server channel is invalid")
+    if role not in {"coder", "supervisor"}:
+        raise LauncherError("app-server role is invalid")
+    if not command or any(not value or "\x00" in value for value in command):
+        raise LauncherError("app-server command is invalid")
+    # Deliberately retain the exact controller-created environment and provider
+    # network.  Context MCP/hook descendants cross the stricter broker boundary.
+    os.execvpe(command[0], command, dict(os.environ))
+    return 127
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="bello-context-launcher")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    mcp = subparsers.add_parser("mcp")
+    mcp.add_argument("--bootstrap", type=Path, required=True)
+    hook = subparsers.add_parser("hook")
+    hook.add_argument("--event", choices=REQUIRED_HOOKS, required=True)
+    hook.add_argument("--bootstrap", type=Path, required=True)
+    app_server = subparsers.add_parser("app-server")
+    app_server.add_argument("--channel", required=True)
+    app_server.add_argument("--role", required=True)
+    app_server.add_argument("command", nargs=argparse.REMAINDER)
+    arguments = parser.parse_args()
+    if arguments.mode == "mcp":
+        return _proxy_mcp(arguments.bootstrap)
+    if arguments.mode == "hook":
+        return _invoke_hook(arguments.bootstrap, arguments.event)
+    command = list(arguments.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    return _launch_app_server(arguments.channel, arguments.role, command)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as error:
+        sys.stderr.write(f"bello-context-launcher: {error}\n")
+        raise SystemExit(1)

@@ -46,6 +46,7 @@ def test_snapshot_patch_applies_after_accept_and_real_repo_is_unchanged_beforeha
     _init_repo(tmp_path)
 
     snapshot = create_workspace_snapshot(tmp_path, task)
+    snapshot_temp_root = snapshot.temp_root
     try:
         (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
         (snapshot.snapshot_root / "new.txt").write_text("created\n", encoding="utf-8")
@@ -61,6 +62,7 @@ def test_snapshot_patch_applies_after_accept_and_real_repo_is_unchanged_beforeha
         assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "created\n"
     finally:
         snapshot.cleanup()
+    assert not snapshot_temp_root.exists()
 
 
 def test_snapshot_patch_applies_binary_files(tmp_path: Path) -> None:
@@ -145,7 +147,7 @@ def test_snapshot_patch_keeps_object_deliverable_while_ignoring_cache(tmp_path: 
         snapshot.cleanup()
 
 
-def test_snapshot_mounts_runtime_state_read_only_and_excludes_secret_files(tmp_path: Path) -> None:
+def test_snapshot_excludes_runtime_state_and_separately_copies_immutable_task(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     (tmp_path / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
@@ -158,14 +160,14 @@ def test_snapshot_mounts_runtime_state_read_only_and_excludes_secret_files(tmp_p
     snapshot = create_workspace_snapshot(tmp_path, task)
     try:
         assert not (snapshot.snapshot_root / ".env").exists()
-        assert (snapshot.snapshot_root / ".supervisor").is_symlink()
-        assert (snapshot.snapshot_root / ".supervisor" / "CONFIG.json").read_text(encoding="utf-8") == "{}"
+        assert not (snapshot.snapshot_root / ".supervisor").exists()
         handoff.write_text("updated handoff\n", encoding="utf-8")
-        assert (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").read_text(encoding="utf-8") == (
-            "updated handoff\n"
-        )
-        assert snapshot.task_path.is_symlink()
-        assert snapshot.task_path.resolve() == task.resolve()
+        assert not (snapshot.snapshot_root / ".supervisor").exists()
+        assert snapshot.task_path.is_file()
+        assert not snapshot.task_path.is_symlink()
+        assert snapshot.task_path.read_text(encoding="utf-8") == "# Task\n"
+        assert snapshot.task_path.stat().st_ino != task.stat().st_ino
+        assert snapshot.task_path.stat().st_mode & 0o222 == 0
         assert (snapshot.snapshot_root / ".git").is_dir()
     finally:
         snapshot.cleanup()
@@ -550,6 +552,128 @@ def test_snapshot_preserves_real_remote_instead_of_local_clone_source(tmp_path: 
         snapshot.cleanup()
 
 
+@pytest.mark.parametrize(
+    ("fetch_url", "push_url", "secret"),
+    [
+        (
+            "https://user:fetch-secret@example.com/project.git",
+            None,
+            "fetch-secret",
+        ),
+        (
+            "https://example.com/project.git",
+            "https://oauth2:push-secret@example.com/project.git",
+            "push-secret",
+        ),
+        (
+            "https://example.com/project.git?access_token=query-secret",
+            None,
+            "query-secret",
+        ),
+        (
+            "https://example.com/ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/project.git",
+            None,
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        ),
+    ],
+    ids=("fetch-userinfo", "push-userinfo", "query-token", "embedded-token"),
+)
+def test_snapshot_omits_entire_credential_bearing_remote(
+    tmp_path: Path,
+    fetch_url: str,
+    push_url: str | None,
+    secret: str,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    subprocess.run(["git", "remote", "add", "origin", fetch_url], cwd=tmp_path, check=True)
+    if push_url is not None:
+        subprocess.run(
+            ["git", "remote", "set-url", "--push", "origin", push_url],
+            cwd=tmp_path,
+            check=True,
+        )
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        assert subprocess.check_output(
+            ["git", "remote"],
+            cwd=snapshot.snapshot_root,
+            text=True,
+        ) == ""
+        config = (snapshot.snapshot_root / ".git" / "config").read_text(encoding="utf-8")
+        assert secret not in config
+        assert secret.encode() not in snapshot.git_config_bytes
+    finally:
+        snapshot.cleanup()
+
+
+def test_snapshot_scrubs_credential_helpers_auth_headers_and_url_rewrites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://example.com/project.git"],
+        cwd=tmp_path,
+        check=True,
+    )
+    original_clone = workspace_snapshot_module._clone_git_metadata
+
+    def clone_with_credential_config(original_root: Path, snapshot_root: Path) -> bool:
+        cloned = original_clone(original_root, snapshot_root)
+        assert cloned
+        entries = (
+            ("credential.helper", "!printf password=helper-secret"),
+            (
+                "http.https://example.com/.extraHeader",
+                "Authorization: Bearer header-secret",
+            ),
+            (
+                "url.https://oauth2:rewrite-secret@example.com/.insteadOf",
+                "safe:",
+            ),
+            ("core.askPass", "/tmp/askpass-secret"),
+            ("remote.origin.proxy", "https://proxy:proxy-secret@example.com"),
+        )
+        for key, value in entries:
+            subprocess.run(
+                ["git", "config", "--local", key, value],
+                cwd=snapshot_root,
+                check=True,
+            )
+        return True
+
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_clone_git_metadata",
+        clone_with_credential_config,
+    )
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        config = (snapshot.snapshot_root / ".git" / "config").read_text(encoding="utf-8")
+        for secret in (
+            "helper-secret",
+            "header-secret",
+            "rewrite-secret",
+            "askpass-secret",
+            "proxy-secret",
+        ):
+            assert secret not in config
+            assert secret.encode() not in snapshot.git_config_bytes
+        assert subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            cwd=snapshot.snapshot_root,
+            text=True,
+        ).strip() == "https://example.com/project.git"
+    finally:
+        snapshot.cleanup()
+
+
 def test_snapshot_git_plumbing_ignores_user_filters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -580,7 +704,7 @@ def test_snapshot_git_plumbing_ignores_user_filters(tmp_path: Path, monkeypatch:
         snapshot.cleanup()
 
 
-def test_snapshot_mounts_existing_dependencies_without_copying(tmp_path: Path) -> None:
+def test_snapshot_copies_existing_dependencies_read_only_without_shared_inodes(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     dependency = tmp_path / ".venv" / "bin" / "tool"
@@ -589,16 +713,21 @@ def test_snapshot_mounts_existing_dependencies_without_copying(tmp_path: Path) -
     _init_repo(tmp_path)
 
     snapshot = create_workspace_snapshot(tmp_path, task)
+    snapshot_temp_root = snapshot.temp_root
     try:
         mounted = snapshot.snapshot_root / ".venv"
-        assert mounted.is_symlink()
+        assert mounted.is_dir()
+        assert not mounted.is_symlink()
         assert (mounted / "bin" / "tool").read_text(encoding="utf-8") == "dependency\n"
+        assert (mounted / "bin" / "tool").stat().st_ino != dependency.stat().st_ino
+        assert (mounted / "bin" / "tool").stat().st_mode & 0o222 == 0
         assert snapshot.readonly_dependency_paths == (".venv",)
     finally:
         snapshot.cleanup()
+    assert not snapshot_temp_root.exists()
 
 
-def test_snapshot_restores_replaced_runtime_links(tmp_path: Path) -> None:
+def test_snapshot_restores_replaced_immutable_copies(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     state = tmp_path / ".supervisor"
@@ -613,18 +742,19 @@ def test_snapshot_restores_replaced_runtime_links(tmp_path: Path) -> None:
     try:
         snapshot.task_path.unlink()
         snapshot.task_path.write_text("weakened\n", encoding="utf-8")
-        (snapshot.snapshot_root / ".supervisor").unlink()
-        (snapshot.snapshot_root / ".supervisor").mkdir()
-        (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").write_text("forged\n", encoding="utf-8")
-        (snapshot.snapshot_root / ".venv").unlink()
-        (snapshot.snapshot_root / ".venv").mkdir()
+        dependency_copy = snapshot.snapshot_root / ".venv"
+        for child in sorted(dependency_copy.rglob("*"), reverse=True):
+            child.chmod(0o700) if child.is_dir() else child.chmod(0o600)
+        dependency_copy.chmod(0o700)
+        (dependency_copy / "bin" / "tool").write_text("forged\n", encoding="utf-8")
 
         repaired = snapshot.restore_runtime_links()
 
-        assert repaired == ("task", "supervisor_state", "dependency:.venv")
-        assert snapshot.task_path.is_symlink()
+        assert repaired == ("task", "dependency:.venv")
+        assert snapshot.task_path.is_file()
+        assert not snapshot.task_path.is_symlink()
         assert snapshot.task_path.read_text(encoding="utf-8") == "# Task\n"
-        assert (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").read_text(encoding="utf-8") == "canonical\n"
+        assert not (snapshot.snapshot_root / ".supervisor").exists()
         assert (snapshot.snapshot_root / ".venv" / "bin" / "tool").read_text(encoding="utf-8") == "dependency\n"
     finally:
         snapshot.cleanup()
@@ -641,10 +771,10 @@ def test_snapshot_runtime_link_repair_wraps_filesystem_errors(
     try:
         snapshot.task_path.unlink()
 
-        def fail_link(*_args, **_kwargs) -> None:
+        def fail_copy(*_args, **_kwargs) -> None:
             raise PermissionError("repair denied")
 
-        monkeypatch.setattr(workspace_snapshot_module, "_create_readonly_link", fail_link)
+        monkeypatch.setattr(workspace_snapshot_module, "_copy_immutable_task", fail_copy)
 
         with pytest.raises(WorkspaceSnapshotError, match="failed to restore.*repair denied"):
             snapshot.restore_runtime_links()
@@ -664,7 +794,8 @@ def test_snapshot_runtime_link_repair_replaces_fifo(tmp_path: Path) -> None:
         os.mkfifo(snapshot.task_path)
 
         assert snapshot.restore_runtime_links() == ("task",)
-        assert snapshot.task_path.is_symlink()
+        assert snapshot.task_path.is_file()
+        assert not snapshot.task_path.is_symlink()
         assert snapshot.task_path.read_text(encoding="utf-8") == "# Task\n"
     finally:
         snapshot.cleanup()
@@ -763,5 +894,156 @@ def test_snapshot_patch_rejects_real_workspace_conflict(tmp_path: Path) -> None:
             apply_snapshot_patch(snapshot)
 
         assert source.read_text(encoding="utf-8") == "value = 3\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_snapshot_uses_precreated_external_run_root_and_leaves_it_owned_by_caller(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = project / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    _init_repo(project)
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o755)
+    marker = run_root / "runtime-metadata"
+    marker.mkdir()
+
+    snapshot = create_workspace_snapshot(project, task, run_root=run_root)
+    assert snapshot.run_root == run_root.resolve()
+    assert snapshot.snapshot_root == run_root / "coder-workspace"
+    assert snapshot.snapshot_root.is_dir()
+    assert run_root.stat().st_mode & 0o777 == 0o700
+    assert snapshot.snapshot_root.stat().st_mode & 0o777 == 0o700
+    assert (snapshot.snapshot_root / ".git" / "config").stat().st_mode & 0o777 == 0o600
+    assert (snapshot.snapshot_root / "app.py").stat().st_ino != source.stat().st_ino
+
+    snapshot.cleanup()
+
+    assert run_root.is_dir()
+    assert marker.is_dir()
+    assert not (run_root / "coder-workspace").exists()
+
+
+def test_snapshot_accepts_precreated_empty_workspace_with_custom_name(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    run_root = tmp_path / "run"
+    workspace = run_root / "work"
+    workspace.mkdir(parents=True)
+
+    snapshot = create_workspace_snapshot(
+        project,
+        task,
+        run_root=run_root,
+        workspace_name="work",
+    )
+    try:
+        assert snapshot.snapshot_root == workspace
+        assert snapshot.task_path.read_text(encoding="utf-8") == "# Task\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_snapshot_rejects_symlink_run_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    actual_run_root = tmp_path / "actual-run"
+    actual_run_root.mkdir()
+    run_root_link = tmp_path / "run-link"
+    os.symlink(actual_run_root, run_root_link)
+
+    with pytest.raises(WorkspaceSnapshotError, match="run root.*symlink"):
+        create_workspace_snapshot(project, task, run_root=run_root_link)
+
+
+def test_snapshot_has_explicit_quiesce_before_diff_contract(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+        with pytest.raises(SnapshotPatchError, match="quiesced before"):
+            apply_snapshot_patch(snapshot, require_quiesced=True)
+
+        assert source.read_text(encoding="utf-8") == "value = 1\n"
+        snapshot.mark_quiesced()
+        assert snapshot.is_quiesced is True
+        result = apply_snapshot_patch(snapshot, require_quiesced=True)
+
+        assert result.changed_paths == ("app.py",)
+        assert source.read_text(encoding="utf-8") == "value = 2\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_snapshot_and_diff_exclude_runtime_metadata_and_context_state(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    for directory in ("runtime-metadata", "context-mode", "context-mode-home", ".codex"):
+        path = tmp_path / directory
+        path.mkdir()
+        (path / "state.json").write_text("source-state\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        for directory in ("runtime-metadata", "context-mode", "context-mode-home", ".codex"):
+            assert not (snapshot.snapshot_root / directory).exists()
+            path = snapshot.snapshot_root / directory
+            path.mkdir()
+            (path / "state.json").write_text("run-state\n", encoding="utf-8")
+
+        result = apply_snapshot_patch(snapshot)
+
+        assert result.applied is False
+        assert set(result.ignored_paths) == {
+            ".codex/state.json",
+            "context-mode-home/state.json",
+            "context-mode/state.json",
+            "runtime-metadata/state.json",
+        }
+        for directory in ("runtime-metadata", "context-mode", "context-mode-home", ".codex"):
+            assert (tmp_path / directory / "state.json").read_text(encoding="utf-8") == "source-state\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_snapshot_masks_preexisting_protected_paths_and_records_mask(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    hidden = tmp_path / "hidden" / "answer.txt"
+    hidden.parent.mkdir()
+    hidden.write_text("private\n", encoding="utf-8")
+    declared = tmp_path / "grader-data"
+    declared.mkdir()
+    (declared / "answer.txt").write_text("declared-private\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    snapshot = create_workspace_snapshot(
+        tmp_path,
+        task,
+        declared_grading_roots=("grader-data",),
+        protected_path_masks=("future-mask",),
+    )
+    try:
+        assert not (snapshot.snapshot_root / "hidden").exists()
+        assert not (snapshot.snapshot_root / "grader-data").exists()
+        assert {"hidden", "grader-data", "future-mask"}.issubset(set(snapshot.protected_path_masks))
+        future_mask = snapshot.snapshot_root / "future-mask"
+        future_mask.mkdir()
+        (future_mask / "answer.txt").write_text("must-not-apply\n", encoding="utf-8")
+        with pytest.raises(SnapshotPatchError, match="declared grading/hidden path access denied"):
+            apply_snapshot_patch(snapshot)
+        assert not (tmp_path / "future-mask").exists()
     finally:
         snapshot.cleanup()

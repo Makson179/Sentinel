@@ -3,11 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import threading
+import urllib.parse
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -18,12 +21,33 @@ from supervisor.schemas import PolicyDecisionKind
 SNAPSHOT_ALWAYS_IGNORE_NAMES = {
     ".git",
     ".supervisor",
+    ".bello",
+    ".codex",
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
     ".tox",
     ".nox",
+}
+
+# These directories belong to Bello's control plane, not to the task workspace.
+# The top-level names mirror the run-root layout from task.md.  Dot-prefixed
+# control directories are excluded at any depth because repository-local Codex
+# configuration must not become coder/context input.
+SNAPSHOT_RUNTIME_STATE_ANYWHERE_NAMES = {
+    ".bello",
+    ".codex",
+    ".context-mode",
+    ".context_mode",
+    ".supervisor",
+}
+
+SNAPSHOT_RUNTIME_STATE_TOP_LEVEL_NAMES = {
+    "context-mode",
+    "context-mode-home",
+    "context-mode-tmp",
+    "runtime-metadata",
 }
 
 SNAPSHOT_READ_ONLY_DEPENDENCY_NAMES = {
@@ -57,6 +81,30 @@ GENERATED_ARTIFACT_SUFFIXES = {
     ".gcno",
     ".tsbuildinfo",
 }
+
+_SNAPSHOT_REMOTE_URL_MAX_BYTES = 4096
+_SNAPSHOT_REMOTE_SCHEMES = frozenset({"git", "http", "https", "ssh"})
+_SNAPSHOT_REMOTE_CREDENTIAL_PATTERN = re.compile(
+    r"(?:"
+    r"github_pat_[A-Za-z0-9_]{10,}"
+    r"|gh[pousr]_[A-Za-z0-9]{10,}"
+    r"|glpat-[A-Za-z0-9_-]{10,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|x-access-token"
+    r"|(?:access|auth|private|refresh)[_-]?token(?:$|[/.:=_-])"
+    r"|api[_-]?key(?:$|[/.:=_-])"
+    r"|authorization(?:$|[/.:=_-])"
+    r"|bearer(?:$|[ +:/=_-])"
+    r")",
+    re.IGNORECASE,
+)
+_SNAPSHOT_SENSITIVE_GIT_CONFIG_PREFIXES = (
+    "credential.",
+    "http.",
+    "include.",
+    "includeif.",
+    "url.",
+)
 
 
 class WorkspaceSnapshotError(RuntimeError):
@@ -111,12 +159,64 @@ class WorkspaceSnapshot:
     git_worktree_config_bytes: bytes | None
     git_worktree_config_mode: int | None
     readonly_dependency_paths: tuple[str, ...] = ()
+    readonly_dependency_digests: tuple[tuple[str, str], ...] = ()
     declared_grading_roots: tuple[str | Path, ...] = ()
+    protected_path_masks: tuple[str, ...] = ()
+    runtime_excluded_paths: tuple[str, ...] = ()
     rewritten_symlinks: tuple[SnapshotSymlinkRewrite, ...] = ()
     excluded_external_symlink_paths: tuple[str, ...] = ()
+    owns_temp_root: bool = True
+    _quiesced: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+
+    @property
+    def run_root(self) -> Path:
+        """Return the run root while retaining the legacy ``temp_root`` name."""
+
+        return self.temp_root
 
     def cleanup(self) -> None:
-        shutil.rmtree(self.temp_root, ignore_errors=True)
+        try:
+            if self.owns_temp_root:
+                _remove_path(self.temp_root)
+            else:
+                _remove_path(self.snapshot_root)
+        except OSError:
+            # Cleanup remains best-effort for compatibility with the previous
+            # TemporaryDirectory-style lifecycle.
+            pass
+
+    @property
+    def is_quiesced(self) -> bool:
+        return self._quiesced.is_set()
+
+    def mark_quiesced(self) -> None:
+        """Attest that all processes capable of writing the workspace stopped.
+
+        The controller owns this lifecycle assertion.  Consumers that require
+        the stronger final-diff contract pass ``require_quiesced=True`` to
+        :func:`apply_snapshot_patch`.
+        """
+
+        self._quiesced.set()
+
+    def task_control_is_trusted(self) -> bool:
+        task = self.snapshot_root / self.task_relative_path
+        if not _path_has_only_real_directory_parents(self.snapshot_root, task):
+            return False
+        try:
+            descriptor = _open_regular_file_no_follow(task)
+        except OSError:
+            return False
+        try:
+            mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+            if mode & 0o222:
+                return False
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            return digest.hexdigest() == self.task_sha256
+        finally:
+            os.close(descriptor)
 
     def restore_runtime_links(self) -> tuple[str, ...]:
         try:
@@ -151,9 +251,12 @@ class WorkspaceSnapshot:
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists() or destination.is_symlink():
                 raise WorkspaceSnapshotError(f"snapshot recovery destination already exists: {destination}")
-            relative_workspace = self.snapshot_root.relative_to(self.temp_root)
-            shutil.move(str(self.temp_root), str(destination))
-            return destination / relative_workspace
+            destination.mkdir(mode=0o700)
+            recovery_workspace = destination / "workspace"
+            shutil.move(str(self.snapshot_root), str(recovery_workspace))
+            if self.owns_temp_root:
+                _remove_path(self.temp_root)
+            return recovery_workspace
         except WorkspaceSnapshotError:
             raise
         except OSError as exc:
@@ -165,7 +268,10 @@ def create_workspace_snapshot(
     task_path: Path,
     *,
     declared_grading_roots: Iterable[str | Path] = (),
+    protected_path_masks: Iterable[str | Path] = (),
     prefix: str = "bello-coder-",
+    run_root: Path | None = None,
+    workspace_name: str = "coder-workspace",
 ) -> WorkspaceSnapshot:
     if shutil.which("git") is None:
         raise WorkspaceSnapshotError("git executable is required for workspace snapshots")
@@ -180,7 +286,13 @@ def create_workspace_snapshot(
     except ValueError as exc:
         raise WorkspaceSnapshotError(f"task path is outside project root: {original_task}") from exc
     reserved_task_part = next(
-        (part for part in task_relative.parts if part in SNAPSHOT_RESERVED_TASK_PATH_NAMES),
+        (
+            part
+            for index, part in enumerate(task_relative.parts)
+            if part in SNAPSHOT_RESERVED_TASK_PATH_NAMES
+            or part in SNAPSHOT_RUNTIME_STATE_ANYWHERE_NAMES
+            or (index == 0 and part in SNAPSHOT_RUNTIME_STATE_TOP_LEVEL_NAMES)
+        ),
         None,
     )
     if reserved_task_part is not None:
@@ -188,14 +300,47 @@ def create_workspace_snapshot(
             f"task path cannot be inside Bello runtime, cache, or dependency directory: {reserved_task_part}"
         )
 
-    try:
-        temp_root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
-    except OSError as exc:
-        raise WorkspaceSnapshotError(f"failed to create temporary workspace snapshot directory: {exc}") from exc
-    snapshot_root = temp_root / "workspace"
     declared_roots = tuple(declared_grading_roots)
-    resolved_declared_roots = _resolve_declared_roots(original_root, declared_roots)
+    explicit_protected_roots = tuple(protected_path_masks)
+    policy_roots = tuple(dict.fromkeys((*declared_roots, *explicit_protected_roots)))
+    resolved_declared_roots = _resolve_declared_roots(original_root, policy_roots)
+    if is_protected_path(original_root, original_task) or _matches_declared_root(
+        original_task,
+        resolved_declared_roots,
+    ):
+        raise WorkspaceSnapshotError("task path cannot be inside a protected or declared grading path")
+
+    owns_temp_root = run_root is None
+    temp_root: Path | None = None
+    try:
+        if run_root is None:
+            temp_root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+            os.chmod(temp_root, 0o700)
+            _validate_run_root_separation(original_root, temp_root)
+        else:
+            temp_root = _prepare_external_run_root(Path(run_root), original_root)
+        snapshot_root = _prepare_snapshot_workspace_path(temp_root, workspace_name)
+    except WorkspaceSnapshotError:
+        if owns_temp_root and temp_root is not None:
+            try:
+                _remove_path(temp_root)
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        if run_root is None:
+            if temp_root is not None:
+                try:
+                    _remove_path(temp_root)
+                except OSError:
+                    pass
+            raise WorkspaceSnapshotError(f"failed to create temporary workspace snapshot directory: {exc}") from exc
+        raise WorkspaceSnapshotError(f"failed to prepare external run workspace: {exc}") from exc
+
+    assert temp_root is not None
     readonly_dependencies: list[tuple[Path, str]] = []
+    masked_protected_paths = list(_relative_roots_within(original_root, resolved_declared_roots))
+    runtime_excluded_paths: list[str] = []
     try:
         history_preserved = _clone_git_metadata(original_root, snapshot_root)
         if history_preserved:
@@ -204,35 +349,60 @@ def create_workspace_snapshot(
         shutil.copytree(
             original_root,
             snapshot_root,
-            dirs_exist_ok=history_preserved,
+            # The run-root workspace leaf is created up front with 0700.  It is
+            # therefore always an existing, controller-owned empty directory
+            # (or contains only the isolated Git clone prepared above).
+            dirs_exist_ok=True,
             symlinks=True,
             ignore=_snapshot_ignore(
                 original_root,
                 resolved_declared_roots,
                 original_task=original_task,
                 readonly_dependencies=readonly_dependencies,
+                protected_path_masks=masked_protected_paths,
+                runtime_excluded_paths=runtime_excluded_paths,
             ),
         )
         rewritten_symlinks, excluded_external_symlinks = _sanitize_copied_workspace_symlinks(
             original_root,
             snapshot_root,
+            declared_roots=resolved_declared_roots,
         )
+        _make_workspace_tree_owner_writable(snapshot_root)
         snapshot_task = snapshot_root / task_relative
-        _create_readonly_link(snapshot_task, original_task)
-        state_source = original_root / ".supervisor"
-        if state_source.is_dir():
-            _create_readonly_link(snapshot_root / ".supervisor", state_source)
+        _copy_immutable_task(snapshot_task, task_bytes)
         readonly_dependency_paths: list[str] = []
+        readonly_dependency_digests: list[tuple[str, str]] = []
         for source, relative in readonly_dependencies:
-            _create_readonly_link(snapshot_root / relative, source)
+            if source.is_symlink() or not source.is_dir():
+                excluded_external_symlinks = (*excluded_external_symlinks, relative)
+                continue
+            dependency_rewrites, dependency_excluded, dependency_masks, dependency_runtime = (
+                _copy_readonly_dependency(
+                    source,
+                    snapshot_root / relative,
+                    relative,
+                    declared_roots=resolved_declared_roots,
+                )
+            )
+            rewritten_symlinks = (*rewritten_symlinks, *dependency_rewrites)
+            excluded_external_symlinks = (*excluded_external_symlinks, *dependency_excluded)
+            masked_protected_paths.extend(dependency_masks)
+            runtime_excluded_paths.extend(dependency_runtime)
             readonly_dependency_paths.append(relative)
+            readonly_dependency_digests.append((relative, _tree_digest(snapshot_root / relative)))
         baseline_commit = _init_snapshot_git(snapshot_root)
+        _sanitize_snapshot_git_metadata(snapshot_root)
+        os.chmod(snapshot_root, 0o700)
+        _restrict_control_file_permissions(snapshot_root / ".git" / "config")
         git_config_bytes, git_config_mode = _read_regular_file(snapshot_root / ".git" / "config")
         worktree_config = snapshot_root / ".git" / "config.worktree"
         if worktree_config.exists() or worktree_config.is_symlink():
+            _restrict_control_file_permissions(worktree_config)
             git_worktree_config_bytes, git_worktree_config_mode = _read_regular_file(worktree_config)
         else:
             git_worktree_config_bytes, git_worktree_config_mode = None, None
+        _assert_no_shared_regular_file_inodes(original_root, snapshot_root)
         return WorkspaceSnapshot(
             original_root=original_root,
             snapshot_root=snapshot_root.resolve(),
@@ -247,28 +417,319 @@ def create_workspace_snapshot(
             git_worktree_config_bytes=git_worktree_config_bytes,
             git_worktree_config_mode=git_worktree_config_mode,
             readonly_dependency_paths=tuple(sorted(dict.fromkeys(readonly_dependency_paths))),
-            declared_grading_roots=declared_roots,
+            readonly_dependency_digests=tuple(sorted(readonly_dependency_digests)),
+            declared_grading_roots=policy_roots,
+            protected_path_masks=tuple(sorted(dict.fromkeys(masked_protected_paths))),
+            runtime_excluded_paths=tuple(sorted(dict.fromkeys(runtime_excluded_paths))),
             rewritten_symlinks=rewritten_symlinks,
-            excluded_external_symlink_paths=excluded_external_symlinks,
+            excluded_external_symlink_paths=tuple(sorted(dict.fromkeys(excluded_external_symlinks))),
+            owns_temp_root=owns_temp_root,
         )
     except WorkspaceSnapshotError:
-        shutil.rmtree(temp_root, ignore_errors=True)
+        _cleanup_failed_snapshot(temp_root, snapshot_root, owns_temp_root=owns_temp_root)
         raise
     except Exception as exc:
-        shutil.rmtree(temp_root, ignore_errors=True)
+        _cleanup_failed_snapshot(temp_root, snapshot_root, owns_temp_root=owns_temp_root)
         raise WorkspaceSnapshotError(f"failed to create coder workspace snapshot: {exc}") from exc
 
 
-def apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
+def _prepare_external_run_root(run_root: Path, original_root: Path) -> Path:
+    raw_root = Path(os.path.abspath(os.fspath(run_root)))
     try:
-        return _apply_snapshot_patch(snapshot)
+        resolved = raw_root.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise WorkspaceSnapshotError(f"external run root does not exist: {raw_root}") from exc
+    if resolved != raw_root:
+        raise WorkspaceSnapshotError(
+            f"external run root must not contain symlink path components: {raw_root}"
+        )
+    try:
+        metadata = raw_root.lstat()
+    except FileNotFoundError as exc:
+        raise WorkspaceSnapshotError(f"external run root does not exist: {raw_root}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise WorkspaceSnapshotError(f"external run root must be a real directory, not a symlink: {raw_root}")
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        raise WorkspaceSnapshotError(f"external run root is not owned by the current user: {raw_root}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(raw_root, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise WorkspaceSnapshotError(f"external run root changed while it was being opened: {raw_root}")
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+
+    _validate_run_root_separation(original_root, resolved)
+    return resolved
+
+
+def _validate_run_root_separation(original_root: Path, run_root: Path) -> None:
+    if _path_is_within(run_root, original_root) or _path_is_within(original_root, run_root):
+        raise WorkspaceSnapshotError(
+            f"run root must be outside and disjoint from the source project: {run_root}"
+        )
+
+
+def _prepare_snapshot_workspace_path(run_root: Path, workspace_name: str) -> Path:
+    if not workspace_name or Path(workspace_name).is_absolute() or Path(workspace_name).parts != (workspace_name,):
+        raise WorkspaceSnapshotError(f"invalid coder workspace name: {workspace_name!r}")
+    if workspace_name in {".", ".."} or _is_runtime_state_relative(workspace_name):
+        raise WorkspaceSnapshotError(f"reserved coder workspace name: {workspace_name!r}")
+    workspace = run_root / workspace_name
+    if workspace.exists() or workspace.is_symlink():
+        metadata = workspace.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise WorkspaceSnapshotError(f"coder workspace path must be a real directory: {workspace}")
+        if any(workspace.iterdir()):
+            raise WorkspaceSnapshotError(f"coder workspace path is not empty: {workspace}")
+        os.chmod(workspace, 0o700)
+    else:
+        workspace.mkdir(mode=0o700)
+    return workspace.absolute()
+
+
+def _cleanup_failed_snapshot(temp_root: Path, snapshot_root: Path, *, owns_temp_root: bool) -> None:
+    if owns_temp_root:
+        try:
+            _remove_path(temp_root)
+        except OSError:
+            pass
+    else:
+        try:
+            _remove_path(snapshot_root)
+        except OSError:
+            pass
+
+
+def _copy_immutable_task(destination: Path, content: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _remove_path(destination)
+    _atomic_replace_bytes(destination, content, 0o444)
+
+
+def _copy_readonly_dependency(
+    source: Path,
+    destination: Path,
+    relative_prefix: str,
+    *,
+    declared_roots: tuple[Path, ...],
+) -> tuple[
+    tuple[SnapshotSymlinkRewrite, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    protected_masks: list[str] = []
+    runtime_excluded: list[str] = []
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
+        current = Path(directory)
+        for name in names:
+            candidate = current / name
+            local_relative = candidate.relative_to(source).as_posix()
+            workspace_relative = _prefixed_relative(relative_prefix, local_relative)
+            if _is_runtime_state_relative(local_relative):
+                ignored.add(name)
+                runtime_excluded.append(workspace_relative)
+            elif is_protected_path(source, candidate) or _matches_declared_root(candidate, declared_roots):
+                ignored.add(name)
+                protected_masks.append(workspace_relative)
+        return ignored
+
+    _remove_path(destination)
+    shutil.copytree(source, destination, symlinks=True, ignore=ignore)
+    local_rewrites, local_excluded = _sanitize_copied_workspace_symlinks(
+        source,
+        destination,
+        declared_roots=declared_roots,
+    )
+    rewrites = tuple(
+        SnapshotSymlinkRewrite(
+            path=_prefixed_relative(relative_prefix, rewrite.path),
+            original_target=rewrite.original_target,
+            snapshot_target=rewrite.snapshot_target,
+        )
+        for rewrite in local_rewrites
+    )
+    excluded = tuple(_prefixed_relative(relative_prefix, path) for path in local_excluded)
+    _make_tree_readonly(destination)
+    return rewrites, excluded, tuple(protected_masks), tuple(runtime_excluded)
+
+
+def _prefixed_relative(prefix: str, relative: str) -> str:
+    return (Path(prefix) / relative).as_posix() if relative not in {"", "."} else Path(prefix).as_posix()
+
+
+def _make_tree_readonly(root: Path) -> None:
+    for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(current) / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise WorkspaceSnapshotError(f"unsupported path in read-only dependency: {path}")
+            mode = stat.S_IMODE(metadata.st_mode) & ~0o222
+            if stat.S_ISDIR(metadata.st_mode):
+                mode |= stat.S_IRUSR | stat.S_IXUSR
+            else:
+                mode |= stat.S_IRUSR
+            os.chmod(path, mode, follow_symlinks=False)
+    root_mode = stat.S_IMODE(root.lstat().st_mode) & ~0o222
+    os.chmod(root, root_mode | stat.S_IRUSR | stat.S_IXUSR, follow_symlinks=False)
+
+
+def _make_workspace_tree_owner_writable(root: Path) -> None:
+    for current, directories, files in os.walk(root, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(current) / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise WorkspaceSnapshotError(f"unsupported path in coder workspace: {path}")
+            mode = stat.S_IMODE(metadata.st_mode) & ~0o022
+            if stat.S_ISDIR(metadata.st_mode):
+                mode |= stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            else:
+                mode |= stat.S_IRUSR | stat.S_IWUSR
+            os.chmod(path, mode, follow_symlinks=False)
+    os.chmod(root, 0o700, follow_symlinks=False)
+
+
+def _tree_digest(root: Path) -> str:
+    metadata = root.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"not a real directory: {root}")
+    digest = hashlib.sha256()
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in [*directories, *files]:
+            path = Path(current) / name
+            relative = path.relative_to(root).as_posix()
+            entry = path.lstat()
+            mode = stat.S_IMODE(entry.st_mode)
+            if stat.S_ISLNK(entry.st_mode):
+                kind = b"link"
+                payload = os.fsencode(os.readlink(path))
+            elif stat.S_ISDIR(entry.st_mode):
+                kind = b"dir"
+                payload = b""
+            elif stat.S_ISREG(entry.st_mode):
+                kind = b"file"
+                payload = bytes.fromhex(_sha256_file(path))
+            else:
+                raise OSError(f"unsupported path type in read-only dependency: {path}")
+            digest.update(kind + b"\0" + os.fsencode(relative) + b"\0" + f"{mode:o}".encode() + b"\0")
+            digest.update(payload + b"\0")
+    return digest.hexdigest()
+
+
+def _restrict_control_file_permissions(path: Path) -> None:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise WorkspaceSnapshotError(f"snapshot control file is not a regular file: {path}")
+    os.chmod(path, 0o600, follow_symlinks=False)
+
+
+def _assert_no_shared_regular_file_inodes(original_root: Path, snapshot_root: Path) -> None:
+    source_inodes = {
+        inode: relative
+        for inode, relative in _regular_file_inodes(original_root)
+    }
+    for inode, relative in _regular_file_inodes(snapshot_root):
+        source_relative = source_inodes.get(inode)
+        if source_relative is not None:
+            raise WorkspaceSnapshotError(
+                "coder workspace contains a hardlink to the source project: "
+                f"{relative} shares an inode with {source_relative}"
+            )
+
+
+def _regular_file_inodes(root: Path) -> list[tuple[tuple[int, int], str]]:
+    inodes: list[tuple[tuple[int, int], str]] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in [*directories, *files]:
+            path = Path(current) / name
+            metadata = path.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                inodes.append(((metadata.st_dev, metadata.st_ino), path.relative_to(root).as_posix()))
+    return inodes
+
+
+def _validate_snapshot_root(snapshot: WorkspaceSnapshot) -> None:
+    try:
+        metadata = snapshot.snapshot_root.lstat()
+    except FileNotFoundError as exc:
+        raise SnapshotPatchError("coder workspace root is missing") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SnapshotPatchError("coder workspace root was replaced with an unsafe path")
+    if not _path_is_within(snapshot.snapshot_root, snapshot.temp_root):
+        raise SnapshotPatchError("coder workspace root is outside its run root")
+
+
+def _path_has_only_real_directory_parents(root: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    try:
+        root_metadata = current.lstat()
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+            return False
+        for part in relative.parts[:-1]:
+            current = current / part
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def apply_snapshot_patch(
+    snapshot: WorkspaceSnapshot,
+    *,
+    require_quiesced: bool = False,
+) -> SnapshotPatchResult:
+    try:
+        return _apply_snapshot_patch(snapshot, require_quiesced=require_quiesced)
     except WorkspaceSnapshotError:
         raise
     except OSError as exc:
         raise SnapshotPatchError(f"snapshot patch filesystem operation failed: {exc}") from exc
 
 
-def _apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
+def _apply_snapshot_patch(
+    snapshot: WorkspaceSnapshot,
+    *,
+    require_quiesced: bool,
+) -> SnapshotPatchResult:
+    if require_quiesced and not snapshot.is_quiesced:
+        raise SnapshotPatchError(
+            "coder workspace must be quiesced before computing or applying the final diff"
+        )
+    _validate_snapshot_root(snapshot)
+    if not snapshot.task_control_is_trusted():
+        raise SnapshotPatchError(
+            f"snapshot patch path rejected: task file is immutable: {snapshot.task_relative_path}"
+        )
     _restore_trusted_snapshot_git_config(snapshot)
     selection = _snapshot_patch_selection(snapshot)
     changed_paths = selection.changed_paths
@@ -295,25 +756,51 @@ def _apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
 
 def _restore_runtime_links(snapshot: WorkspaceSnapshot) -> tuple[str, ...]:
     repaired: list[str] = []
-    mounts: list[tuple[Path, Path, str]] = [
-        (
-            snapshot.snapshot_root / snapshot.task_relative_path,
-            snapshot.original_root / snapshot.task_relative_path,
-            "task",
-        ),
-    ]
-    state_source = snapshot.original_root / ".supervisor"
-    if state_source.is_dir():
-        mounts.append((snapshot.snapshot_root / ".supervisor", state_source, "supervisor_state"))
+    if not snapshot.task_control_is_trusted():
+        task = snapshot.snapshot_root / snapshot.task_relative_path
+        if not _path_has_only_real_directory_parents(snapshot.snapshot_root, task):
+            raise WorkspaceSnapshotError("cannot restore immutable task through a symlinked parent directory")
+        _copy_immutable_task(
+            task,
+            snapshot.task_bytes,
+        )
+        repaired.append("task")
+
+    expected_dependency_digests = dict(snapshot.readonly_dependency_digests)
     for relative in snapshot.readonly_dependency_paths:
-        source = snapshot.original_root / relative
-        if source.exists() or source.is_symlink():
-            mounts.append((snapshot.snapshot_root / relative, source, f"dependency:{relative}"))
-    for destination, source, label in mounts:
-        if _symlink_points_to(destination, source):
+        destination = snapshot.snapshot_root / relative
+        expected_digest = expected_dependency_digests.get(relative)
+        try:
+            trusted = expected_digest is not None and _tree_digest(destination) == expected_digest
+        except OSError:
+            trusted = False
+        if trusted:
             continue
-        _create_readonly_link(destination, source)
-        repaired.append(label)
+        if not _path_has_only_real_directory_parents(snapshot.snapshot_root, destination):
+            raise WorkspaceSnapshotError(
+                f"cannot restore read-only dependency through a symlinked parent: {relative}"
+            )
+        source = snapshot.original_root / relative
+        if source.is_symlink() or not source.is_dir():
+            raise WorkspaceSnapshotError(
+                f"read-only dependency source is no longer a real directory: {relative}"
+            )
+        _remove_path(destination)
+        _copy_readonly_dependency(
+            source,
+            destination,
+            relative,
+            declared_roots=_resolve_declared_roots(
+                snapshot.original_root,
+                snapshot.declared_grading_roots,
+            ),
+        )
+        if expected_digest is None or _tree_digest(destination) != expected_digest:
+            _remove_path(destination)
+            raise WorkspaceSnapshotError(
+                f"read-only dependency changed at its source during the run: {relative}"
+            )
+        repaired.append(f"dependency:{relative}")
     return tuple(repaired)
 
 
@@ -341,6 +828,7 @@ def _snapshot_patch_selection(snapshot: WorkspaceSnapshot) -> SnapshotPatchSelec
         snapshot_root,
         changed_paths,
         readonly_dependency_paths=snapshot.readonly_dependency_paths,
+        runtime_excluded_paths=snapshot.runtime_excluded_paths,
     )
 
 
@@ -349,12 +837,16 @@ def _filter_snapshot_patch_paths(
     changed_paths: tuple[str, ...],
     *,
     readonly_dependency_paths: tuple[str, ...],
+    runtime_excluded_paths: tuple[str, ...] = (),
 ) -> SnapshotPatchSelection:
     kept: list[str] = []
     ignored: list[str] = []
     for path in changed_paths:
-        if _is_generated_artifact_path(snapshot_root, path) or any(
-            _path_is_at_or_below(path, dependency) for dependency in readonly_dependency_paths
+        if (
+            _is_generated_artifact_path(snapshot_root, path)
+            or _is_runtime_state_relative(path)
+            or any(_path_is_at_or_below(path, dependency) for dependency in readonly_dependency_paths)
+            or any(_path_is_at_or_below(path, runtime) for runtime in runtime_excluded_paths)
         ):
             ignored.append(path)
         else:
@@ -411,7 +903,7 @@ def _validate_symlink_targets(snapshot_root: Path, paths: tuple[str, ...]) -> No
         try:
             resolved = candidate.resolve(strict=False)
             resolved.relative_to(root)
-        except (OSError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise SnapshotPatchError(f"snapshot patch creates or modifies escaping symlink: {raw} -> {target}") from exc
 
 
@@ -515,12 +1007,18 @@ def _restore_trusted_snapshot_git_config(snapshot: WorkspaceSnapshot) -> None:
 
 
 def _detach_recovery_workspace(snapshot: WorkspaceSnapshot) -> None:
-    _remove_path(snapshot.snapshot_root / ".git")
-    _remove_path(snapshot.snapshot_root / ".supervisor")
+    _validate_snapshot_root(snapshot)
+    _remove_workspace_relative_path(snapshot.snapshot_root, ".git")
+    for name in SNAPSHOT_RUNTIME_STATE_ANYWHERE_NAMES | SNAPSHOT_RUNTIME_STATE_TOP_LEVEL_NAMES:
+        _remove_workspace_relative_path(snapshot.snapshot_root, name)
+    for relative in snapshot.runtime_excluded_paths:
+        _remove_workspace_relative_path(snapshot.snapshot_root, relative)
     for relative in snapshot.readonly_dependency_paths:
-        _remove_path(snapshot.snapshot_root / relative)
+        _remove_workspace_relative_path(snapshot.snapshot_root, relative)
     task = snapshot.snapshot_root / snapshot.task_relative_path
-    _remove_path(task)
+    if not _path_has_only_real_directory_parents(snapshot.snapshot_root, task):
+        raise WorkspaceSnapshotError("cannot detach immutable task through a symlinked parent directory")
+    _remove_workspace_relative_path(snapshot.snapshot_root, snapshot.task_relative_path)
     task.parent.mkdir(parents=True, exist_ok=True)
     _atomic_replace_bytes(task, snapshot.task_bytes, 0o644)
 
@@ -610,14 +1108,117 @@ def _sync_snapshot_remotes(original_root: Path, snapshot_root: Path) -> None:
         fetch_urls = _optional_git_lines(original_root, ["remote", "get-url", "--all", name])
         if not fetch_urls:
             continue
-        _run_git(snapshot_root, ["remote", "add", name, fetch_urls[0]])
-        for url in fetch_urls[1:]:
-            _run_git(snapshot_root, ["remote", "set-url", "--add", name, url])
         push_urls = _optional_git_lines(original_root, ["remote", "get-url", "--push", "--all", name])
-        if push_urls and push_urls != fetch_urls:
-            _run_git(snapshot_root, ["remote", "set-url", "--push", name, push_urls[0]])
-            for url in push_urls[1:]:
+        all_urls = (*fetch_urls, *push_urls)
+        if any(_credential_free_snapshot_remote_url(url) is None for url in all_urls):
+            # A remote is copied as one trust unit.  Keeping only its safe fetch
+            # half would make an unsafe push URL silently fall back to fetch.
+            continue
+        safe_fetch_urls = list(fetch_urls)
+        safe_push_urls = list(push_urls)
+        _run_git(snapshot_root, ["remote", "add", name, safe_fetch_urls[0]])
+        for url in safe_fetch_urls[1:]:
+            _run_git(snapshot_root, ["remote", "set-url", "--add", name, url])
+        if safe_push_urls and safe_push_urls != safe_fetch_urls:
+            _run_git(snapshot_root, ["remote", "set-url", "--push", name, safe_push_urls[0]])
+            for url in safe_push_urls[1:]:
                 _run_git(snapshot_root, ["remote", "set-url", "--add", "--push", name, url])
+    _sanitize_snapshot_git_metadata(snapshot_root)
+
+
+def _credential_free_snapshot_remote_url(raw_url: str) -> str | None:
+    if not raw_url or "\\" in raw_url:
+        return None
+    try:
+        encoded = raw_url.encode("utf-8")
+    except UnicodeError:
+        return None
+    if len(encoded) > _SNAPSHOT_REMOTE_URL_MAX_BYTES or any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in raw_url
+    ):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(raw_url)
+        hostname = parsed.hostname
+        # Accessing ``port`` also rejects malformed/out-of-range port syntax.
+        parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in _SNAPSHOT_REMOTE_SCHEMES
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in urllib.parse.unquote(parsed.netloc)
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    decoded = raw_url
+    for _ in range(3):
+        next_decoded = urllib.parse.unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    if _SNAPSHOT_REMOTE_CREDENTIAL_PATTERN.search(decoded):
+        return None
+    return raw_url
+
+
+def _sanitize_snapshot_git_metadata(snapshot_root: Path) -> None:
+    git_dir = snapshot_root / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        raise WorkspaceSnapshotError("snapshot Git directory was replaced or removed")
+    for config_name in ("config", "config.worktree"):
+        config_path = git_dir / config_name
+        if not (config_path.exists() or config_path.is_symlink()):
+            continue
+        _remove_sensitive_snapshot_git_config(config_path, snapshot_root=snapshot_root)
+    for name in _optional_git_lines(snapshot_root, ["remote"]):
+        fetch_urls = _optional_git_lines(snapshot_root, ["remote", "get-url", "--all", name])
+        push_urls = _optional_git_lines(snapshot_root, ["remote", "get-url", "--push", "--all", name])
+        if not fetch_urls or any(
+            _credential_free_snapshot_remote_url(url) is None for url in (*fetch_urls, *push_urls)
+        ):
+            _run_git(snapshot_root, ["remote", "remove", name])
+
+
+def _remove_sensitive_snapshot_git_config(config_path: Path, *, snapshot_root: Path) -> None:
+    # Validate without following a final symlink before asking Git to parse it.
+    _read_regular_file(config_path)
+    raw_keys = _run_git(
+        snapshot_root,
+        ["config", "--file", os.fspath(config_path), "--null", "--name-only", "--list"],
+        capture_bytes=True,
+    )
+    assert isinstance(raw_keys, bytes)
+    for raw_key in raw_keys.split(b"\0"):
+        if not raw_key:
+            continue
+        try:
+            key = raw_key.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WorkspaceSnapshotError("snapshot Git config contains a non-UTF-8 key") from exc
+        if _snapshot_git_config_key_is_sensitive(key):
+            _run_git(
+                snapshot_root,
+                ["config", "--file", os.fspath(config_path), "--unset-all", key],
+            )
+
+
+def _snapshot_git_config_key_is_sensitive(key: str) -> bool:
+    normalized = key.casefold()
+    if normalized.startswith(_SNAPSHOT_SENSITIVE_GIT_CONFIG_PREFIXES):
+        return True
+    if normalized in {"core.askpass", "core.sshcommand"}:
+        return True
+    parts = normalized.split(".")
+    return len(parts) >= 3 and parts[0] == "remote" and parts[-1] in {
+        "proxy",
+        "proxyauthmethod",
+    }
 
 
 def _optional_git_lines(cwd: Path, args: list[str]) -> list[str]:
@@ -645,6 +1246,8 @@ def _clear_snapshot_worktree(snapshot_root: Path) -> None:
 def _sanitize_copied_workspace_symlinks(
     original_root: Path,
     snapshot_root: Path,
+    *,
+    declared_roots: tuple[Path, ...] = (),
 ) -> tuple[tuple[SnapshotSymlinkRewrite, ...], tuple[str, ...]]:
     rewrites: list[SnapshotSymlinkRewrite] = []
     excluded: list[str] = []
@@ -663,7 +1266,15 @@ def _sanitize_copied_workspace_symlinks(
             try:
                 resolved_target = target_candidate.resolve(strict=False)
                 target_relative = resolved_target.relative_to(original_root)
-            except (OSError, ValueError):
+            except (OSError, RuntimeError, ValueError):
+                destination.unlink()
+                excluded.append(relative)
+                continue
+            if (
+                _is_runtime_state_relative(target_relative.as_posix())
+                or is_protected_path(original_root, resolved_target)
+                or _matches_declared_root(resolved_target, declared_roots)
+            ):
                 destination.unlink()
                 excluded.append(relative)
                 continue
@@ -681,22 +1292,6 @@ def _sanitize_copied_workspace_symlinks(
                 )
             )
     return tuple(rewrites), tuple(excluded)
-
-
-def _create_readonly_link(destination: Path, source: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
-        _remove_path(destination)
-    os.symlink(str(source.resolve()), destination, target_is_directory=source.is_dir())
-
-
-def _symlink_points_to(path: Path, target: Path) -> bool:
-    if not path.is_symlink():
-        return False
-    try:
-        return path.resolve(strict=True) == target.resolve(strict=True)
-    except OSError:
-        return False
 
 
 def _backup_original_paths(
@@ -792,9 +1387,50 @@ def _remove_path(path: Path) -> None:
     except FileNotFoundError:
         return
     if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+        _make_tree_owner_removable(path)
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
+
+
+def _make_tree_owner_removable(root: Path) -> None:
+    metadata = root.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        return
+    os.chmod(root, stat.S_IMODE(metadata.st_mode) | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    for current, directories, _files in os.walk(root, topdown=True, followlinks=False):
+        for name in directories:
+            path = Path(current) / name
+            entry = path.lstat()
+            if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+                continue
+            os.chmod(
+                path,
+                stat.S_IMODE(entry.st_mode) | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+                follow_symlinks=False,
+            )
+
+
+def _remove_workspace_relative_path(root: Path, raw_relative: str) -> None:
+    relative = Path(raw_relative)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise WorkspaceSnapshotError(f"unsafe workspace-relative removal path: {raw_relative}")
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        is_last = index == len(relative.parts) - 1
+        if is_last:
+            _remove_path(current)
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            current.unlink(missing_ok=True)
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            return
 
 
 def _sha256_file(path: Path) -> str:
@@ -912,6 +1548,8 @@ def _snapshot_ignore(
     *,
     original_task: Path,
     readonly_dependencies: list[tuple[Path, str]],
+    protected_path_masks: list[str],
+    runtime_excluded_paths: list[str],
 ):
     root = original_root.resolve()
 
@@ -931,21 +1569,36 @@ def _snapshot_ignore(
             if resolved_candidate == original_task:
                 ignored.add(name)
                 continue
-            if name in SNAPSHOT_READ_ONLY_DEPENDENCY_NAMES:
-                readonly_dependencies.append((candidate, candidate_relative))
+            if _is_runtime_state_relative(candidate_relative):
+                runtime_excluded_paths.append(candidate_relative)
                 ignored.add(name)
                 continue
             if name in SNAPSHOT_ALWAYS_IGNORE_NAMES:
                 ignored.add(name)
                 continue
             if is_protected_path(root, candidate) or is_supervisor_runtime_path(root, candidate):
+                protected_path_masks.append(candidate_relative)
                 ignored.add(name)
                 continue
             if _matches_declared_root(candidate, declared_roots):
+                protected_path_masks.append(candidate_relative)
+                ignored.add(name)
+                continue
+            if name in SNAPSHOT_READ_ONLY_DEPENDENCY_NAMES:
+                readonly_dependencies.append((candidate, candidate_relative))
                 ignored.add(name)
         return ignored
 
     return ignore
+
+
+def _is_runtime_state_relative(raw_path: str) -> bool:
+    parts = tuple(part.lower() for part in Path(raw_path).parts if part not in {"", "."})
+    if not parts:
+        return False
+    if any(part in SNAPSHOT_RUNTIME_STATE_ANYWHERE_NAMES for part in parts):
+        return True
+    return parts[0] in SNAPSHOT_RUNTIME_STATE_TOP_LEVEL_NAMES
 
 
 def _resolve_declared_roots(project_root: Path, roots: tuple[str | Path, ...]) -> tuple[Path, ...]:
@@ -959,6 +1612,18 @@ def _resolve_declared_roots(project_root: Path, roots: tuple[str | Path, ...]) -
         except OSError:
             continue
     return tuple(dict.fromkeys(resolved))
+
+
+def _relative_roots_within(project_root: Path, roots: tuple[Path, ...]) -> tuple[str, ...]:
+    relative: list[str] = []
+    for root in roots:
+        try:
+            candidate = root.relative_to(project_root).as_posix()
+        except ValueError:
+            continue
+        if candidate not in {"", "."}:
+            relative.append(candidate)
+    return tuple(dict.fromkeys(relative))
 
 
 def _matches_declared_root(path: Path, roots: tuple[Path, ...]) -> bool:

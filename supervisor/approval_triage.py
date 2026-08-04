@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import ValidationError
 
@@ -371,11 +371,13 @@ class CheapRuntimeReviewer:
         *,
         model: str | None,
         timeout_seconds: float = DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS,
+        on_thread_start: Callable[[str], None] | None = None,
     ):
         self.client = client
         self.workspace = workspace.resolve()
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.on_thread_start = on_thread_start
 
     async def review(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision:
         if not self.model:
@@ -395,6 +397,8 @@ class CheapRuntimeReviewer:
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str):
                 raise CheapRuntimeReviewerError("cheap runtime thread/start did not return thread id")
+            if self.on_thread_start is not None:
+                self.on_thread_start(thread_id)
             turn_response = await asyncio.wait_for(
                 self.client.turn_start(
                     {

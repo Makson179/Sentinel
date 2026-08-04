@@ -1,0 +1,14 @@
+{
+  "description": "Bello coder-only offline Context Mode worker",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "Elastic-2.0",
+  "name": "context-mode",
+  "private": true,
+  "type": "module",
+  "version": "1.0.169",
+  "dependencies": {
+    "better-sqlite3": "12.9.0"
+  }
+}

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from supervisor.appserver import AppServerMessage
+from supervisor.context_mode.config import AUTO_APPROVABLE_TOOLS, CAPABILITY_REQUIRED_TOOLS
 from supervisor.policy import (
     PolicyEngine,
     analyze_command,
@@ -59,6 +60,8 @@ PERMISSIONS_APPROVAL_METHOD = "item/permissions/requestApproval"
 TOOL_USER_INPUT_METHOD = "item/tool/requestUserInput"
 DYNAMIC_TOOL_CALL_METHOD = "item/tool/call"
 MCP_ELICITATION_METHOD = "mcpServer/elicitation/request"
+MCP_TOOL_APPROVAL_KIND_KEY = "codex_approval_kind"
+MCP_TOOL_APPROVAL_KIND = "mcp_tool_call"
 
 
 class SupervisorApprovalReviewer(Protocol):
@@ -69,7 +72,7 @@ class SupervisorApprovalReviewer(Protocol):
 def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
     method = message.method or "unknown"
     params = message.params
-    request_type = _request_type(method)
+    request_type = _request_type(method, params)
     command: str | None = None
     cwd: str | None = _string(params.get("cwd"))
     paths: list[str] = []
@@ -80,6 +83,14 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
 
     if request_type == ApprovalRequestType.COMMAND:
         command = _string(params.get("command"))
+    elif request_type == ApprovalRequestType.MCP_TOOL_CALL:
+        # Stock Codex exposes MCP tool approvals as form elicitations.  The
+        # human-readable message/title/description are presentation metadata
+        # and are deliberately not parsed for authority.  The Controller later
+        # fills the exact tool from a uniquely correlated item/started record.
+        cwd = None
+        grant_root = None
+        approval_id = None
     elif request_type == ApprovalRequestType.FILE_CHANGE:
         if grant_root:
             paths.append(grant_root)
@@ -100,6 +111,8 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
             protocol=str(raw_network.get("protocol") or ""),
             port=raw_network.get("port") if isinstance(raw_network.get("port"), int) else None,
         )
+    if request_type == ApprovalRequestType.MCP_TOOL_CALL:
+        network = None
 
     return ApprovalContext(
         server_request_id=message.request_id if message.request_id is not None else "",
@@ -107,7 +120,11 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
         request_type=request_type,
         thread_id=_string(params.get("threadId") or params.get("conversationId")),
         turn_id=_string(params.get("turnId")),
-        item_id=_string(params.get("itemId") or params.get("callId")),
+        item_id=(
+            None
+            if request_type == ApprovalRequestType.MCP_TOOL_CALL
+            else _string(params.get("itemId") or params.get("callId"))
+        ),
         approval_id=approval_id,
         command=command,
         cwd=cwd,
@@ -116,13 +133,29 @@ def normalize_approval_request(message: AppServerMessage) -> ApprovalContext:
         diff=diff,
         grant_root=grant_root,
         network_approval_context=network,
-        proposed_execpolicy_amendment=_list_of_strings(
-            params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
+        proposed_execpolicy_amendment=(
+            None
+            if request_type == ApprovalRequestType.MCP_TOOL_CALL
+            else _list_of_strings(
+                params.get("proposedExecpolicyAmendment")
+                or params.get("proposed_execpolicy_amendment")
+            )
         ),
-        proposed_network_policy_amendments=_list_or_none(
-            params.get("proposedNetworkPolicyAmendments") or params.get("proposed_network_policy_amendments")
+        proposed_network_policy_amendments=(
+            None
+            if request_type == ApprovalRequestType.MCP_TOOL_CALL
+            else _list_or_none(
+                params.get("proposedNetworkPolicyAmendments")
+                or params.get("proposed_network_policy_amendments")
+            )
         ),
-        available_decisions=params.get("availableDecisions") if isinstance(params.get("availableDecisions"), list) else None,
+        available_decisions=(
+            None
+            if request_type == ApprovalRequestType.MCP_TOOL_CALL
+            else params.get("availableDecisions")
+            if isinstance(params.get("availableDecisions"), list)
+            else None
+        ),
         raw_params=params,
     )
 
@@ -150,6 +183,21 @@ class ApprovalManager:
         self.adversary_mode = adversary_mode
 
     async def decide(self, context: ApprovalContext) -> ApprovalResolution:
+        if context.request_type == ApprovalRequestType.MCP_TOOL_CALL:
+            if context.tool_name in AUTO_APPROVABLE_TOOLS:
+                return self._allow(
+                    context,
+                    "verified read-only Context Mode call is auto-approved once",
+                )
+            if context.tool_name not in CAPABILITY_REQUIRED_TOOLS:
+                return self._deny(context, "unknown Context Mode tool approval")
+            # Controller performs exact server/tool/binding checks and creates
+            # the broker capability.  This layer provides the human/supervisor
+            # judgment only and never grants a reusable session decision.
+            return await self._route_full_supervisor_or_deny(
+                context,
+                "Context Mode local execution/purge requires one-shot approval",
+            )
         if context.request_type in {
             ApprovalRequestType.TOOL_USER_INPUT,
             ApprovalRequestType.DYNAMIC_TOOL_CALL,
@@ -222,7 +270,22 @@ class ApprovalManager:
         if method == PERMISSIONS_APPROVAL_METHOD:
             return {"permissions": {}, "scope": "turn", "strictAutoReview": True}
         if method == MCP_ELICITATION_METHOD:
-            action = resolution.decision if isinstance(resolution.decision, str) and resolution.decision in {"decline", "cancel"} else "cancel"
+            if context.request_type is ApprovalRequestType.MCP_TOOL_CALL:
+                # One call only.  In particular, never return response
+                # ``_meta.persist`` even if a supervisor attempted to remember
+                # the decision.
+                action = (
+                    resolution.decision
+                    if isinstance(resolution.decision, str)
+                    and resolution.decision in {"accept", "decline", "cancel"}
+                    else "cancel"
+                )
+                return {"action": action}
+            action = (
+                resolution.decision
+                if isinstance(resolution.decision, str) and resolution.decision in {"decline", "cancel"}
+                else "cancel"
+            )
             return {"action": action, "content": None, "_meta": None}
         return {"decision": resolution.decision}
 
@@ -346,8 +409,8 @@ class ApprovalManager:
         return False
 
 
-def _request_type(method: str) -> ApprovalRequestType:
-    return {
+def _request_type(method: str, params: dict[str, Any] | None = None) -> ApprovalRequestType:
+    request_type = {
         COMMAND_APPROVAL_METHOD: ApprovalRequestType.COMMAND,
         FILE_CHANGE_APPROVAL_METHOD: ApprovalRequestType.FILE_CHANGE,
         PERMISSIONS_APPROVAL_METHOD: ApprovalRequestType.PERMISSIONS,
@@ -355,6 +418,12 @@ def _request_type(method: str) -> ApprovalRequestType:
         DYNAMIC_TOOL_CALL_METHOD: ApprovalRequestType.DYNAMIC_TOOL_CALL,
         MCP_ELICITATION_METHOD: ApprovalRequestType.MCP_ELICITATION,
     }.get(method, ApprovalRequestType.UNKNOWN)
+    if method != MCP_ELICITATION_METHOD or not isinstance(params, dict):
+        return request_type
+    meta = params.get("_meta")
+    if isinstance(meta, dict) and meta.get(MCP_TOOL_APPROVAL_KIND_KEY) == MCP_TOOL_APPROVAL_KIND:
+        return ApprovalRequestType.MCP_TOOL_CALL
+    return request_type
 
 
 def _string(value: Any) -> str | None:
@@ -416,6 +485,8 @@ def _immutable_path_hit(
 
 
 def _accept_for_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
+    if context.request_type == ApprovalRequestType.MCP_TOOL_CALL:
+        return True
     if _network_scoped_approval(context, workspace):
         return True
     if context.request_type == ApprovalRequestType.FILE_CHANGE:

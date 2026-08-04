@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 from click.testing import CliRunner
 
 from supervisor.controller import DEFAULT_MODEL, BelloController
-from supervisor.main import _resolve_run_settings, cli
+from supervisor.main import (
+    CONTEXT_TOOLCHAIN_ROOTS_ENV,
+    _context_toolchain_roots_from_env,
+    _resolve_run_settings,
+    cli,
+)
 from supervisor.project_config import (
     MODEL_GPT_5_5,
     MODEL_GPT_5_6_LUNA,
@@ -50,6 +56,38 @@ def test_four_role_flags_are_registered() -> None:
         "--adversary-intelligence",
     ):
         assert option in result.output
+
+
+def test_context_toolchain_roots_env_is_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(CONTEXT_TOOLCHAIN_ROOTS_ENV, raising=False)
+
+    assert _context_toolchain_roots_from_env() == ()
+
+
+def test_context_toolchain_roots_env_resolves_unique_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.setenv(
+        CONTEXT_TOOLCHAIN_ROOTS_ENV,
+        os.pathsep.join((str(first), str(second), str(first))),
+    )
+
+    assert _context_toolchain_roots_from_env() == (first.resolve(), second.resolve())
+
+
+@pytest.mark.parametrize("value", ["relative", ""])
+def test_context_toolchain_roots_env_rejects_invalid_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, value: str
+) -> None:
+    raw = value if value else f"{tmp_path}{os.pathsep}"
+    monkeypatch.setenv(CONTEXT_TOOLCHAIN_ROOTS_ENV, raw)
+
+    with pytest.raises(RuntimeError, match=CONTEXT_TOOLCHAIN_ROOTS_ENV):
+        _context_toolchain_roots_from_env()
 
 
 def test_cli_passes_independent_role_models_and_efforts_to_runner(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -348,6 +386,7 @@ def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_
         "clean=false "
         "completion-review=true "
         "adversary=false "
+        "context-mode=false "
         "protected-path=hidden"
     )
 
@@ -438,8 +477,8 @@ def test_deep_work_cli_flags_enable_review_and_adversary() -> None:
     assert settings.completion_review is True
     assert settings.adversary is True
     assert settings.adversary_runs == 1
-    assert config.completion_returns_before_adversary == 1
-    assert config.completion_returns_after_adversary == 0
+    assert config.completion_returns_before_adversary == 4
+    assert config.completion_returns_after_adversary == 2
 
 
 def test_adversary_runs_defaults_to_project_config() -> None:

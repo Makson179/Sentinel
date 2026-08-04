@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Bello"
-version = "0.3.0"
+version = "0.3.1"
 description = "Terminal supervisor for autonomous Codex app-server runs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,7 +38,9 @@ bello = "supervisor.main:cli"
 include = ["supervisor*"]
 
 [tool.setuptools.package-data]
+"supervisor" = ["_vendor/context_mode/**/*"]
 "supervisor.prompts" = ["*.toml"]
+"supervisor.context_mode" = ["manifests/*.json", "native-release.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

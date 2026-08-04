@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bello-context-mode-runtime-manifest-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "bello_offline_fork_revision",
+    "bello_offline_fork_attestation_sha256",
+    "context_mode_commit",
+    "context_mode_version",
+    "node_version",
+    "platform",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "bello_offline_fork_revision": {"const": "bello-offline-v1"},
+    "bello_offline_fork_attestation_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "context_mode_commit": {"const": "589d8214d56740a28b5f7bf63167743d586b0b40"},
+    "context_mode_version": {"const": "1.0.169"},
+    "node_version": {"const": "22.5.0"},
+    "platform": {"enum": ["linux-x86_64", "linux-arm64", "macos-x86_64", "macos-arm64"]},
+    "files": {
+      "type": "object",
+      "minProperties": 9,
+      "required": [
+        "node",
+        "server.bundle.mjs",
+        "node/LICENSE",
+        "package/cli.bundle.mjs",
+        "package/start.mjs",
+        "package/package.json",
+        "package/LICENSE",
+        "package/bello-offline-fork.json",
+        "package/node_modules/better-sqlite3/package.json"
+      ],
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    }
+  }
+}

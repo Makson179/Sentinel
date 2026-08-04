@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bello-context-mode-protocol-schemas-v1",
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "command_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runner_identity", "redacted_argv", "argv_digest", "argv_digest_kind", "relative_cwd",
+        "start_order", "duration_ms", "exit_code", "signal", "timed_out",
+        "stdout_bytes", "stderr_bytes", "stdout_digest", "stderr_digest",
+        "stdout_complete", "stderr_complete", "stdout_excerpt", "stderr_excerpt"
+      ],
+      "properties": {
+        "runner_identity": {"const": "bello-native-runner-v1"},
+        "redacted_argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "maxLength": 8192}},
+        "argv_digest": {"$ref": "#/$defs/sha256"},
+        "argv_digest_kind": {"const": "run-hmac-sha256-v1"},
+        "relative_cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "start_order": {"type": "integer", "minimum": 0},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "exit_code": {"type": ["integer", "null"]},
+        "signal": {"type": ["integer", "null"], "minimum": 1},
+        "timed_out": {"type": "boolean"},
+        "stdout_bytes": {"type": "integer", "minimum": 0, "maximum": 8388608},
+        "stderr_bytes": {"type": "integer", "minimum": 0, "maximum": 8388608},
+        "stdout_digest": {"$ref": "#/$defs/sha256"},
+        "stderr_digest": {"$ref": "#/$defs/sha256"},
+        "stdout_complete": {"type": "boolean"},
+        "stderr_complete": {"type": "boolean"},
+        "stdout_excerpt": {"type": "string"},
+        "stderr_excerpt": {"type": "string"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "exit_code": {"type": "integer"},
+            "signal": {"type": "null"},
+            "timed_out": {"const": false}
+          }
+        },
+        {
+          "properties": {
+            "exit_code": {"type": "null"},
+            "signal": {"type": "integer", "minimum": 1},
+            "timed_out": {"const": false}
+          }
+        },
+        {
+          "properties": {
+            "exit_code": {"type": "null"},
+            "signal": {"type": "null"},
+            "timed_out": {"const": true}
+          }
+        }
+      ]
+    },
+    "retrieval_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_kind", "relative_path", "content_hash", "indexed_revision",
+        "current_revision", "ranges", "source_bytes", "returned_bytes", "stale"
+      ],
+      "properties": {
+        "source_kind": {"type": "string", "minLength": 1},
+        "relative_path": {"type": "string", "minLength": 1},
+        "content_hash": {"$ref": "#/$defs/sha256"},
+        "indexed_revision": {"type": "integer", "minimum": 0},
+        "current_revision": {"type": "integer", "minimum": 0},
+        "ranges": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {"type": "integer", "minimum": 0},
+              {"type": "integer", "minimum": 1}
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "source_bytes": {"type": "integer", "minimum": 0},
+        "returned_bytes": {"type": "integer", "minimum": 1},
+        "stale": {"type": "boolean"}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "stable", "lifecycle"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "stable": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run_id", "workspace_id", "context_session_id", "workspace_path", "base_config_digest"],
+          "properties": {
+            "run_id": {"type": "string", "minLength": 1},
+            "workspace_id": {"type": "string", "minLength": 1},
+            "context_session_id": {"type": "string", "minLength": 1},
+            "workspace_path": {"type": "string", "minLength": 1},
+            "base_config_digest": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "lifecycle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["binding_version", "context_state_epoch", "coder_generation", "generation_lease_id", "coder_process_epoch", "app_server_instance_id", "sandbox_policy_digest", "provider_thread_id"],
+          "properties": {
+            "binding_version": {"type": "integer", "minimum": 1},
+            "context_state_epoch": {"type": "integer", "minimum": 0},
+            "coder_generation": {"type": "integer", "minimum": 0},
+            "generation_lease_id": {"type": "string", "minLength": 1},
+            "coder_process_epoch": {"type": "integer", "minimum": 0},
+            "app_server_instance_id": {"type": "string", "minLength": 1},
+            "sandbox_policy_digest": {"$ref": "#/$defs/sha256"},
+            "provider_thread_id": {"type": ["string", "null"]}
+          }
+        }
+      }
+    },
+    "approval_capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "capability_id", "role", "process_epoch", "binding_version", "coder_generation", "generation_lease_id", "tool_name", "arguments_digest", "canonical_cwd", "request_digest", "issued_at", "expires_at", "ordered_children_digest"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "capability_id": {"type": "string", "minLength": 1},
+        "role": {"const": "coder"},
+        "process_epoch": {"type": "integer", "minimum": 0},
+        "binding_version": {"type": "integer", "minimum": 1},
+        "coder_generation": {"type": "integer", "minimum": 0},
+        "generation_lease_id": {"type": "string", "minLength": 1},
+        "tool_name": {"enum": ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_purge"]},
+        "arguments_digest": {"$ref": "#/$defs/sha256"},
+        "canonical_cwd": {"type": "string", "minLength": 1},
+        "request_digest": {"$ref": "#/$defs/sha256"},
+        "issued_at": {"type": "number"},
+        "expires_at": {"type": "number"},
+        "ordered_children_digest": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    },
+    "checkpoint_cursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "checkpoint_id", "reason", "run_id", "workspace_id", "context_session_id", "context_state_epoch", "coder_generation", "generation_lease_id", "coder_process_epoch", "provider_thread_id", "binding_version", "context_event_seq", "last_committed_operation_id", "created_at", "cursor_hmac"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "checkpoint_id": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "workspace_id": {"type": "string", "minLength": 1},
+        "context_session_id": {"type": "string", "minLength": 1},
+        "context_state_epoch": {"type": "integer", "minimum": 0},
+        "coder_generation": {"type": "integer", "minimum": 0},
+        "generation_lease_id": {"type": "string", "minLength": 1},
+        "coder_process_epoch": {"type": "integer", "minimum": 0},
+        "provider_thread_id": {"type": "string", "minLength": 1},
+        "binding_version": {"type": "integer", "minimum": 1},
+        "context_event_seq": {"type": "integer", "minimum": 0},
+        "last_committed_operation_id": {"type": ["string", "null"]},
+        "created_at": {"type": "string", "minLength": 1},
+        "cursor_hmac": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "broker_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "receipt_seq", "role", "app_server_instance_id", "process_epoch", "run_id", "workspace_id", "context_session_id", "context_state_epoch", "binding_version", "coder_generation", "generation_lease_id", "mcp_request_id", "tool_name", "arguments_digest", "operation_id", "result_digest", "sandbox_backend", "sandbox_policy_digest", "capability_id", "context_event_seq", "duration_ms", "source_bytes", "returned_bytes", "indexed_bytes", "commands", "retrieval", "changed_paths"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "receipt_seq": {"type": "integer", "minimum": 1},
+        "role": {"const": "coder"},
+        "app_server_instance_id": {"type": "string", "minLength": 1},
+        "process_epoch": {"type": "integer", "minimum": 0},
+        "run_id": {"type": "string", "minLength": 1},
+        "workspace_id": {"type": "string", "minLength": 1},
+        "context_session_id": {"type": "string", "minLength": 1},
+        "context_state_epoch": {"type": "integer", "minimum": 0},
+        "binding_version": {"type": "integer", "minimum": 1},
+        "coder_generation": {"type": "integer", "minimum": 0},
+        "generation_lease_id": {"type": "string", "minLength": 1},
+        "mcp_request_id": {"type": ["integer", "string"]},
+        "tool_name": {"enum": ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_index", "ctx_search", "ctx_stats", "ctx_doctor", "ctx_purge"]},
+        "arguments_digest": {"$ref": "#/$defs/sha256"},
+        "operation_id": {"type": "string", "minLength": 1},
+        "result_digest": {"$ref": "#/$defs/sha256"},
+        "sandbox_backend": {"type": "string", "minLength": 1},
+        "sandbox_policy_digest": {"$ref": "#/$defs/sha256"},
+        "capability_id": {"type": ["string", "null"]},
+        "context_event_seq": {"type": "integer", "minimum": 1},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "source_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "returned_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "indexed_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "commands": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/command_record"}},
+        "retrieval": {"type": "array", "maxItems": 2048, "items": {"$ref": "#/$defs/retrieval_record"}},
+        "changed_paths": {"type": "object", "maxProperties": 4096, "propertyNames": {"maxLength": 4096}, "additionalProperties": {"$ref": "#/$defs/sha256"}}
+      }
+    },
+    "result_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "broker_receipt_seq", "broker_receipt_digest", "operation_id", "tool_name", "run_id", "workspace_id", "context_session_id", "context_state_epoch", "binding_version", "coder_generation", "generation_lease_id", "mcp_request_id", "arguments_digest", "capability_id", "result_digest", "sandbox_backend", "sandbox_policy_digest"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "broker_receipt_seq": {"type": "integer", "minimum": 1},
+        "broker_receipt_digest": {"$ref": "#/$defs/sha256"},
+        "operation_id": {"type": "string", "minLength": 1},
+        "tool_name": {"enum": ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_index", "ctx_search", "ctx_stats", "ctx_doctor", "ctx_purge"]},
+        "run_id": {"type": "string", "minLength": 1},
+        "workspace_id": {"type": "string", "minLength": 1},
+        "context_session_id": {"type": "string", "minLength": 1},
+        "context_state_epoch": {"type": "integer", "minimum": 0},
+        "binding_version": {"type": "integer", "minimum": 1},
+        "coder_generation": {"type": "integer", "minimum": 0},
+        "generation_lease_id": {"type": "string", "minLength": 1},
+        "mcp_request_id": {"type": ["integer", "string"]},
+        "arguments_digest": {"$ref": "#/$defs/sha256"},
+        "capability_id": {"type": ["string", "null"]},
+        "result_digest": {"$ref": "#/$defs/sha256"},
+        "sandbox_backend": {"type": "string", "minLength": 1},
+        "sandbox_policy_digest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

@@ -26,6 +26,7 @@ from supervisor.task_select import TaskSelectionError
 
 
 OPTIONAL_BOOL_FLAGS = {"--fast", "--start-over", "--clean", "--adversary", "--completion-review"}
+CONTEXT_TOOLCHAIN_ROOTS_ENV = "BELLO_CONTEXT_TOOLCHAIN_ROOTS"
 
 
 class BelloClickGroup(click.Group):
@@ -141,6 +142,23 @@ class BelloClickGroup(click.Group):
     help="Maximum adversarial tester passes before final completion (default 1; 0 disables).",
 )
 @click.option(
+    "--context-mode/--no-context-mode",
+    default=None,
+    help="Enable or disable the bundled coder-only offline Context Mode runtime.",
+)
+@click.option(
+    "--keep-context-mode-data",
+    is_flag=True,
+    default=False,
+    help="Retain run-local Context Mode state after shutdown for diagnostics.",
+)
+@click.option(
+    "--context-mode-debug",
+    is_flag=True,
+    default=False,
+    help="Emit bounded Context Mode lifecycle diagnostics (never raw payloads).",
+)
+@click.option(
     "--version",
     "-V",
     is_flag=True,
@@ -169,6 +187,9 @@ def cli(
     completion_review: bool | None,
     adversary: bool | None,
     adversary_runs: int | None,
+    context_mode: bool | None,
+    keep_context_mode_data: bool,
+    context_mode_debug: bool,
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -195,6 +216,9 @@ def cli(
             completion_review=completion_review,
             adversary=adversary,
             adversary_runs=adversary_runs,
+            context_mode=context_mode,
+            keep_context_mode_data=keep_context_mode_data,
+            context_mode_debug=context_mode_debug,
         )
         _run_async_cleanly(_run_bello(run_settings))
     except ProjectConfigError as exc:
@@ -411,12 +435,44 @@ async def _run_bello(settings: RunSettings) -> int:
         adversary_runs=settings.adversary_runs,
         completion_review=settings.completion_review,
         project_config=load_project_config(Path.cwd(), create=False),
+        context_mode_enabled=settings.context_mode,
+        keep_context_mode_data=settings.keep_context_mode_data,
+        context_mode_debug=settings.context_mode_debug,
+        context_toolchain_roots=_context_toolchain_roots_from_env(),
     )
     await controller.run()
     status = controller.store.get_bello_config().status
     if status == BelloStatus.PROVIDER_FAILURE:
         return 2
     return 0
+
+
+def _context_toolchain_roots_from_env() -> tuple[Path, ...]:
+    """Load harness-declared Context toolchains without inheriting general env state."""
+
+    raw = os.environ.get(CONTEXT_TOOLCHAIN_ROOTS_ENV, "")
+    if not raw:
+        return ()
+    roots: list[Path] = []
+    for value in raw.split(os.pathsep):
+        if not value:
+            raise RuntimeError(f"{CONTEXT_TOOLCHAIN_ROOTS_ENV} contains an empty path")
+        path = Path(value)
+        if not path.is_absolute():
+            raise RuntimeError(f"{CONTEXT_TOOLCHAIN_ROOTS_ENV} paths must be absolute: {value!r}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"{CONTEXT_TOOLCHAIN_ROOTS_ENV} path is unavailable: {value!r}"
+            ) from exc
+        if not resolved.is_dir():
+            raise RuntimeError(
+                f"{CONTEXT_TOOLCHAIN_ROOTS_ENV} path must be a directory: {value!r}"
+            )
+        if resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
 
 
 @dataclass(frozen=True)
@@ -437,6 +493,9 @@ class RunSettings:
     completion_review: bool
     adversary: bool
     adversary_runs: int
+    context_mode: bool
+    keep_context_mode_data: bool
+    context_mode_debug: bool
 
 
 def _resolve_run_settings(
@@ -460,6 +519,9 @@ def _resolve_run_settings(
     completion_review: bool | None = None,
     adversary: bool | None = None,
     adversary_runs: int | None = None,
+    context_mode: bool | None = None,
+    keep_context_mode_data: bool = False,
+    context_mode_debug: bool = False,
 ) -> RunSettings:
     if legacy_supervisor_model is not None:
         if runtime_model is not None or completion_model is not None:
@@ -510,6 +572,9 @@ def _resolve_run_settings(
             else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
         ),
         adversary_runs=project_config.adversary_runs if adversary_runs is None else adversary_runs,
+        context_mode=project_config.context_mode if context_mode is None else context_mode,
+        keep_context_mode_data=keep_context_mode_data,
+        context_mode_debug=context_mode_debug,
     )
 
 

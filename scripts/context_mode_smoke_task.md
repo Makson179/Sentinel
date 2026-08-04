@@ -1,0 +1,3 @@
+Create `hello_world.py` in this repository. Running `python3 hello_world.py` must print exactly `hello world` followed by one newline.
+
+Before creating the file, you must call the Context Mode MCP tool `ctx_execute` with `language` set to `javascript`, an intent of `COMPRESS_MARKER`, and JavaScript that prints `COMPRESS_MARKER ` followed by 300000 `x` characters. Confirm from the returned metadata/output that the large result was reduced and indexed. Then create the requested file, validate its exact stdout with normal local command-execution tools (do not call Context Mode again for post-edit validation), and finish only when the task is complete. Do not create unrelated artifacts.

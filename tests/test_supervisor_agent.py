@@ -55,7 +55,13 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
         async def thread_archive(self, thread_id, *, timeout):
             return {}
 
-    agent = StatelessSupervisorAgent(FakeClient(), store, task)  # type: ignore[arg-type]
+    started_threads: list[tuple[str, str]] = []
+    agent = StatelessSupervisorAgent(  # type: ignore[arg-type]
+        FakeClient(),
+        store,
+        task,
+        on_thread_start=lambda thread_id, role: started_threads.append((thread_id, role)),
+    )
     packet = agent.build_packet(wake_sequence=7, current_summary="audit this wake")
 
     decision = await agent.decide(packet)
@@ -70,6 +76,7 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
     assert audit["packet"]["current_summary"] == "audit this wake"
     assert audit["decision"]["decision"] == "noop"
     assert audit["decision"]["reason"] == "state is consistent"
+    assert started_threads == [("supervisor-thread", "runtime")]
 
 
 def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path) -> None:
@@ -685,7 +692,13 @@ async def test_completion_review_reuses_thread_until_closed(tmp_path: Path) -> N
             return {}
 
     client = FakeClient()
-    agent = StatelessSupervisorAgent(client, store, task)  # type: ignore[arg-type]
+    started_threads: list[tuple[str, str]] = []
+    agent = StatelessSupervisorAgent(  # type: ignore[arg-type]
+        client,
+        store,
+        task,
+        on_thread_start=lambda thread_id, role: started_threads.append((thread_id, role)),
+    )
     packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
 
     await agent.decide_completion(packet)
@@ -694,6 +707,7 @@ async def test_completion_review_reuses_thread_until_closed(tmp_path: Path) -> N
     assert client.thread_starts == 1
     assert client.turn_starts == ["completion-thread", "completion-thread"]
     assert client.archived == []
+    assert started_threads == [("completion-thread", "completion")]
 
     await agent.close_completion_review()
 

@@ -32,11 +32,10 @@ from supervisor.project_config import (
     project_config_path,
     sync_runtime_config_fields,
 )
-from supervisor.review_limits import UNLIMITED_REVIEW_LIMIT, format_review_limit
 
 
 EditorAction = Literal["add_protected_path"]
-InlineEditKind = Literal["optional_text", "non_negative_int", "protected_path_entry", "review_limit"]
+InlineEditKind = Literal["optional_text", "non_negative_int", "protected_path_entry"]
 StyledFragment = tuple[str, str]
 FragmentLine = list[StyledFragment]
 FormattedRender = list[StyledFragment]
@@ -463,21 +462,20 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         )
         before_adversary_help = (
             "Maximum completion-review rounds that may return work before Bello forces the first adversary. "
-            "An earlier accept starts the adversary immediately. 0 skips these rounds; Unlimited removes the cap."
+            "An earlier accept starts the adversary immediately. 0 allows unlimited rounds."
             if adversary_enabled
             else (
                 "Maximum completion-review rounds that may return work. After the coder applies the final return "
-                "and reports readiness, Bello completes without another review. 0 skips review; Unlimited removes "
-                "the cap."
+                "and reports readiness, Bello completes without another review. 0 allows unlimited rounds."
             )
         )
         review_parameters.append(
             EditorParameter(
                 "completion_returns_before_adversary",
                 "max-reviews-before-adversary" if adversary_enabled else "max-reviews",
-                format_review_limit(config.completion_returns_before_adversary),
+                str(config.completion_returns_before_adversary),
                 (),
-                edit_kind="review_limit",
+                edit_kind="non_negative_int",
                 help_text=before_adversary_help,
             )
         )
@@ -496,13 +494,13 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                 EditorParameter(
                     "completion_returns_after_adversary",
                     "max-reviews-after-adversary",
-                    format_review_limit(config.completion_returns_after_adversary),
+                    str(config.completion_returns_after_adversary),
                     (),
-                    edit_kind="review_limit",
+                    edit_kind="non_negative_int",
                     help_text=(
-                        "Maximum additional completion-review rounds after each adversary pass. 0 schedules none; "
-                        "Unlimited removes the cap. A candidate adversary finding is still adjudicated once before "
-                        "Bello accepts it or returns a real defect to the coder."
+                        "Maximum completion-review rounds that may return work after each adversary. After the "
+                        "final allowed return, Bello starts the next adversary or completes after the last one. "
+                        "0 allows unlimited rounds."
                     ),
                 )
             )
@@ -794,9 +792,9 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
     if parameter.key == "adversary_runs":
         return str(config.adversary_runs if config.adversary and config.completion_review else 0)
     if parameter.key == "completion_returns_before_adversary":
-        return format_review_limit(config.completion_returns_before_adversary)
+        return str(config.completion_returns_before_adversary)
     if parameter.key == "completion_returns_after_adversary":
-        return format_review_limit(config.completion_returns_after_adversary)
+        return str(config.completion_returns_after_adversary)
     return parameter.value if parameter.value != "absent" else ""
 
 
@@ -819,15 +817,6 @@ def _commit_inline_edit(
         if not raw.isdecimal():
             return config, replace(state, edit_error="enter a non-negative integer")
         updated = _replace_config_field(config, parameter.key, int(raw))
-        return updated, advance_after_selection(state, len(parameters))
-    if state.edit_kind == "review_limit":
-        if raw.lower() == UNLIMITED_REVIEW_LIMIT:
-            value: int | str = UNLIMITED_REVIEW_LIMIT
-        elif raw.isdecimal():
-            value = int(raw)
-        else:
-            return config, replace(state, edit_error="enter 0 or a positive integer, or Unlimited")
-        updated = _replace_config_field(config, parameter.key, value)
         return updated, advance_after_selection(state, len(parameters))
     return config, cancel_inline_edit(state)
 

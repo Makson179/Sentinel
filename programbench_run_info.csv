@@ -1,19 +1,12 @@
 task,agent,model,mode,completion_pct,runtime
-Solar,Raw Codex,gpt-5.6-sol,ultra,53.13,00:32:33
-Solar,Raw Codex,gpt-5.6-sol,xhigh,46.61,00:16:58
-Solar,Raw Codex,gpt-5.5,xhigh,43.78,00:16:27
-Solar,Bello,gpt-5.6-sol,ultra,71.30,07:39:17
-Solar,Bello,gpt-5.6-sol,xhigh,66.50,04:26:04
-Solar,Bello,gpt-5.5,xhigh,53.39,01:29:35
-Samtools,Raw Codex,gpt-5.6-sol,ultra,51.86,00:36:17
-Samtools,Raw Codex,gpt-5.6-sol,xhigh,38.11,00:28:48
-Samtools,Raw Codex,gpt-5.5,xhigh,20.28,00:16:28
-Samtools,Bello,gpt-5.6-sol,ultra,70.60,19:25:22
-Samtools,Bello,gpt-5.6-sol,xhigh,51.93,05:39:13
-Samtools,Bello,gpt-5.5,xhigh,44.21,02:30:01
-Rumdl,Raw Codex,gpt-5.6-sol,ultra,55.60,01:40:05
-Rumdl,Raw Codex,gpt-5.6-sol,xhigh,48.19,00:31:57
-Rumdl,Raw Codex,gpt-5.5,xhigh,46.30,00:26:03
-Rumdl,Bello,gpt-5.6-sol,ultra,80.19,07:44:12
-Rumdl,Bello,gpt-5.6-sol,xhigh,61.74,03:53:35
-Rumdl,Bello,gpt-5.5,xhigh,50.99,03:30:01
+Solar,Raw Codex,gpt-5.6-sol,ultra,53,00:32:33
+Solar,Raw Codex,gpt-5.6-sol,xhigh,47,00:16:58
+Solar,Bello,gpt-5.6-sol,ultra,71,10:43:00
+Solar,Bello,gpt-5.6-sol,xhigh,67,04:26:04
+Samtools,Raw Codex,gpt-5.6-sol,ultra,52,00:36:17
+Samtools,Raw Codex,gpt-5.6-sol,xhigh,38,00:28:48
+Samtools,Bello,gpt-5.6-sol,ultra,71,19:25:22
+Samtools,Bello,gpt-5.6-sol,xhigh,44,09:57:52
+Rumdl,Raw Codex,gpt-5.6-sol,ultra,56,01:40:05
+Rumdl,Raw Codex,gpt-5.6-sol,xhigh,48,00:31:57
+Rumdl,Bello,gpt-5.6-sol,ultra,80,19:20:30

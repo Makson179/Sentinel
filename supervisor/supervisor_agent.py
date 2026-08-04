@@ -83,6 +83,7 @@ class StatelessSupervisorAgent:
         intelligence: str | None = DEFAULT_INTELLIGENCE,
         timeout_seconds: float = DEFAULT_SUPERVISOR_TIMEOUT_SECONDS,
         completion_timeout_seconds: float = DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS,
+        on_thread_start: Callable[[str, Literal["runtime", "completion"]], None] | None = None,
     ):
         self.client = client
         self.store = store
@@ -94,6 +95,7 @@ class StatelessSupervisorAgent:
         self.intelligence = intelligence
         self.timeout_seconds = timeout_seconds
         self.completion_timeout_seconds = completion_timeout_seconds
+        self.on_thread_start = on_thread_start
         self.completion_thread_id: str | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
@@ -213,6 +215,11 @@ class StatelessSupervisorAgent:
                     raise SupervisorAgentError("supervisor thread/start did not return thread id")
                 if persistent_completion_thread:
                     self.completion_thread_id = thread_id
+                if self.on_thread_start is not None:
+                    self.on_thread_start(
+                        thread_id,
+                        "completion" if persistent_completion_thread else "runtime",
+                    )
             turn_prompt = prompt
             for attempt in range(2):
                 turn_response = await self._await_rpc(

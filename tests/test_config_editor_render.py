@@ -115,39 +115,8 @@ def test_config_editor_render_shows_numeric_limit_fields() -> None:
     assert "max-adversary-runs" in output
     assert "max-reviews-before-adversary" in output
     assert "max-reviews-after-adversary" in output
-    assert next(
-        parameter.value
-        for parameter in params
-        if parameter.key == "completion_returns_before_adversary"
-    ) == "1"
-    assert next(
-        parameter.value
-        for parameter in params
-        if parameter.key == "completion_returns_after_adversary"
-    ) == "0"
     assert keys.index("completion_returns_before_adversary") < keys.index("adversary_runs")
     assert keys.index("adversary_runs") < keys.index("completion_returns_after_adversary")
-
-
-def test_config_editor_render_displays_unlimited_as_a_word() -> None:
-    config = ProjectConfig(
-        completion_review=True,
-        adversary=True,
-        completion_returns_before_adversary="unlimited",
-        completion_returns_after_adversary="unlimited",
-    )
-    params = parameter_defs(config)
-
-    assert next(
-        parameter.value
-        for parameter in params
-        if parameter.key == "completion_returns_before_adversary"
-    ) == "Unlimited"
-    assert next(
-        parameter.value
-        for parameter in params
-        if parameter.key == "completion_returns_after_adversary"
-    ) == "Unlimited"
 
 
 def test_config_editor_render_shows_cheap_runtime_toggle() -> None:
@@ -447,21 +416,9 @@ def test_config_editor_review_limit_tip_matches_adversary_mode() -> None:
     disabled_help = _side_panel_text(disabled, EditorState(parameter_index=disabled_index))
 
     assert "forces the first adversary" in enabled_help
-    assert "0 skips these rounds" in enabled_help
-    assert "Unlimited removes the cap" in enabled_help
     assert "Maximum completion-review rounds that may return work" in disabled_help
     assert "Bello completes without another review" in disabled_help
-    assert "0 skips review" in disabled_help
-    assert "Unlimited removes the cap" in disabled_help
     assert "restarts the coder" not in disabled_help
-
-    after_index = [parameter.key for parameter in enabled_params].index(
-        "completion_returns_after_adversary"
-    )
-    after_help = _side_panel_text(enabled, EditorState(parameter_index=after_index))
-    assert "0 schedules none" in after_help
-    assert "Unlimited removes the cap" in after_help
-    assert "candidate adversary finding is still adjudicated once" in after_help
 
 
 def test_config_editor_focused_icon_moves_without_shifting_the_field_name() -> None:

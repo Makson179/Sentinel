@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bello-context-mode-sandbox-policy-v1",
+  "$defs": {
+    "runtime_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "PATH",
+        "BELLO_OFFLINE",
+        "BELLO_RUN_ID",
+        "BELLO_WORKSPACE_ID",
+        "BELLO_CONTEXT_SESSION_ID"
+      ],
+      "properties": {
+        "HOME": {"type": "string", "pattern": "^/", "minLength": 2},
+        "TMPDIR": {"type": "string", "pattern": "^/", "minLength": 2},
+        "XDG_CONFIG_HOME": {"type": "string", "pattern": "^/", "minLength": 2},
+        "XDG_CACHE_HOME": {"type": "string", "pattern": "^/", "minLength": 2},
+        "PATH": {"type": "string", "pattern": "^/", "minLength": 2},
+        "LANG": {"type": "string"},
+        "LC_ALL": {"type": "string"},
+        "TZ": {"type": "string"},
+        "CONTEXT_MODE_PLATFORM": {"type": "string", "minLength": 1},
+        "CONTEXT_MODE_DIR": {"type": "string", "pattern": "^/", "minLength": 2},
+        "BELLO_OFFLINE": {"const": "1"},
+        "BELLO_RUN_ID": {"type": "string", "minLength": 1},
+        "BELLO_WORKSPACE_ID": {"type": "string", "minLength": 1},
+        "BELLO_CONTEXT_SESSION_ID": {"type": "string", "minLength": 1},
+        "CC": {"type": "string"},
+        "CXX": {"type": "string"},
+        "AR": {"type": "string"},
+        "RANLIB": {"type": "string"},
+        "CFLAGS": {"type": "string"},
+        "CXXFLAGS": {"type": "string"},
+        "CPPFLAGS": {"type": "string"},
+        "LDFLAGS": {"type": "string"},
+        "MAKEFLAGS": {"type": "string"},
+        "CARGO_HOME": {"type": "string", "pattern": "^/", "minLength": 2},
+        "RUSTUP_HOME": {"type": "string", "pattern": "^/", "minLength": 2},
+        "GOMODCACHE": {"type": "string", "pattern": "^/", "minLength": 2},
+        "GOCACHE": {"type": "string", "pattern": "^/", "minLength": 2},
+        "npm_config_cache": {"type": "string", "pattern": "^/", "minLength": 2},
+        "PIP_CACHE_DIR": {"type": "string", "pattern": "^/", "minLength": 2}
+      }
+    },
+    "proxy_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["BELLO_OFFLINE"],
+      "properties": {
+        "BELLO_OFFLINE": {"const": "1"},
+        "LANG": {"type": "string"},
+        "LC_ALL": {"type": "string"},
+        "TZ": {"type": "string"}
+      }
+    },
+    "process_control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authenticated_runner_identity",
+        "direct_exec_mediated",
+        "ptrace_denied",
+        "process_vm_denied",
+        "cross_tree_signals_denied",
+        "non_dumpable",
+        "core_dumps_denied",
+        "rlimits_enforced",
+        "process_tree_enforced"
+      ],
+      "properties": {
+        "authenticated_runner_identity": {"const": "bello-native-runner-v1"},
+        "direct_exec_mediated": {"const": true},
+        "ptrace_denied": {"const": true},
+        "process_vm_denied": {"const": true},
+        "cross_tree_signals_denied": {"const": true},
+        "non_dumpable": {"const": true},
+        "core_dumps_denied": {"const": true},
+        "rlimits_enforced": {"const": true},
+        "process_tree_enforced": {"const": true}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile",
+    "mounts",
+    "protected_roots",
+    "environment",
+    "limits",
+    "workspace_paths",
+    "proxy_bootstrap",
+    "process_control",
+    "network_allowed",
+    "loopback_allowed",
+    "allow_host_unix_sockets"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profile": {"enum": ["mcp", "hook", "command", "proxy"]},
+    "mounts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "target", "access", "path_class"],
+        "properties": {
+          "source": {"type": "string", "pattern": "^/"},
+          "target": {"type": "string", "pattern": "^/"},
+          "access": {"enum": ["read_only", "read_write", "read_execute"]},
+          "path_class": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "protected_roots": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^/", "minLength": 2}
+    },
+    "environment": {"type": "object"},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_time_seconds",
+        "cpu_time_seconds",
+        "address_space_bytes",
+        "processes",
+        "open_files",
+        "single_file_bytes",
+        "total_write_bytes",
+        "stdout_bytes",
+        "stderr_bytes",
+        "core_dump_bytes"
+      ],
+      "properties": {
+        "wall_time_seconds": {"type": "integer", "minimum": 1},
+        "cpu_time_seconds": {"type": "integer", "minimum": 1},
+        "address_space_bytes": {"type": "integer", "minimum": 1},
+        "processes": {"type": "integer", "minimum": 1},
+        "open_files": {"type": "integer", "minimum": 1},
+        "single_file_bytes": {"type": "integer", "minimum": 1},
+        "total_write_bytes": {"type": "integer", "minimum": 1},
+        "stdout_bytes": {"type": "integer", "minimum": 1},
+        "stderr_bytes": {"type": "integer", "minimum": 1},
+        "core_dump_bytes": {"type": "integer", "const": 0}
+      }
+    },
+    "workspace_paths": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "root",
+            "read_only_paths",
+            "masked_paths",
+            "deny_component_names",
+            "deny_top_level_names",
+            "deny_filename_globs"
+          ],
+          "properties": {
+            "root": {"type": "string", "pattern": "^/"},
+            "read_only_paths": {"type": "array", "items": {"type": "string", "pattern": "^/"}},
+            "masked_paths": {"type": "array", "items": {"type": "string", "pattern": "^/"}},
+            "deny_component_names": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "deny_top_level_names": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "deny_filename_globs": {"type": "array", "items": {"type": "string", "minLength": 1}}
+          }
+        }
+      ]
+    },
+    "proxy_bootstrap": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_files", "exactly_one_per_launch"],
+          "properties": {
+            "allowed_files": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"type": "string", "pattern": "^/"}
+            },
+            "exactly_one_per_launch": {"const": true}
+          }
+        }
+      ]
+    },
+    "process_control": {"$ref": "#/$defs/process_control"},
+    "network_allowed": {"const": false},
+    "loopback_allowed": {"const": false},
+    "allow_host_unix_sockets": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"profile": {"const": "proxy"}},
+        "required": ["profile"]
+      },
+      "then": {
+        "properties": {
+          "environment": {"$ref": "#/$defs/proxy_environment"},
+          "workspace_paths": {"type": "null"},
+          "proxy_bootstrap": {"type": "object"}
+        }
+      },
+      "else": {
+        "properties": {
+          "environment": {"$ref": "#/$defs/runtime_environment"},
+          "workspace_paths": {"type": "object"},
+          "proxy_bootstrap": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"profile": {"enum": ["mcp", "hook"]}},
+        "required": ["profile"]
+      },
+      "then": {
+        "properties": {
+          "environment": {"required": ["CONTEXT_MODE_DIR"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"profile": {"const": "command"}},
+        "required": ["profile"]
+      },
+      "then": {
+        "properties": {
+          "environment": {"not": {"required": ["CONTEXT_MODE_DIR"]}}
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "allowed_tools": [
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_batch_execute",
+    "ctx_index",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_doctor",
+    "ctx_purge"
+  ],
+  "attestation_type": "bello-context-mode-offline-fork",
+  "catalog_version": 1,
+  "forbidden_tools": [
+    "ctx_fetch_and_index",
+    "ctx_insight",
+    "ctx_upgrade"
+  ],
+  "fork_revision": "bello-offline-v1",
+  "fork_source_commit": "4fb531520ce7d802f52b8a3389d871b7d13e6c99",
+  "network_routes": false,
+  "offline": true,
+  "payload_sha256": "68612a5c0c2e84135d91e09eb7b030f8a1f2e874ffa2de3461b45d505292d83b",
+  "runtime_downloads": false,
+  "runtime_installs": false,
+  "runtime_updates": false,
+  "schema_version": 1,
+  "tool_schema_digests": {
+    "ctx_batch_execute": "28d3abf5124101cd58e62315d856fa185c810c74aca7b54ee100eb31e88f1039",
+    "ctx_doctor": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
+    "ctx_execute": "837fc20a1b03174d9ef82341d199d76462aac4bd0dbda899b3b456ffce9bad87",
+    "ctx_execute_file": "954cfd686247ec173526abebccb79e644d59d0e9a4fa4ba550323c1ea7d8ebba",
+    "ctx_index": "a5c7a92d98ef14e3b02ab206f82a602bf6b5106042e4772cf99921b66c382adf",
+    "ctx_purge": "c4cf420a267955ab52b5b099ac676c34c96e65a8375cdfe5d10da55f7366b2ac",
+    "ctx_search": "a322ea2343e97ec29da1150d1a934e969823b16949c9d3e2d521874d8fe81bd6",
+    "ctx_stats": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa"
+  },
+  "upstream_commit": "589d8214d56740a28b5f7bf63167743d586b0b40",
+  "upstream_version": "1.0.169"
+}

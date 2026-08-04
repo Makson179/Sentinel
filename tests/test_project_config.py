@@ -27,11 +27,6 @@ from supervisor.project_config import (
     save_project_config,
     sync_runtime_config_fields,
 )
-from supervisor.review_limits import (
-    EXPLICIT_REVIEW_LIMIT_FORMAT,
-    REVIEW_LIMIT_FORMAT_FIELD,
-    UNLIMITED_REVIEW_LIMIT,
-)
 from supervisor.schemas import BelloConfig
 from supervisor.state import CONFIG, PROGRESS, StateStore
 
@@ -51,8 +46,8 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.completion_review is False
     assert config.adversary is False
     assert config.adversary_runs == 1
-    assert config.completion_returns_before_adversary == 1
-    assert config.completion_returns_after_adversary == 0
+    assert config.completion_returns_before_adversary == 4
+    assert config.completion_returns_after_adversary == 2
     assert config.cheap_runtime is True
     assert config.clean is False
     assert config.task is None
@@ -87,8 +82,6 @@ def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     assert config.completion_mod == DEFAULT_MODEL
     assert config.adversary_mod == DEFAULT_MODEL
     assert config.start_over is True
-    assert config.completion_returns_before_adversary == 4
-    assert config.completion_returns_after_adversary == 2
 
 
 def test_project_config_invalid_json_reports_path(tmp_path: Path) -> None:
@@ -114,9 +107,8 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["speed"] == "fast"
     assert payload["fast"] is True
     assert payload["clean"] is True
-    assert payload[REVIEW_LIMIT_FORMAT_FIELD] == EXPLICIT_REVIEW_LIMIT_FORMAT
-    assert payload["max_completion_returns_before_adversary"] == 1
-    assert payload["max_completion_returns_after_adversary"] == 0
+    assert payload["max_completion_returns_before_adversary"] == 4
+    assert payload["max_completion_returns_after_adversary"] == 2
     assert payload["cheap_runtime"] is True
     assert payload["runtime_mod"] == DEFAULT_MODEL
     assert payload["completion_mod"] == DEFAULT_MODEL
@@ -168,36 +160,6 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     assert config.cheap_runtime is False
 
 
-@pytest.mark.parametrize(
-    "before_field",
-    ["max_completion_returns_before_adversary", "max_completion_returns_per_generation"],
-)
-def test_state_store_migrates_legacy_zero_review_limits_on_update(
-    tmp_path: Path,
-    before_field: str,
-) -> None:
-    store = StateStore(tmp_path)
-    store.write_json_locked(
-        CONFIG,
-        {
-            "project_root": str(tmp_path),
-            "task_path": "TASK.md",
-            before_field: 0,
-            "max_completion_returns_after_adversary": 0,
-        },
-    )
-
-    config = store.get_bello_config()
-    assert config.max_completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
-    assert config.max_completion_returns_after_adversary == UNLIMITED_REVIEW_LIMIT
-
-    store.update_bello_config(lambda current: current)
-    payload = json.loads(store.path(CONFIG).read_text(encoding="utf-8"))
-    assert payload[REVIEW_LIMIT_FORMAT_FIELD] == EXPLICIT_REVIEW_LIMIT_FORMAT
-    assert payload["max_completion_returns_before_adversary"] == UNLIMITED_REVIEW_LIMIT
-    assert payload["max_completion_returns_after_adversary"] == UNLIMITED_REVIEW_LIMIT
-
-
 def test_project_config_loads_independent_role_models_and_efforts(tmp_path: Path) -> None:
     _write_config_payload(
         tmp_path,
@@ -241,9 +203,8 @@ def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> Non
     assert runtime_config.fast is True
     assert runtime_config.adversary is False
     assert runtime_config.max_adversary_runs == 0
-    assert runtime_config.review_limit_format == EXPLICIT_REVIEW_LIMIT_FORMAT
-    assert runtime_config.max_completion_returns_before_adversary == 1
-    assert runtime_config.max_completion_returns_after_adversary == 0
+    assert runtime_config.max_completion_returns_before_adversary == 4
+    assert runtime_config.max_completion_returns_after_adversary == 2
     assert runtime_config.cheap_runtime is True
 
 
@@ -497,35 +458,6 @@ def test_config_editor_inline_completion_return_limits_update_config() -> None:
     assert config.completion_returns_after_adversary == 1
 
 
-def test_config_editor_review_limits_support_zero_and_unlimited() -> None:
-    config = ProjectConfig(completion_review=True, adversary=True)
-    params = parameter_defs(config)
-    before_index = [param.key for param in params].index("completion_returns_before_adversary")
-    state = EditorState(parameter_index=before_index)
-
-    config, state, action = select_current(config, state)
-    assert action is None
-    assert state.edit_kind == "review_limit"
-    assert state.edit_value == "1"
-
-    state = replace(state, edit_value="Unlimited")
-    config, state, action = select_current(config, state)
-    assert action is None
-    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
-
-    params = parameter_defs(config)
-    before = next(param for param in params if param.key == "completion_returns_before_adversary")
-    assert before.value == "Unlimited"
-
-    after_index = [param.key for param in params].index("completion_returns_after_adversary")
-    state = EditorState(parameter_index=after_index)
-    config, state, action = select_current(config, state)
-    state = replace(state, edit_value="0")
-    config, state, action = select_current(config, state)
-    assert action is None
-    assert config.completion_returns_after_adversary == 0
-
-
 def test_config_editor_inline_number_rejects_invalid_input() -> None:
     config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(config)
@@ -537,9 +469,9 @@ def test_config_editor_inline_number_rejects_invalid_input() -> None:
     config, state, action = select_current(config, state)
 
     assert action is None
-    assert config.completion_returns_before_adversary == 1
+    assert config.completion_returns_before_adversary == 4
     assert state.editing is True
-    assert state.edit_error == "enter 0 or a positive integer, or Unlimited"
+    assert state.edit_error == "enter a non-negative integer"
 
 
 def test_config_editor_groups_gpt_56_variants_and_filters_older_models() -> None:
@@ -711,66 +643,10 @@ def test_completion_return_budgets_parsed_from_payload(tmp_path) -> None:
     assert config.completion_returns_after_adversary == 1
 
 
-def test_explicit_zero_completion_return_budgets_mean_none(tmp_path) -> None:
-    _write_config_payload(
-        tmp_path,
-        json.dumps(
-            {
-                REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
-                "max_completion_returns_before_adversary": 0,
-                "max_completion_returns_after_adversary": 0,
-            }
-        ),
-    )
-
-    config = load_project_config(tmp_path, create=False)
-
-    assert config.completion_returns_before_adversary == 0
-    assert config.completion_returns_after_adversary == 0
-
-
-def test_legacy_zero_completion_return_budgets_remain_unlimited(tmp_path) -> None:
-    _write_config_payload(
-        tmp_path,
-        '{"max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}',
-    )
-
-    config = load_project_config(tmp_path, create=False)
-
-    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
-    assert config.completion_returns_after_adversary == UNLIMITED_REVIEW_LIMIT
-
-
-def test_completion_return_budgets_accept_unlimited(tmp_path) -> None:
-    _write_config_payload(
-        tmp_path,
-        json.dumps(
-            {
-                REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
-                "max_completion_returns_before_adversary": "Unlimited",
-                "max_completion_returns_after_adversary": "unlimited",
-            }
-        ),
-    )
-
-    config = load_project_config(tmp_path, create=False)
-
-    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
-    assert config.completion_returns_after_adversary == UNLIMITED_REVIEW_LIMIT
-
-
 def test_legacy_completion_return_budget_is_supported(tmp_path) -> None:
     _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": 3}')
     config = load_project_config(tmp_path, create=False)
     assert config.completion_returns_before_adversary == 3
-
-
-def test_legacy_zero_completion_return_budget_remains_unlimited(tmp_path) -> None:
-    _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": 0}')
-
-    config = load_project_config(tmp_path, create=False)
-
-    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -778,13 +654,6 @@ def test_legacy_zero_completion_return_budget_remains_unlimited(tmp_path) -> Non
     [
         '{"max_completion_returns_before_adversary": -1}',
         '{"max_completion_returns_after_adversary": -1}',
-        json.dumps(
-            {
-                REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
-                "max_completion_returns_before_adversary": "forever",
-            }
-        ),
-        '{"max_completion_returns_before_adversary": false}',
     ],
 )
 def test_completion_return_budgets_reject_invalid_values(tmp_path, payload: str) -> None:
@@ -795,24 +664,13 @@ def test_completion_return_budgets_reject_invalid_values(tmp_path, payload: str)
 
 def test_to_json_data_round_trips_completion_return_limit(tmp_path) -> None:
     config = ProjectConfig(
-        completion_returns_before_adversary=UNLIMITED_REVIEW_LIMIT,
-        completion_returns_after_adversary=0,
+        completion_returns_before_adversary=4,
+        completion_returns_after_adversary=1,
     )
     data = config.to_json_data()
-    assert data[REVIEW_LIMIT_FORMAT_FIELD] == EXPLICIT_REVIEW_LIMIT_FORMAT
-    assert data["max_completion_returns_before_adversary"] == UNLIMITED_REVIEW_LIMIT
-    assert data["max_completion_returns_after_adversary"] == 0
+    assert data["max_completion_returns_before_adversary"] == 4
+    assert data["max_completion_returns_after_adversary"] == 1
     assert "max_completion_returns_per_generation" not in data
-
-
-def test_invalid_review_limit_format_is_rejected(tmp_path) -> None:
-    _write_config_payload(
-        tmp_path,
-        json.dumps({REVIEW_LIMIT_FORMAT_FIELD: "ambiguous"}),
-    )
-
-    with pytest.raises(ProjectConfigError, match=REVIEW_LIMIT_FORMAT_FIELD):
-        load_project_config(tmp_path, create=False)
 
 
 def test_completion_review_defaults_to_disabled(tmp_path) -> None:

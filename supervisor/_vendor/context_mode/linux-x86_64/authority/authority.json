@@ -1,0 +1,11 @@
+{
+  "authority_version": "bello-context-authority-2-precompact",
+  "broker_protocol": "bello-context-native-v1",
+  "files": {
+    "LICENSE": "4f8a96a1e06f5ee2d31c27a8768e228ca6c0c7ad7262e78dc48dd48b35a609a8",
+    "bin/bello-context-broker": "ca5bfb1e95ddf2c3bb00a7217e28879f2202796ec730a4c6a27447b54aba88a0",
+    "bin/bello-context-launcher": "9c694b1fd66788c493be8fb44dabc97cef47c731fb62fe6b98cd18f5ba696a1f"
+  },
+  "platform": "linux-x86_64",
+  "schema_version": 1
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "bello_offline_fork_revision": "bello-offline-v1",
+  "offline_fork_attestation_version": 1,
+  "context_mode_version": "1.0.169",
+  "context_mode_commit": "589d8214d56740a28b5f7bf63167743d586b0b40",
+  "codex_cli_version": "codex-cli 0.146.0",
+  "codex_app_server_schema_sha256": "8b4f3070be27707f5f621196fff0bad967f9b47093737fe1699c859a69d52289",
+  "node_version": "22.5.0",
+  "minimum_node_version": "22.5.0",
+  "license": "Elastic-2.0",
+  "offline": true,
+  "runtime_downloads": false
+}

@@ -1,52 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="420" viewBox="0 0 1240 420" role="img" aria-labelledby="title-rumdl desc-rumdl">
-<title id="title-rumdl">Rumdl configuration profile</title>
-<desc id="desc-rumdl">Six bars compare GPT-5.5 xhigh and GPT-5.6 Sol ultra and xhigh configurations, sorted by score.</desc>
-<rect width="1240" height="420" fill="#FFFFFF"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="390" viewBox="0 0 960 390" role="img" aria-labelledby="title-rumdl desc-rumdl">
+<title id="title-rumdl">Rumdl completion scores</title>
+<desc id="desc-rumdl">Grouped bars compare Raw Codex and Bello completion percentages in ultra and xhigh modes.</desc>
+<rect width="960" height="390" fill="#FFFFFF"/>
 <text x="48.0" y="38.0" font-family="Georgia, 'Times New Roman', serif" font-size="21" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">(c)  Rumdl</text>
-<text x="48.0" y="62.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">Six model–effort configurations · ordered by completion score</text>
+<text x="48.0" y="62.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">ProgramBench completion score · gpt-5.6-sol</text>
 <text x="105.0" y="85.0" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">Completion (%)</text>
-<line x1="105.0" y1="315.0" x2="955.0" y2="315.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="93.0" y="319.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0</text>
-<line x1="105.0" y1="271.0" x2="955.0" y2="271.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="93.0" y="275.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">20</text>
-<line x1="105.0" y1="227.0" x2="955.0" y2="227.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="93.0" y="231.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">40</text>
-<line x1="105.0" y1="183.0" x2="955.0" y2="183.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="93.0" y="187.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">60</text>
-<line x1="105.0" y1="139.0" x2="955.0" y2="139.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="93.0" y="143.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">80</text>
-<line x1="105.0" y1="95.0" x2="955.0" y2="95.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<line x1="105.0" y1="306.0" x2="670.0" y2="306.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="93.0" y="310.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0</text>
+<line x1="105.0" y1="263.8" x2="670.0" y2="263.8" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="93.0" y="267.8" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">20</text>
+<line x1="105.0" y1="221.6" x2="670.0" y2="221.6" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="93.0" y="225.6" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">40</text>
+<line x1="105.0" y1="179.4" x2="670.0" y2="179.4" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="93.0" y="183.4" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">60</text>
+<line x1="105.0" y1="137.2" x2="670.0" y2="137.2" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="93.0" y="141.2" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">80</text>
+<line x1="105.0" y1="95.0" x2="670.0" y2="95.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
 <text x="93.0" y="99.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">100</text>
-<line x1="105.0" y1="95.0" x2="105.0" y2="315.0" stroke="#1B1B1B" stroke-width="1.2"/>
-<line x1="105.0" y1="315.0" x2="955.0" y2="315.0" stroke="#1B1B1B" stroke-width="1.2"/>
-<rect x="116.0" y="213.1" width="78.0" height="101.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.8"/>
-<text x="155.0" y="204.1" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">46.30%</text>
-<text x="155.0" y="339.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Codex</text>
-<text x="155.0" y="357.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="middle" fill="#5B5B5B">5.5 · xhigh</text>
-<rect x="271.0" y="209.0" width="78.0" height="106.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.8"/>
-<text x="310.0" y="200.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">48.19%</text>
-<text x="310.0" y="339.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Codex</text>
-<text x="310.0" y="357.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="middle" fill="#5B5B5B">5.6 Sol · xhigh</text>
-<rect x="426.0" y="202.8" width="78.0" height="112.2" fill="#C7654D" stroke="#B24A33" stroke-width="1.8"/>
-<text x="465.0" y="193.8" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">50.99%</text>
-<text x="465.0" y="339.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Bello</text>
-<text x="465.0" y="357.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="middle" fill="#5B5B5B">5.5 · xhigh</text>
-<rect x="581.0" y="192.7" width="78.0" height="122.3" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.8"/>
-<text x="620.0" y="183.7" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">55.60%</text>
-<text x="620.0" y="339.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Codex</text>
-<text x="620.0" y="357.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="middle" fill="#5B5B5B">5.6 Sol · ultra</text>
-<rect x="736.0" y="179.2" width="78.0" height="135.8" fill="#C7654D" stroke="#B24A33" stroke-width="1.8"/>
-<text x="775.0" y="170.2" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">61.74%</text>
-<text x="775.0" y="339.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Bello</text>
-<text x="775.0" y="357.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="middle" fill="#5B5B5B">5.6 Sol · xhigh</text>
-<rect x="891.0" y="138.6" width="78.0" height="176.4" fill="#C7654D" stroke="#B24A33" stroke-width="1.8"/>
-<text x="930.0" y="129.6" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">80.19%</text>
-<text x="930.0" y="339.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Bello</text>
-<text x="930.0" y="357.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="middle" fill="#5B5B5B">5.6 Sol · ultra</text>
-<text x="1030.0" y="113.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">Method</text>
-<rect x="1030.0" y="137.0" width="26.0" height="18.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
-<text x="1068.0" y="151.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">Raw Codex</text>
-<rect x="1030.0" y="174.0" width="26.0" height="18.0" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
-<text x="1068.0" y="188.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">Bello</text>
-<text x="48.0" y="404.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">All panels use matched Raw Codex and Bello runs; labels use the reported precision.</text>
+<line x1="105.0" y1="95.0" x2="105.0" y2="306.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="105.0" y1="306.0" x2="670.0" y2="306.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<text x="260.0" y="333.0" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">ultra</text>
+<rect x="181.0" y="187.8" width="70.0" height="118.2" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.8"/>
+<text x="216.0" y="178.8" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">56%</text>
+<rect x="269.0" y="137.2" width="70.0" height="168.8" fill="#C7654D" stroke="#B24A33" stroke-width="1.8"/>
+<text x="304.0" y="128.2" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">80%</text>
+<text x="515.0" y="333.0" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">xhigh</text>
+<rect x="436.0" y="204.7" width="70.0" height="101.3" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.8"/>
+<text x="471.0" y="195.7" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">48%</text>
+<line x1="524.0" y1="304.0" x2="594.0" y2="304.0" stroke="#B24A33" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="559.0" y="294.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="italic" text-anchor="middle" fill="#5B5B5B">n/a</text>
+<text x="750.0" y="113.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">Method</text>
+<rect x="750.0" y="137.0" width="26.0" height="18.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="788.0" y="151.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">Raw Codex</text>
+<rect x="750.0" y="174.0" width="26.0" height="18.0" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="788.0" y="188.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">Bello</text>
+<text x="48.0" y="369.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">Bars report observed completion percentages; a missing run is shown as n/a, not zero.</text>
 </svg>

@@ -12,7 +12,6 @@ import fcntl
 from pydantic import BaseModel
 
 from supervisor.schemas import AppEvent, FinalReport, HealthState, BelloConfig
-from supervisor.review_limits import normalize_review_limit_payload
 
 T = TypeVar("T")
 
@@ -30,6 +29,7 @@ EVENTS = "events.jsonl"
 SUPERVISOR_WAKES = "supervisor_wakes.jsonl"
 RUNTIME_TRACE = "runtime_trace.jsonl"
 RUNTIME_METRICS = "runtime_metrics.json"
+PROVIDER_TOKEN_USAGE = "provider_token_usage.jsonl"
 AGENT_SETTINGS = "agent-settings.json"
 PREVIOUS_RUNS = "previous_runs"
 RECOVERY = "recovery"
@@ -195,6 +195,7 @@ class StateStore:
             SUPERVISOR_WAKES: "",
             RUNTIME_TRACE: "",
             RUNTIME_METRICS: "{}\n",
+            PROVIDER_TOKEN_USAGE: "",
         }
 
     def _clear_state_dir(self, *, preserve: set[str]) -> None:
@@ -249,7 +250,7 @@ class StateStore:
         return previous_runs / f"run{max_run + 1}"
 
     def get_bello_config(self) -> BelloConfig:
-        return BelloConfig.model_validate(normalize_review_limit_payload(self.read_json(CONFIG, {})))
+        return BelloConfig.model_validate(self.read_json(CONFIG, {}))
 
     def update_bello_config(self, patcher: Callable[[BelloConfig], BelloConfig]) -> BelloConfig:
         with self.locked(CONFIG):
@@ -283,6 +284,18 @@ class StateStore:
 
     def append_runtime_trace(self, entry: dict[str, Any]) -> None:
         self.append_text_locked(RUNTIME_TRACE, json.dumps(entry, default=str, sort_keys=True) + "\n")
+
+    def append_provider_token_usage(self, entry: dict[str, Any]) -> None:
+        """Append one sanitized provider gauge observation to the durable run ledger."""
+
+        encoded = json.dumps(entry, default=str, sort_keys=True) + "\n"
+        with self.locked(PROVIDER_TOKEN_USAGE):
+            path = self.path(PROVIDER_TOKEN_USAGE)
+            fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def update_runtime_metrics(self, patcher: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
         with self.locked(RUNTIME_METRICS):

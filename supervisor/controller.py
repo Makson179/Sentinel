@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -14,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from supervisor.approval_triage import (
     CheapRuntimeReviewer,
@@ -23,15 +25,97 @@ from supervisor.approval_triage import (
     runtime_triage_config_from_env,
 )
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
-from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
-from supervisor.approvals import ApprovalManager, normalize_approval_request
+from supervisor.appserver import (
+    AppServerClient,
+    AppServerError,
+    AppServerMessage,
+    ClientRole,
+    PendingRequestKey,
+    require_json_rpc_id,
+)
+from supervisor.approvals import (
+    MCP_ELICITATION_METHOD,
+    MCP_TOOL_APPROVAL_KIND,
+    MCP_TOOL_APPROVAL_KIND_KEY,
+    ApprovalManager,
+    normalize_approval_request,
+)
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
     CODER_SANDBOX_WORKSPACE_WRITE,
     DEFAULT_INTELLIGENCE,
     CoderSession,
+    CoderContextBindingSnapshot,
+    CoderLifecycleCheckpointRequest,
+    CoderLifecycleTransition,
+    CoderRecoveryContext,
     coder_sandbox_mode,
     coder_thread_params,
+)
+from supervisor.context_mode._util import (
+    ContextModeDataError,
+    canonical_json_bytes,
+    digest_json,
+    require_int,
+)
+from supervisor.context_mode.config import (
+    ALLOWED_TOOL_SET,
+    CAPABILITY_REQUIRED_TOOLS,
+    CONTEXT_SERVER_NAME,
+    EXECUTION_TOOLS,
+    PINNED_APPROVAL_CORRELATION_FIELDS,
+    PINNED_CODEX_APP_SERVER_SCHEMA_SHA256,
+    PINNED_CODEX_CLI_VERSION,
+    REQUIRED_HOOKS,
+    Role as ContextRole,
+    generate_coder_home,
+    generate_plain_coder_home,
+    generate_supervisor_home,
+    validate_exact_hook_catalogue,
+    validate_exact_tool_catalogue,
+)
+from supervisor.context_mode.approvals import (
+    canonical_cwd as context_canonical_cwd,
+    normalized_arguments_digest as context_arguments_digest,
+)
+from supervisor.context_mode.health import check_doctor_result, check_generated_role_home
+from supervisor.context_mode.events import (
+    ClientRole as ContextClientRole,
+    EventDisposition as ContextEventDisposition,
+    LogicalContextCallKey,
+)
+from supervisor.context_mode.integration import (
+    ContextCallClassification,
+    ContextIntegrationOutcome,
+    ContextModeIntegration,
+    ContextNotificationOrigin,
+    ContextOutcomeStatus,
+)
+from supervisor.context_mode.provenance import RedactedSummary
+from supervisor.context_mode.sandbox import SandboxBackend, detect_sandbox_backend
+from supervisor.context_mode.runtime import ExclusiveWorkspaceLease, RuntimeState
+from supervisor.context_mode.session import (
+    CheckpointCursor,
+    CheckpointRecoveryKind,
+    ContextBinding,
+    TransitionReason,
+    new_generation_lease_id,
+)
+from supervisor.context_mode.startup import (
+    CHECKPOINT_LIFECYCLE_ATTESTATION,
+    CheckpointRecoveryResult,
+    ContextModeStartupError,
+    NativeContextRuntime,
+    PURGE_LIFECYCLE_ATTESTATION,
+    PreparedContextMode,
+    prepare_context_mode,
+)
+from supervisor.context_mode.telemetry import (
+    AuthoritySeparatedCounters,
+    MetricAuthority,
+    ProviderThreadKey,
+    ProviderTokenGaugeBook,
+    provider_metric_names,
 )
 from supervisor.health import (
     clear_restart_issue_for_validation,
@@ -40,11 +124,11 @@ from supervisor.health import (
     record_restart_issue_intervention,
 )
 from supervisor.project_config import DEFAULT_MODEL, ProjectConfig
-from supervisor.review_limits import review_limit_reached
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
     ApprovalContext,
+    ApprovalRequestType,
     AdversaryReport,
     ApprovalWakeContext,
     BehaviorSurfaceItem,
@@ -105,6 +189,11 @@ POST_RESTART_CONTINUE_NUDGE = (
     "You are a fresh generation after a restart. Read HANDOFF.md and continue the task from there. "
     "Do not declare readiness until you have done new work and validated it."
 )
+POST_COMPACTION_CONTINUE_NUDGE = (
+    "Context compaction completed and its checkpoint was recovered. Continue the current task "
+    "from the verified workspace state. Re-check any operation that may have been interrupted, "
+    "and do not declare readiness until validation is complete."
+)
 ACCEPT_GATE_REVIEWER_INCOMPLETE = "reviewer-incomplete"
 ACCEPT_GATE_CODER_CORRECTABLE = "coder-correctable"
 ACCEPT_GATE_AUDIT_FAILURE = "audit-failure"
@@ -124,6 +213,8 @@ MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
+CODER_CONTEXT_COMPACT_THRESHOLD_TOKENS = 120_000
+CODER_CONTEXT_COMPACT_MIN_GROWTH_TOKENS = 60_000
 # Provider no_message (empty-completion) recovery for the completion review. A transient
 # backend blip can return empty "completed" turns for a couple of minutes; ride it out with
 # backed-off retries before declaring the run infra-invalid. The budget is CONSECUTIVE
@@ -186,10 +277,26 @@ ADVERSARY_MODEL = DEFAULT_MODEL
 @dataclass(frozen=True)
 class ControllerEvent:
     kind: str
+    role: ClientRole | None = None
+    process_epoch: int = 0
+    app_server_instance_id: str | None = None
     message: AppServerMessage | None = None
     user_command: UserCommand | None = None
     error: BaseException | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingContextApprovalCall:
+    """Authoritative started-call facts available before Codex asks approval."""
+
+    logical_key: tuple[str, str, str]
+    tool_name: str
+    arguments_digest: str
+    origin_role: ClientRole
+    process_epoch: int
+    app_server_instance_id: str
+    binding: ContextBinding
 
 
 @dataclass(frozen=True)
@@ -246,6 +353,8 @@ class BelloController:
         *,
         task_path: Path | None = None,
         client: AppServerClient | None = None,
+        coder_client: AppServerClient | None = None,
+        supervisor_client: AppServerClient | None = None,
         tui: TerminalTUI | None = None,
         model: str | None = None,
         coder_model: str | None = None,
@@ -267,6 +376,13 @@ class BelloController:
         completion_review: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
+        context_mode_enabled: bool | None = None,
+        keep_context_mode_data: bool = False,
+        context_mode_debug: bool = False,
+        context_native_runtime: NativeContextRuntime | None = None,
+        context_sandbox_backend: SandboxBackend | None = None,
+        context_vendor_root: Path | None = None,
+        context_toolchain_roots: tuple[Path, ...] = (),
     ):
         self.project_root = project_root.resolve()
         self.task_path = resolve_task(self.project_root, task_path)
@@ -275,6 +391,10 @@ class BelloController:
         self.workspace_root = self.project_root
         self.workspace_task_path = self.task_path
         self._coder_snapshot: WorkspaceSnapshot | None = None
+        self.run_id: str | None = None
+        self.run_root: Path | None = None
+        self.workspace_id: str | None = None
+        self.context_session_id: str | None = None
         self._snapshot_patch_applied = False
         self._coder_started = False
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
@@ -312,13 +432,59 @@ class BelloController:
         # rewrites the persisted project config, matching the other run settings.
         self.completion_review = completion_review
         self.project_config = project_config
-        self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
-        self.client = client or AppServerClient(
-            cwd=self.project_root,
-            notification_handler=self._on_notification,
-            server_request_handler=self._on_server_request,
-            transport_error_handler=self._on_transport_error,
+        configured_context_mode = project_config.context_mode if project_config is not None else False
+        self.context_mode_enabled = configured_context_mode if context_mode_enabled is None else context_mode_enabled
+        self.keep_context_mode_data = keep_context_mode_data
+        self.context_mode_debug = context_mode_debug
+        self.context_native_runtime = context_native_runtime
+        self.context_sandbox_backend = context_sandbox_backend
+        self.context_vendor_root = (
+            Path(context_vendor_root).resolve(strict=False)
+            if context_vendor_root is not None
+            else (Path(__file__).resolve().parent / "_vendor" / "context_mode")
         )
+        self.context_toolchain_roots = tuple(Path(path).resolve(strict=False) for path in context_toolchain_roots)
+        self.context_runtime: PreparedContextMode | None = None
+        self.context_binding_store = None
+        self.context_capability_store = None
+        self.provider_token_gauges = ProviderTokenGaugeBook()
+        self._provider_logical_roles: dict[ProviderThreadKey, str] = {}
+        self._provider_token_sample_sequence = 0
+        self._coder_context_thread_id: str | None = None
+        self._coder_context_input_tokens: int | None = None
+        self._coder_context_compaction_baseline_tokens: int | None = None
+        self._coder_context_compactions_completed = 0
+        self._coder_context_awaiting_post_compaction_sample = False
+        self._coder_context_compaction_pending = False
+        self._coder_context_compaction_in_progress = False
+        self._coder_context_compaction_interrupt_turn_id: str | None = None
+        self._coder_context_compaction_turn_ids: set[str] = set()
+        self._coder_transition_lock = asyncio.Lock()
+        self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
+        self._shutdown_signal = asyncio.Event()
+        if client is not None and (coder_client is not None or supervisor_client is not None):
+            raise ValueError("client cannot be combined with coder_client or supervisor_client")
+        self._legacy_shared_client = client is not None
+        if client is not None:
+            # Compatibility for embedders that supplied a single fake transport.
+            # Production never takes this branch.
+            self.coder_client = client
+            self.supervisor_client = client
+        else:
+            self.coder_client = coder_client or AppServerClient(
+                role=ClientRole.CODER,
+                launch_cwd=self.project_root,
+                notification_handler=self._on_coder_notification,
+                server_request_handler=self._on_coder_server_request,
+                transport_error_handler=self._on_coder_transport_error,
+            )
+            self.supervisor_client = supervisor_client or AppServerClient(
+                role=ClientRole.SUPERVISOR,
+                launch_cwd=self.project_root,
+                notification_handler=self._on_supervisor_notification,
+                server_request_handler=self._on_supervisor_server_request,
+                transport_error_handler=self._on_supervisor_transport_error,
+            )
         self.tui = tui or TerminalTUI()
         self.supervisor: StatelessSupervisorAgent | None = None
         self.completion_supervisor: StatelessSupervisorAgent | None = None
@@ -328,7 +494,24 @@ class BelloController:
         )
         self.runtime_triage_reviewer: CheapRuntimeReviewer | None = None
         self.coder: CoderSession | None = None
-        self.pending_approvals: dict[int | str, ApprovalContext] = {}
+        self.pending_approvals: dict[PendingRequestKey | int | str, ApprovalContext] = {}
+        self._context_approval_capabilities: dict[PendingRequestKey, str] = {}
+        self._context_capability_by_item: dict[tuple[str, str, str], str] = {}
+        self._context_pending_approval_calls: dict[
+            tuple[str, str, str], PendingContextApprovalCall
+        ] = {}
+        self._context_approval_item_by_request: dict[
+            PendingRequestKey, tuple[str, str, str]
+        ] = {}
+        self._context_approval_correlation_issues: dict[PendingRequestKey, str] = {}
+        self._context_purge_lease: ExclusiveWorkspaceLease | None = None
+        self._context_purge_logical_key: tuple[str, str, str] | None = None
+        self._context_purge_request_key: PendingRequestKey | None = None
+        self._context_call_start_revision: dict[tuple[str, str, str], int] = {}
+        self._active_workspace_mutations: dict[tuple[str, str, str], int] = {}
+        self._overlapped_workspace_mutations: set[tuple[str, str, str]] = set()
+        self._workspace_mutation_terminals: dict[tuple[str, str, str], tuple[int, bool]] = {}
+        self._workspace_revision = 0
         self.last_coder_message: CoderMessage | None = None
         self.validations: list[ValidationRun] = []
         self.inspections: list[InspectionRun] = []
@@ -384,12 +567,19 @@ class BelloController:
     async def run(self) -> None:
         self.initialize_state()
         try:
-            await self.client.start()
-            await self.client.initialize()
+            # The disposable coder workspace and role configuration are fixed
+            # before either app-server can discover project/user extensions.
+            self._prepare_run_layout()
+            self._prepare_coder_workspace()
+            self._bind_role_client_paths()
+            await self._prepare_role_homes_and_context()
+            await self._start_role_clients()
+            # Effective config/catalog verification must precede every thread,
+            # including the supervisor structured-output self-test.
+            await self._preflight_context_app_server_boundary()
             await self.tui.start()
             self.running = True
             self.tui.render("SYSTEM", self._runtime_settings_summary())
-            self._prepare_coder_workspace()
             if self._adversary_enabled_for_config() and not self._effective_completion_review():
                 self.tui.render(
                     "SYSTEM",
@@ -399,7 +589,7 @@ class BelloController:
             if not self.running:
                 return
             self.supervisor = StatelessSupervisorAgent(
-                self.client,
+                self.supervisor_client,
                 self.store,
                 self.task_path,
                 workspace_root=self._active_workspace_root(),
@@ -407,9 +597,10 @@ class BelloController:
                 model=self._runtime_model(),
                 fast=self._fast_mode(),
                 intelligence=self._runtime_intelligence(),
+                on_thread_start=self._mark_supervisor_thread_started,
             )
             self.completion_supervisor = StatelessSupervisorAgent(
-                self.client,
+                self.supervisor_client,
                 self.store,
                 self.task_path,
                 workspace_root=self._active_workspace_root(),
@@ -417,6 +608,7 @@ class BelloController:
                 model=self._completion_model(),
                 fast=self._fast_mode(),
                 intelligence=self._completion_intelligence(),
+                on_thread_start=self._mark_supervisor_thread_started,
             )
             self.approvals = ApprovalManager(
                 self._active_workspace_root(),
@@ -425,15 +617,22 @@ class BelloController:
                 immutable_paths=self._immutable_approval_paths(),
             )
             self.coder = CoderSession(
-                self.client,
+                self.coder_client,
                 self.store,
                 self._active_workspace_root(),
                 self._active_task_path(),
                 model=self._coder_model(),
                 fast=self._fast_mode(),
                 intelligence=self._coder_intelligence(),
+                context_binding=self._active_coder_binding_snapshot(),
+                thread_id=getattr(self, "_preflight_coder_thread_id", None),
+                on_thread_start=self._mark_coder_thread_started,
             )
-            await self.coder.start_thread()
+            if self.coder.thread_id is not None:
+                self._mark_coder_thread_started(self.coder.thread_id)
+            if self.coder.thread_id is None:
+                await self.coder.start_thread()
+                await self._claim_context_provider_thread(self.coder.thread_id)
             self._coder_started = True
             await self.coder.start_initial_turn()
             self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
@@ -441,20 +640,552 @@ class BelloController:
             await self.event_loop()
         except (AppServerError, SupervisorAgentError) as exc:
             await self.fail_provider(f"app-server RPC failed: {exc}")
-        except WorkspaceSnapshotError as exc:
+        except (WorkspaceSnapshotError, ContextModeDataError, OSError, RuntimeError) as exc:
             await self.fail_provider(f"run infrastructure failed: {exc}")
         finally:
             self.running = False
             await self._stop_supervisor_task()
             snapshot = getattr(self, "_coder_snapshot", None)
+            snapshot_pending = snapshot is not None and not getattr(self, "_snapshot_patch_applied", False)
+            if snapshot_pending and getattr(self, "_coder_started", False):
+                try:
+                    await self._quiesce_coder_before_snapshot("unhandled_shutdown")
+                except Exception as exc:
+                    # Stopping every role client below is the final writer
+                    # barrier.  Preserve only if that barrier succeeds.
+                    self._append_cleanup_error(
+                        cleanup_kind="unhandled_snapshot_quiesce",
+                        thread_id=getattr(getattr(self, "coder", None), "thread_id", None) or "unknown",
+                        turn_id=getattr(getattr(self, "coder", None), "active_turn_id", None),
+                        error=exc,
+                    )
+            await self.tui.stop()
+            # Snapshot preservation is a read of mutable run data.  Stop the
+            # coder, native Context tree and supervisor first, even when normal
+            # terminal cleanup was interrupted midway.
+            await self._stop_role_clients()
+            if snapshot_pending and getattr(self, "_coder_started", False) and not getattr(
+                self, "_coder_quiesced_for_snapshot", False
+            ):
+                snapshot.mark_quiesced()
+                self._coder_quiesced_for_snapshot = True
             if snapshot is not None and not getattr(self, "_snapshot_patch_applied", False):
                 if getattr(self, "_coder_started", False):
                     await self._preserve_snapshot_for_recovery(snapshot, reason="unhandled_shutdown")
                 else:
                     snapshot.cleanup()
                     self._coder_snapshot = None
-            await self.tui.stop()
-            await self.client.stop()
+            self._cleanup_run_layout()
+
+    def _prepare_run_layout(self) -> None:
+        if self.run_root is not None:
+            return
+        run_id = secrets.token_hex(16)
+        base = Path(tempfile.gettempdir()).resolve(strict=True)
+        if _paths_overlap(base, self.project_root):
+            base = Path("/tmp").resolve(strict=True)
+        run_root = Path(tempfile.mkdtemp(prefix=f"bello-run-{run_id}-", dir=base)).resolve(strict=True)
+        if _paths_overlap(run_root, self.project_root):
+            shutil.rmtree(run_root, ignore_errors=True)
+            raise WorkspaceSnapshotError("Bello run root must be outside the source project tree")
+        os.chmod(run_root, 0o700)
+        for name in (
+            "control-cwd-coder",
+            "control-cwd-supervisor",
+            "codex-home-coder",
+            "codex-home-supervisor",
+            "app-server-home-coder",
+            "app-server-home-supervisor",
+            "app-server-tmp-coder",
+            "app-server-tmp-supervisor",
+            "context-mode",
+            "context-mode-home",
+            "context-mode-tmp",
+            "bootstrap",
+            "runtime-metadata",
+        ):
+            path = run_root / name
+            path.mkdir(mode=0o700)
+        for role in ("coder", "supervisor"):
+            home = run_root / f"app-server-home-{role}"
+            (home / ".config").mkdir(mode=0o700)
+            (home / ".cache").mkdir(mode=0o700)
+        self.run_id = run_id
+        self.run_root = run_root
+        self.workspace_id = secrets.token_hex(16)
+        self.context_session_id = secrets.token_hex(24)
+        self.provider_token_gauges = ProviderTokenGaugeBook(
+            run_root / "runtime-metadata" / "provider-token-gauges.json"
+        )
+        self.context_integration = ContextModeIntegration(
+            redaction_authority_key=secrets.token_bytes(32),
+            telemetry=AuthoritySeparatedCounters(
+                run_root / "runtime-metadata" / "context-telemetry.json"
+            ),
+        )
+        self.store.update_bello_config(
+            lambda cfg: cfg.model_copy(
+                update={
+                    "run_id": run_id,
+                    "workspace_id": self.workspace_id,
+                    "context_session_id": self.context_session_id,
+                }
+            )
+        )
+
+    def _bind_role_client_paths(self) -> None:
+        run_root = self.run_root
+        if run_root is None:
+            return
+        if isinstance(self.coder_client, AppServerClient):
+            self.coder_client.launch_cwd = (run_root / "control-cwd-coder").resolve()
+            self.coder_client.cwd = self.coder_client.launch_cwd
+            self.coder_client.codex_home = (run_root / "codex-home-coder").resolve()
+            self.coder_client.environment_overrides.update(
+                _role_app_server_environment_overrides(run_root, "coder")
+            )
+        if isinstance(self.supervisor_client, AppServerClient):
+            self.supervisor_client.launch_cwd = (run_root / "control-cwd-supervisor").resolve()
+            self.supervisor_client.cwd = self.supervisor_client.launch_cwd
+            self.supervisor_client.codex_home = (run_root / "codex-home-supervisor").resolve()
+            self.supervisor_client.environment_overrides.update(
+                _role_app_server_environment_overrides(run_root, "supervisor")
+            )
+
+    async def _prepare_role_homes_and_context(self) -> None:
+        """Generate clean role homes and, when enabled, start the broker first.
+
+        Injected transports used by embedders/tests do not execute Codex config
+        discovery and retain the legacy setup contract.  Production transports
+        must be two distinct ``AppServerClient`` instances; there is no shared-
+        process or unverified-sandbox fallback for Context Mode.
+        """
+
+        if not self._uses_production_role_clients():
+            if self.context_mode_enabled:
+                raise ContextModeStartupError(
+                    "Context Mode requires two distinct production AppServerClient transports; "
+                    "shared or injected transports cannot enforce coder-only isolation"
+                )
+            return
+        run_root = self.run_root
+        if run_root is None:
+            raise ContextModeStartupError("run layout was not prepared")
+        auth_source = self._codex_auth_source()
+        supervisor_home = generate_supervisor_home(
+            run_root / "codex-home-supervisor",
+            auth_source=auth_source,
+        )
+        check_generated_role_home(
+            supervisor_home.root,
+            expected_role=ContextRole.SUPERVISOR,
+            expected_context_mode_enabled=False,
+        ).require_passed()
+
+        if not self.context_mode_enabled:
+            coder_home = generate_plain_coder_home(
+                run_root / "codex-home-coder",
+                auth_source=auth_source,
+            )
+            check_generated_role_home(
+                coder_home.root,
+                expected_role=ContextRole.CODER,
+                expected_context_mode_enabled=False,
+            ).require_passed()
+            return
+
+        if self._coder_snapshot is None:
+            raise ContextModeStartupError(
+                "Context Mode requires Bello's external writable workspace snapshot; "
+                "read-only/danger-full-access coder modes are not eligible"
+            )
+
+        coder_process_epoch, app_server_instance_id = self.coder_client.reserve_next_identity()
+        cfg = self.store.get_bello_config()
+        generation_lease_id = new_generation_lease_id()
+        native_runtime = self.context_native_runtime
+        if native_runtime is None:
+            # Production resolves only the release-pinned, signed platform
+            # authority.  Source checkouts with no payload fail here; there is
+            # deliberately no Python sandbox or unsigned adapter fallback.
+            from supervisor.context_mode.native_release import load_bundled_native_runtime
+
+            native_runtime = load_bundled_native_runtime(
+                vendor_root=self.context_vendor_root,
+            )
+            self.context_native_runtime = native_runtime
+        if self.context_sandbox_backend is not None:
+            backend = self.context_sandbox_backend
+        else:
+            verify_backend = getattr(native_runtime, "verify_sandbox_backend", None)
+            backend = (
+                await _maybe_await(verify_backend())
+                if callable(verify_backend)
+                else detect_sandbox_backend()
+            )
+        base_config_digest = digest_json(
+            {
+                "project_config": self._project_config_for_persistence().to_json_data(),
+                "canonical_task_sha256": self._canonical_task_hash,
+                "coder_model": self._coder_model(),
+                "coder_intelligence": self._coder_intelligence(),
+            }
+        )
+        workspace = self._active_workspace_root().resolve(strict=True)
+        protected_roots = (
+            self.project_root,
+            run_root / "codex-home-coder",
+            run_root / "codex-home-supervisor",
+            run_root / "runtime-metadata",
+        )
+        runtime = await prepare_context_mode(
+            run_root=run_root,
+            workspace=workspace,
+            run_id=self.run_id or "",
+            workspace_id=self.workspace_id or "",
+            context_session_id=self.context_session_id or "",
+            base_config_digest=base_config_digest,
+            coder_generation=cfg.generation,
+            coder_process_epoch=coder_process_epoch,
+            app_server_instance_id=app_server_instance_id,
+            generation_lease_id=generation_lease_id,
+            vendor_root=self.context_vendor_root,
+            backend=backend,
+            native_runtime=native_runtime,
+            protected_roots=protected_roots,
+            toolchain_roots=self.context_toolchain_roots,
+            immutable_workspace_paths=(
+                workspace / self._coder_snapshot.task_relative_path,
+            ),
+            readonly_dependency_roots=tuple(
+                workspace / relative
+                for relative in self._coder_snapshot.readonly_dependency_paths
+            ),
+            workspace_masked_paths=tuple(
+                workspace / relative
+                for relative in self._coder_snapshot.protected_path_masks
+            ),
+            receipt_handler=self.context_integration.publish_receipt,
+        )
+        self.context_runtime = runtime
+        self.context_binding_store = runtime.binding_store
+        self.context_capability_store = runtime.capability_store
+        # The same platform authority applies distinct pre-exec role profiles;
+        # app-server itself retains provider network and is never wrapped in the
+        # stricter offline Context command sandbox.
+        self.coder_client.process_launcher = runtime.native_runtime.launch_app_server
+        self.supervisor_client.process_launcher = runtime.native_runtime.launch_app_server
+        binding = runtime.binding
+        self.store.update_bello_config(
+            lambda current: current.model_copy(
+                update={
+                    "context_state_epoch": binding.lifecycle.context_state_epoch,
+                    "context_binding_version": binding.lifecycle.binding_version,
+                    "coder_generation_lease_id": binding.lifecycle.generation_lease_id,
+                    "coder_process_epoch": binding.lifecycle.coder_process_epoch,
+                }
+            )
+        )
+        coder_home = generate_coder_home(
+            run_root / "codex-home-coder",
+            auth_source=auth_source,
+            launcher_path=runtime.endpoint.launcher_path,
+            mcp_bootstrap_path=runtime.bootstraps.mcp,
+            workspace=workspace,
+            hook_bootstraps=runtime.bootstraps.hooks,
+        )
+        check_generated_role_home(
+            coder_home.root,
+            expected_role=ContextRole.CODER,
+            expected_context_mode_enabled=True,
+        ).require_passed()
+
+    def _uses_production_role_clients(self) -> bool:
+        return (
+            isinstance(self.coder_client, AppServerClient)
+            and isinstance(self.supervisor_client, AppServerClient)
+            and self.coder_client is not self.supervisor_client
+        )
+
+    @staticmethod
+    def _codex_auth_source() -> Path | None:
+        configured = os.environ.get("CODEX_HOME")
+        source_home = Path(configured).expanduser() if configured else Path.home() / ".codex"
+        candidate = source_home / "auth.json"
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            return None
+        return candidate
+
+    def _active_coder_binding_snapshot(self) -> CoderContextBindingSnapshot | None:
+        store = getattr(self, "context_binding_store", None)
+        if store is None:
+            return None
+        return CoderContextBindingSnapshot.from_context_binding(store.load())
+
+    async def _claim_context_provider_thread(self, thread_id: str | None) -> None:
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is None:
+            return
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ContextModeStartupError("coder thread did not provide an identity for Context Mode claim")
+        current = runtime.binding
+        claimed = await runtime.transition_binding(
+            expected_version=current.binding_version,
+            reason=TransitionReason.THREAD_CLAIM,
+            provider_thread_id=thread_id,
+        )
+        if self.coder is not None:
+            self.coder.context_binding = CoderContextBindingSnapshot.from_context_binding(claimed)
+        self.store.update_bello_config(
+            lambda cfg: cfg.model_copy(
+                update={
+                    "context_binding_version": claimed.binding_version,
+                    "coder_thread_id": thread_id,
+                }
+            )
+        )
+        # THREAD_CLAIM rewrites binding-bound MCP/hook bootstrap files.  The
+        # earlier pre-thread report is therefore stale by construction; no
+        # initial/recovery turn may begin until the native boundary re-attests
+        # the current binding version and exact file digests.
+        await self._preflight_context_app_server_boundary()
+
+    def _publish_context_telemetry(self) -> None:
+        integration = getattr(self, "context_integration", None)
+        if integration is None:
+            raise ContextModeStartupError(
+                "Context lifecycle telemetry is unavailable for an active runtime"
+            )
+        snapshot = integration.telemetry.snapshot()
+        self.store.update_runtime_metrics(
+            lambda current: {
+                **current,
+                **{
+                    metric: value
+                    for namespace in snapshot.values()
+                    for metric, value in namespace.items()
+                },
+                "context_mode_metric_authorities": snapshot,
+            }
+        )
+
+    async def _checkpoint_context_runtime(
+        self,
+        *,
+        reason: str,
+        transition: str,
+        recovery_kind: CheckpointRecoveryKind | None,
+    ) -> CheckpointCursor:
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is None:
+            raise ContextModeStartupError("Context lifecycle checkpoint has no active runtime")
+        cursor = await runtime.checkpoint(
+            reason=reason,
+            transition=transition,
+            recovery_kind=recovery_kind,
+            timeout_seconds=30.0,
+        )
+        if not isinstance(cursor, CheckpointCursor):
+            runtime.coordinator.mark_failed()
+            raise ContextModeStartupError(
+                "native lifecycle checkpoint returned no verified cursor"
+            )
+        if recovery_kind is CheckpointRecoveryKind.COMPACTION:
+            integration = getattr(self, "context_integration", None)
+            if integration is None:
+                runtime.coordinator.mark_failed()
+                raise ContextModeStartupError(
+                    "compaction checkpoint cannot be counted without controller telemetry"
+                )
+            integration.telemetry.increment(
+                "context_mode_compactions_attempted",
+                authority=MetricAuthority.CONTROLLER_OBSERVED,
+                idempotency_key=cursor.checkpoint_id,
+            )
+            self._publish_context_telemetry()
+        return cursor
+
+    async def _recover_context_checkpoint(
+        self,
+        *,
+        checkpoint_id: str,
+        recovery_kind: CheckpointRecoveryKind,
+        exclusive_workspace_lease: ExclusiveWorkspaceLease | None = None,
+    ) -> CheckpointRecoveryResult:
+        """Acknowledge, count once, and only then resume the native runtime."""
+
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is None:
+            raise ContextModeStartupError("Context checkpoint recovery has no active runtime")
+        result = await runtime.recover_checkpoint(
+            checkpoint_id=checkpoint_id,
+            recovery_kind=recovery_kind,
+            timeout_seconds=30.0,
+        )
+        if not isinstance(result, CheckpointRecoveryResult):
+            runtime.coordinator.mark_failed()
+            raise ContextModeStartupError(
+                "native SessionStart recovery returned no verified acknowledgement"
+            )
+        if recovery_kind is CheckpointRecoveryKind.COMPACTION and result.newly_recovered:
+            integration = getattr(self, "context_integration", None)
+            if integration is None:
+                runtime.coordinator.mark_failed()
+                raise ContextModeStartupError(
+                    "compaction recovery cannot be counted without controller telemetry"
+                )
+            integration.telemetry.increment(
+                "context_mode_compactions_recovered",
+                authority=MetricAuthority.CONTROLLER_OBSERVED,
+                idempotency_key=result.cursor.checkpoint_id,
+            )
+            self._publish_context_telemetry()
+        if exclusive_workspace_lease is not None:
+            active_lease = runtime.coordinator.exclusive_workspace_lease
+            if (
+                runtime.coordinator.state is not RuntimeState.QUIESCED
+                or active_lease is None
+                or active_lease.lease_id != exclusive_workspace_lease.lease_id
+                or active_lease.owner != exclusive_workspace_lease.owner
+            ):
+                runtime.coordinator.mark_failed()
+                raise ContextModeStartupError(
+                    "verified checkpoint recovery lost its exclusive bootstrap fence"
+                )
+            await runtime.resume(exclusive_workspace_lease=active_lease)
+        elif runtime.coordinator.state is RuntimeState.QUIESCED:
+            await runtime.resume()
+        return result
+
+    async def _checkpoint_coder_lifecycle_request(
+        self,
+        request: CoderLifecycleCheckpointRequest,
+    ) -> CoderRecoveryContext:
+        """Reject the legacy callback path that cannot gate the next model turn.
+
+        A ``CoderSession`` callback returns before its next ``SessionStart``.
+        Therefore it cannot prove recovery before that session starts a model
+        turn.  The controller lifecycle methods below orchestrate checkpoint,
+        thread start/resume, native acknowledgement, and runtime resume in that
+        order and are the only production entry points.
+        """
+
+        raise ContextModeStartupError(
+            "standalone coder lifecycle checkpoints are disabled: a verified "
+            "SessionStart acknowledgement must precede runtime/model resume"
+        )
+
+    def _cleanup_run_layout(self) -> None:
+        run_root = getattr(self, "run_root", None)
+        if run_root is None:
+            return
+        try:
+            resolved = Path(run_root).resolve(strict=True)
+        except OSError:
+            self.run_root = None
+            return
+        if resolved == self.project_root or _paths_overlap(resolved, self.project_root):
+            raise RuntimeError("refusing to clean a run root that overlaps the source project")
+        if not resolved.name.startswith("bello-run-"):
+            raise RuntimeError("refusing to clean an unrecognized run root")
+        if getattr(self, "keep_context_mode_data", False):
+            # The flag retains only Context state/binding metadata.  Generated
+            # CODEX_HOME directories may contain copied provider credentials
+            # and must never be retained as a side effect of this debug option.
+            retained = {"context-mode", "runtime-metadata"}
+            for child in resolved.iterdir():
+                if child.name in retained:
+                    continue
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink(missing_ok=True)
+            return
+        shutil.rmtree(resolved)
+        self.run_root = None
+
+    async def _start_role_clients(self) -> None:
+        """Start supervisor first, then coder, rolling back in reverse order."""
+
+        supervisor_started = False
+        try:
+            await self.supervisor_client.start()
+            supervisor_started = True
+            await self.supervisor_client.initialize()
+            if self.coder_client is self.supervisor_client:
+                epoch = int(getattr(self.coder_client, "process_epoch", 0))
+                self.store.update_bello_config(
+                    lambda cfg: cfg.model_copy(
+                        update={"coder_process_epoch": epoch, "supervisor_process_epoch": epoch}
+                    )
+                )
+                return
+            await self.coder_client.start()
+            await self.coder_client.initialize()
+            self._verify_coder_transport_binding()
+            self.store.update_bello_config(
+                lambda cfg: cfg.model_copy(
+                    update={
+                        "coder_process_epoch": int(getattr(self.coder_client, "process_epoch", 0)),
+                        "supervisor_process_epoch": int(getattr(self.supervisor_client, "process_epoch", 0)),
+                    }
+                )
+            )
+        except BaseException:
+            if self.coder_client is not self.supervisor_client:
+                try:
+                    await self.coder_client.stop()
+                except Exception:
+                    pass
+            if supervisor_started:
+                try:
+                    await self.supervisor_client.stop()
+                except Exception:
+                    pass
+            raise
+
+    def _verify_coder_transport_binding(self) -> None:
+        store = getattr(self, "context_binding_store", None)
+        if store is None:
+            return
+        binding = store.load()
+        lifecycle = binding.lifecycle
+        actual_epoch = int(getattr(self.coder_client, "process_epoch", -1))
+        actual_instance = getattr(self.coder_client, "app_server_instance_id", None)
+        if (
+            actual_epoch != lifecycle.coder_process_epoch
+            or actual_instance != lifecycle.app_server_instance_id
+        ):
+            raise ContextModeStartupError(
+                "coder app-server origin does not match the pre-bound Context Mode process lease"
+            )
+
+    async def _stop_role_clients(self) -> None:
+        """Coder is stopped before the supervisor, which remains last owner."""
+
+        if self.coder_client is self.supervisor_client:
+            await self.coder_client.stop()
+            await self._stop_context_runtime()
+            return
+        try:
+            await self.coder_client.stop()
+        finally:
+            try:
+                await self._stop_context_runtime()
+            finally:
+                await self.supervisor_client.stop()
+
+    async def _stop_context_runtime(self) -> None:
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is None:
+            return
+        await runtime.stop(timeout_seconds=30.0)
+        # Clear the handle only after the native authority has returned the
+        # exact process-tree reap attestation verified by PreparedContextMode.
+        # A failed stop remains reachable for recovery and blocks patch-back.
+        self.context_runtime = None
 
     def initialize_state(self) -> None:
         project_config = self._project_config_for_persistence()
@@ -492,6 +1223,10 @@ class BelloController:
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=project_config.cheap_runtime,
+            context_mode_enabled=self.context_mode_enabled,
+            context_mode_keep_data=self.keep_context_mode_data,
+            context_mode_debug=self.context_mode_debug,
+            coder_generation_lease_id=secrets.token_urlsafe(32),
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_bello(config, mode=mode)
@@ -552,6 +1287,10 @@ class BelloController:
         snapshot = getattr(self, "_coder_snapshot", None)
         if snapshot is None:
             return None
+        if hasattr(snapshot, "task_control_is_trusted"):
+            if not snapshot.task_control_is_trusted():
+                return "the coder workspace replaced or modified the immutable task copy"
+            return None
         snapshot_task = snapshot.snapshot_root / snapshot.task_relative_path
         if not snapshot_task.is_symlink():
             return "the coder workspace replaced or removed the read-only task link"
@@ -608,6 +1347,7 @@ class BelloController:
             self.project_root,
             self.task_path,
             declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+            run_root=getattr(self, "run_root", None),
         )
         self._coder_snapshot = snapshot
         self.workspace_root = snapshot.snapshot_root
@@ -697,6 +1437,7 @@ class BelloController:
             adversary=self._adversary_enabled_for_config(),
             clean=self.clean_workspace,
             protected_path=tuple(_workspace_display_path(self.project_root, path) for path in self.declared_grading_roots),
+            context_mode=self.context_mode_enabled,
         )
 
     def _runtime_settings_summary(self) -> str:
@@ -723,6 +1464,7 @@ class BelloController:
             f"clean={_format_bool(self.clean_workspace)} "
             f"completion-review={_format_bool(self._effective_completion_review())} "
             f"adversary={_format_bool(self._adversary_enabled_for_config() and self._effective_completion_review())} "
+            f"context-mode={_format_bool(self.context_mode_enabled)} "
             f"protected-path={protected_paths}"
         )
 
@@ -750,19 +1492,35 @@ class BelloController:
 
     async def preflight(self) -> None:
         self.tui.status("checking Codex version")
-        version = _run_probe(["codex", "--version"])[1]
+        probe_ok, raw_version = _run_probe(["codex", "--version"])
+        if not probe_ok:
+            raise RuntimeError(f"codex --version failed: {raw_version}")
         self.tui.status("checking Codex app-server schema")
         schema_hash = await self._generate_schema_hash_async()
+        if getattr(self, "context_runtime", None) is not None:
+            version = _pinned_codex_version_from_output(raw_version)
+            mismatches = []
+            if version != PINNED_CODEX_CLI_VERSION:
+                mismatches.append("version")
+            if schema_hash != PINNED_CODEX_APP_SERVER_SCHEMA_SHA256:
+                mismatches.append("app-server schema")
+            if mismatches:
+                raise ContextModeStartupError(
+                    "Context Mode requires the pinned Codex approval protocol; "
+                    f"mismatch={mismatches!r}"
+                )
+        else:
+            version = raw_version
         self.store.update_bello_config(
             lambda cfg: cfg.model_copy(update={"codex_version": version, "appserver_schema_hash": schema_hash})
         )
         self.tui.status("checking Codex account")
-        account = await self.client.account_read()
+        account = await self.supervisor_client.account_read()
         if account.get("requiresOpenaiAuth") and account.get("account") is None:
             raise RuntimeError("Codex auth missing. Run `codex login` before starting Bello.")
         self.tui.status("checking Codex rate limits")
         try:
-            await self.client.account_rate_limits_read()
+            await self.supervisor_client.account_rate_limits_read()
         except Exception as exc:
             warning = f"Codex rate limit check unavailable; continuing: {exc}"
             self.tui.render("SYSTEM", warning)
@@ -775,8 +1533,23 @@ class BelloController:
                     "error": str(exc),
                 }
             )
+            try:
+                final_report_path = self.store.path(FINAL_REPORT)
+                if not final_report_path.read_text(encoding="utf-8").strip():
+                    self.store.write_final_report(
+                        FinalReport(
+                            task_path=str(self.task_path),
+                            status=BelloStatus.PROVIDER_FAILURE,
+                            result=(
+                                f"{message}; terminal cleanup/reporting also failed: "
+                                f"{exc.__class__.__name__}: {exc}"
+                            ),
+                        )
+                    )
+            except Exception:
+                pass
         self.tui.status("checking available models")
-        models_response = await self.client.model_list()
+        models_response = await self.supervisor_client.model_list()
         self._persist_model_config()
         await self._ensure_selected_models_available(models_response)
         if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
@@ -785,9 +1558,11 @@ class BelloController:
         await self._structured_output_self_test()
         await self._configure_runtime_triage()
         self.tui.status("checking config requirements")
-        await self.client.config_requirements_read()
+        await self.supervisor_client.config_requirements_read()
+        if self.coder_client is not self.supervisor_client:
+            await self.coder_client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
-        thread = await self.client.thread_start(
+        thread = await self.coder_client.thread_start(
             coder_thread_params(self._active_workspace_root(), model=self._coder_model(), fast=self._fast_mode())
         )
         approval_policy = thread.get("approvalPolicy")
@@ -803,7 +1578,157 @@ class BelloController:
         ):
             raise RuntimeError(f"app-server did not accept {expected_sandbox} coder sandbox")
         if isinstance(thread_id, str):
-            await self._cleanup_preflight_probe_thread(thread_id)
+            self._mark_coder_thread_started(thread_id)
+            if self.context_binding_store is not None:
+                # This is the real coder thread.  A disposable probe would let
+                # its SessionStart hook steal the generation's one-time claim.
+                self._preflight_coder_thread_id = thread_id
+                await self._claim_context_provider_thread(thread_id)
+            else:
+                await self._cleanup_preflight_probe_thread(thread_id)
+
+    async def _preflight_context_app_server_boundary(self) -> None:
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is None:
+            return
+        runtime.purge_protocol_attested = False
+        runtime.checkpoint_protocol_attested = False
+
+        def reject(message: str) -> None:
+            runtime.coordinator.mark_failed()
+            raise ContextModeStartupError(message)
+
+        try:
+            report = await _maybe_await(
+                runtime.native_runtime.verify_app_server_boundary(
+                    supervisor_client=self.supervisor_client,
+                    coder_client=self.coder_client,
+                    binding=runtime.binding,
+                )
+            )
+        except BaseException:
+            runtime.coordinator.mark_failed()
+            raise
+        if not isinstance(report, dict):
+            reject("native app-server boundary preflight returned no report")
+        required = {
+            "schema_version",
+            "codex_version",
+            "appserver_schema_hash",
+            "binding_version",
+            "role_sandboxes",
+            "discovery_disabled",
+            "supervisor_context_entries",
+            "coder_context_tools",
+            "coder_hooks",
+            "coder_hook_attestations",
+            "unmanifested_extensions",
+            "approval_correlation_fields",
+            "purge_lifecycle_attestation",
+            "checkpoint_lifecycle_attestation",
+            "doctor",
+        }
+        if frozenset(report) != required:
+            reject("native app-server boundary preflight schema mismatch")
+        try:
+            report_schema_version = require_int(
+                report.get("schema_version"),
+                "boundary schema_version",
+                minimum=1,
+            )
+        except ContextModeDataError:
+            reject("native app-server boundary preflight schema mismatch")
+        if report_schema_version != 3:
+            reject("native app-server boundary preflight schema mismatch")
+        if report.get("codex_version") != PINNED_CODEX_CLI_VERSION:
+            reject("native app-server boundary reports an unpinned Codex version")
+        if report.get("appserver_schema_hash") != PINNED_CODEX_APP_SERVER_SCHEMA_SHA256:
+            reject("native app-server boundary reports an unpinned app-server schema")
+        binding = runtime.binding
+        try:
+            report_binding_version = require_int(
+                report.get("binding_version"),
+                "boundary binding_version",
+                minimum=1,
+            )
+        except ContextModeDataError:
+            reject("app-server boundary report has an invalid binding version")
+        if report_binding_version != binding.binding_version:
+            reject("app-server boundary report belongs to a stale Context binding")
+        if not _strict_json_equal(
+            report.get("role_sandboxes"),
+            {"coder": True, "supervisor": True},
+        ):
+            reject("coder/supervisor role sandbox preflight failed")
+        if not _strict_json_equal(
+            report.get("discovery_disabled"),
+            {"coder": True, "supervisor": True},
+        ):
+            reject("user/project extension discovery is not disabled")
+        if report.get("supervisor_context_entries") != []:
+            reject("supervisor effective config contains Context Mode material")
+        tools = report.get("coder_context_tools")
+        hooks = report.get("coder_hooks")
+        if not isinstance(tools, list) or not isinstance(hooks, list):
+            reject("effective Context tool/hook catalogues are missing")
+        try:
+            validate_exact_tool_catalogue(
+                tools,
+                expected_schema_digests=runtime.bundle.tool_schema_digests,
+            )
+            validate_exact_hook_catalogue(hooks)
+            expected_hook_attestations = runtime.expected_coder_hook_attestations()
+        except ContextModeDataError:
+            runtime.coordinator.mark_failed()
+            raise
+        if not _strict_json_equal(
+            report.get("coder_hook_attestations"),
+            expected_hook_attestations,
+        ):
+            reject("native coder hook launcher/bootstrap attestations do not match generated files")
+        if not _strict_json_equal(
+            report.get("unmanifested_extensions"),
+            {"coder": [], "supervisor": []},
+        ):
+            reject("effective app-server config contains unmanifested extensions")
+        correlation = report.get("approval_correlation_fields")
+        if (
+            not isinstance(correlation, list)
+            or any(not isinstance(field, str) for field in correlation)
+            or tuple(correlation) != PINNED_APPROVAL_CORRELATION_FIELDS
+        ):
+            reject(
+                "pinned Codex/native adapter cannot correlate Context approvals to the exact call"
+            )
+        if not _strict_json_equal(
+            report.get("purge_lifecycle_attestation"),
+            dict(PURGE_LIFECYCLE_ATTESTATION),
+        ):
+            reject(
+                "native broker does not attest exclusive/quiesced ctx_purge lifecycle and receipt ordering"
+            )
+        if not _strict_json_equal(
+            report.get("checkpoint_lifecycle_attestation"),
+            dict(CHECKPOINT_LIFECYCLE_ATTESTATION),
+        ):
+            reject(
+                "native broker does not attest WAL-bound checkpoints and verified "
+                "SessionStart recovery"
+            )
+        doctor = report.get("doctor")
+        if not isinstance(doctor, dict):
+            reject("ctx_doctor returned no structured result")
+        try:
+            check_doctor_result(
+                doctor,
+                expected_policy_digest=binding.lifecycle.sandbox_policy_digest,
+                expected_backend=runtime.backend.name.value,
+            ).require_passed()
+        except ContextModeDataError:
+            runtime.coordinator.mark_failed()
+            raise
+        runtime.purge_protocol_attested = True
+        runtime.checkpoint_protocol_attested = True
 
     async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
         result = _selected_model_availability(
@@ -841,8 +1766,9 @@ class BelloController:
         while self.running:
             event_task = asyncio.create_task(self.event_queue.get())
             input_task = asyncio.create_task(self.tui.input_queue.get())
+            shutdown_task = asyncio.create_task(self._shutdown_signal.wait())
             done, pending = await asyncio.wait(
-                {event_task, input_task},
+                {event_task, input_task, shutdown_task},
                 timeout=CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -854,6 +1780,9 @@ class BelloController:
                 await self._handle_controller_idle_guard()
                 continue
             for done_task in done:
+                if done_task is shutdown_task:
+                    self.running = False
+                    return
                 completed = done_task.result()
                 self._mark_controller_activity()
                 if isinstance(completed, ControllerEvent):
@@ -914,26 +1843,133 @@ class BelloController:
             if event.message is None:
                 return
             message = event.message
+            if not self._event_origin_is_current(event):
+                self.store.append_raw_log(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "late_app_server_event_rejected",
+                        "role": (event.role or message.role or ClientRole.CODER).value,
+                        "process_epoch": event.process_epoch or message.process_epoch,
+                        "app_server_instance_id": event.app_server_instance_id or message.app_server_instance_id,
+                        "method": message.method,
+                    }
+                )
+                return
             if event.kind == "server_request":
-                await self.handle_server_request(message)
+                await self.handle_server_request(message, role=event.role)
             elif event.kind == "notification":
-                await self.handle_notification(message)
+                await self.handle_notification(message, role=event.role)
         except AppServerError as exc:
             await self.fail_provider(f"app-server RPC failed while handling {event.kind}: {exc}")
 
     async def handle_transport_error(self, event: ControllerEvent) -> None:
         message = event.error_message or str(event.error) or "app-server transport error"
-        self._append_event(AppEventSource.APP_SERVER, "appServer/transportError", reason=message)
-        await self.finalize(f"app-server transport error: {message}", status=BelloStatus.PROVIDER_FAILURE)
+        role = event.role or _client_role_from_error(event.error) or ClientRole.CODER
+        if not self._event_origin_is_current(event):
+            return
+        self._append_event(
+            AppEventSource.APP_SERVER,
+            "appServer/transportError",
+            reason=message,
+            client_role=role,
+            process_epoch=event.process_epoch or _process_epoch_from_error(event.error),
+        )
+        coder_client = getattr(self, "coder_client", None)
+        supervisor_client = getattr(self, "supervisor_client", None)
+        if (
+            role is ClientRole.CODER
+            and coder_client is not None
+            and supervisor_client is not None
+            and coder_client is not supervisor_client
+        ):
+            await self.recover_coder_process(message)
+            return
+        await self.finalize(
+            f"{role.value} app-server transport error: {message}",
+            status=BelloStatus.PROVIDER_FAILURE,
+        )
+
+    def _event_origin_is_current(self, event: ControllerEvent) -> bool:
+        role = event.role or (event.message.role if event.message is not None else None) or _client_role_from_error(event.error)
+        if role is None:
+            return True
+        client = self._client_for_role(role)
+        event_epoch = event.process_epoch or (
+            event.message.process_epoch if event.message is not None else _process_epoch_from_error(event.error)
+        )
+        active_epoch = getattr(client, "active_process_epoch", None)
+        if active_epoch is None:
+            # A stopped production transport has no active origin.  Treating
+            # that state as a wildcard would admit late notifications during
+            # recycle or terminal snapshot work.  Injected test transports do
+            # not expose lifecycle identity and retain compatibility behavior.
+            return not isinstance(client, AppServerClient)
+        if not event_epoch:
+            return True
+        if event_epoch != active_epoch:
+            return False
+        expected_instance = getattr(client, "app_server_instance_id", None)
+        event_instance = event.app_server_instance_id or (
+            event.message.app_server_instance_id if event.message is not None else _instance_id_from_error(event.error)
+        )
+        return event_instance is None or expected_instance is None or event_instance == expected_instance
+
+    def _client_for_role(self, role: ClientRole | str) -> AppServerClient:
+        return self.coder_client if ClientRole(role) is ClientRole.CODER else self.supervisor_client
 
     async def fail_provider(self, message: str) -> None:
         if not self.running and self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
-        await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+        # Persist the terminal state before touching a failed/unattested
+        # runtime.  Startup boundary rejection can make quiesce/checkpoint
+        # illegal, and must never leave the durable run status at STARTING.
+        self.store.update_bello_config(
+            lambda cfg: cfg.model_copy(update={"status": BelloStatus.PROVIDER_FAILURE})
+        )
+        failure_record: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "provider_failure",
+            "error": message,
+        }
+        if getattr(self, "context_mode_debug", False):
+            for label, client in (
+                ("coder_app_server_stderr", getattr(self, "coder_client", None)),
+                ("supervisor_app_server_stderr", getattr(self, "supervisor_client", None)),
+            ):
+                stderr_text = getattr(client, "stderr_text", "")
+                if isinstance(stderr_text, str) and stderr_text:
+                    failure_record[label] = stderr_text[-8192:]
+            runtime = getattr(self, "context_runtime", None)
+            native_runtime = getattr(runtime, "native_runtime", None)
+            stderr_capture = getattr(native_runtime, "_stderr_capture", b"")
+            if isinstance(stderr_capture, (bytes, bytearray)) and stderr_capture:
+                failure_record["context_broker_stderr"] = bytes(stderr_capture[-8192:]).decode(
+                    "utf-8", errors="replace"
+                )
+        self.store.append_raw_log(failure_record)
+        try:
+            await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+        except Exception as exc:
+            self.running = False
+            try:
+                await self._prepare_terminal_shutdown(message)
+            except Exception:
+                pass
+            self.store.update_bello_config(
+                lambda cfg: cfg.model_copy(update={"status": BelloStatus.PROVIDER_FAILURE})
+            )
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "provider_failure_finalization_error",
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                }
+            )
 
     async def _cleanup_preflight_probe_thread(self, thread_id: str) -> None:
         try:
-            await self.client.thread_unsubscribe(thread_id)
+            await self.coder_client.thread_unsubscribe(thread_id)
         except Exception as exc:
             self._append_cleanup_error(
                 cleanup_kind="preflight_probe_thread",
@@ -971,8 +2007,63 @@ class BelloController:
             human_message=HumanMessage(text=command.text, sequence=self._sequence),
         )
 
-    async def handle_server_request(self, message: AppServerMessage) -> None:
-        context = normalize_approval_request(message)
+    async def handle_server_request(
+        self,
+        message: AppServerMessage,
+        *,
+        role: ClientRole | None = None,
+    ) -> None:
+        origin_role = role or message.role or ClientRole.CODER
+        origin_epoch = message.process_epoch
+        request_id = message.request_id
+        if request_id is None:
+            raise AppServerError("server request has no JSON-RPC id")
+        pending_key = PendingRequestKey(origin_role, origin_epoch, request_id)
+        context = normalize_approval_request(message).model_copy(
+            update={
+                "client_role": origin_role.value,
+                "process_epoch": origin_epoch,
+                "app_server_instance_id": message.app_server_instance_id,
+                **self._active_context_approval_binding(
+                    message,
+                    origin_role=origin_role,
+                    pending_key=pending_key,
+                ),
+            }
+        )
+        context_approval_issue = self._context_approval_issue(
+            context,
+            message=message,
+            origin_role=origin_role,
+        )
+        if context.request_type is ApprovalRequestType.MCP_TOOL_CALL and context_approval_issue is not None:
+            manager = getattr(self, "approvals", None) or ApprovalManager(
+                self._active_workspace_root(),
+                declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                immutable_paths=self._immutable_approval_paths(),
+            )
+            resolution = manager._deny(context, context_approval_issue)
+            await self._respond_to_origin(message, manager.response_payload(context, resolution), role=origin_role)
+            self._record_approval_metric(decision="decline", from_supervisor=False)
+            self.tui.render("DENIED", f"{resolution.decision}: {resolution.reason}")
+            getattr(self, "_context_approval_item_by_request", {}).pop(pending_key, None)
+            getattr(self, "_context_approval_correlation_issues", {}).pop(pending_key, None)
+            self._append_event(
+                AppEventSource.APPROVAL,
+                "context_mode/approval_correlation_health_violation",
+                thread_id=context.thread_id,
+                turn_id=context.turn_id,
+                item_id=context.item_id,
+                reason=context_approval_issue,
+                client_role=origin_role,
+                process_epoch=message.process_epoch,
+                app_server_instance_id=message.app_server_instance_id,
+            )
+            await self.finalize(
+                f"Context Mode approval correlation health violation: {context_approval_issue}",
+                status=BelloStatus.PROVIDER_FAILURE,
+            )
+            return
         if getattr(self, "_terminal_cleanup_started", False):
             manager = getattr(self, "approvals", None) or ApprovalManager(
                 self._active_workspace_root(),
@@ -980,12 +2071,49 @@ class BelloController:
                 immutable_paths=self._immutable_approval_paths(),
             )
             resolution = manager._deny(context, "terminal state reached")
-            await self.client.respond(context.server_request_id, manager.response_payload(context, resolution))
+            await self._respond_to_origin(message, manager.response_payload(context, resolution), role=origin_role)
+            getattr(self, "_context_approval_item_by_request", {}).pop(pending_key, None)
+            getattr(self, "_context_approval_correlation_issues", {}).pop(pending_key, None)
             self.tui.render("DENIED", f"{resolution.decision}: {resolution.reason}")
             return
-        self.pending_approvals[context.server_request_id] = context
+        purge_lease_acquired = False
+        if (
+            context.request_type is ApprovalRequestType.MCP_TOOL_CALL
+            and context.tool_name == "ctx_purge"
+        ):
+            try:
+                await self._acquire_context_purge_approval_lease(
+                    context,
+                    pending_key=pending_key,
+                )
+                purge_lease_acquired = True
+            except ContextModeDataError as exc:
+                manager = getattr(self, "approvals", None) or ApprovalManager(
+                    self._active_workspace_root(),
+                    declared_grading_roots=getattr(self, "declared_grading_roots", ()),
+                    immutable_paths=self._immutable_approval_paths(),
+                )
+                resolution = manager._deny(
+                    context,
+                    f"ctx_purge exclusive lifecycle lease rejected: {exc}",
+                )
+                await self._respond_to_origin(
+                    message,
+                    manager.response_payload(context, resolution),
+                    role=origin_role,
+                )
+                getattr(self, "_context_approval_item_by_request", {}).pop(
+                    pending_key,
+                    None,
+                )
+                await self.finalize(
+                    f"Context Mode ctx_purge lease failure: {exc}",
+                    status=BelloStatus.PROVIDER_FAILURE,
+                )
+                return
+        self.pending_approvals[pending_key] = context
         self.store.update_bello_config(
-            lambda cfg: cfg.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
+            lambda cfg: cfg.model_copy(update={"pending_server_request_ids": self._persisted_pending_request_keys()})
         )
         self._append_event(
             AppEventSource.APPROVAL,
@@ -1019,16 +2147,76 @@ class BelloController:
             resolution = fallback_manager._deny(context, "approval manager not ready")
             response = fallback_manager.response_payload(context, resolution)
         else:
-            resolution = await self.approvals.decide(context)
+            try:
+                resolution = await self.approvals.decide(context)
+            except BaseException:
+                if purge_lease_acquired:
+                    runtime = getattr(self, "context_runtime", None)
+                    if runtime is not None:
+                        runtime.coordinator.mark_failed()
+                raise
             response = self.approvals.response_payload(context, resolution)
-        await self.client.respond(context.server_request_id, response)
+        if context.request_type is ApprovalRequestType.MCP_TOOL_CALL:
+            # A Codex MCP acceptance is valid for exactly this elicitation.
+            # Never record supervisor text as a reusable decision and never
+            # return response metadata that asks Codex to persist approval.
+            resolution = resolution.model_copy(update={"persistent_decision": None})
+            manager = self.approvals or fallback_manager
+            response = manager.response_payload(context, resolution)
         is_denial = _approval_resolution_is_denial(resolution.decision)
+        if context.request_type is ApprovalRequestType.MCP_TOOL_CALL and not is_denial:
+            if resolution.decision != "accept":
+                manager = self.approvals or fallback_manager
+                resolution = manager._deny(context, "Context Mode approvals must be one-shot, never session-scoped")
+                response = manager.response_payload(context, resolution)
+                is_denial = True
+            else:
+                try:
+                    await self._grant_context_approval_capability(
+                        context,
+                        message=message,
+                        pending_key=pending_key,
+                    )
+                except ContextModeDataError as exc:
+                    manager = self.approvals or fallback_manager
+                    resolution = manager._deny(context, f"Context Mode capability grant rejected: {exc}")
+                    response = manager.response_payload(context, resolution)
+                    is_denial = True
+        try:
+            await self._respond_to_origin(message, response, role=origin_role)
+        except BaseException:
+            if context.request_type is ApprovalRequestType.MCP_TOOL_CALL and not is_denial:
+                capability_store = getattr(self, "context_capability_store", None)
+                capability_map = getattr(self, "_context_approval_capabilities", {})
+                capability_id = capability_map.pop(pending_key, None)
+                if capability_store is not None and capability_id is not None:
+                    capability_store.revoke(capability_id)
+                    self._context_capability_by_item = {
+                        key: value
+                        for key, value in getattr(self, "_context_capability_by_item", {}).items()
+                        if value != capability_id
+                    }
+                    try:
+                        await _maybe_await(
+                            self.context_runtime.native_runtime.revoke_approval_capability(
+                                capability_id=capability_id
+                            )
+                        )
+                    except Exception:
+                        capability_store.revoke_all()
+            if purge_lease_acquired:
+                runtime = getattr(self, "context_runtime", None)
+                if runtime is not None:
+                    runtime.coordinator.mark_failed()
+            raise
         decision_key = _approval_resolution_metric_key(resolution.decision)
         self._record_approval_metric(decision=decision_key, from_supervisor=resolution.from_supervisor)
         self.tui.render("DENIED" if is_denial else "APPROVAL", f"{resolution.decision}: {resolution.reason}")
         if resolution.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {resolution.persistent_decision}\n")
         if is_denial:
+            if purge_lease_acquired:
+                await self._release_context_purge_approval_lease()
             if is_adversary_request:
                 denied_command = (context.command or context.grant_root or context.request_type.value or "").strip()
                 if len(denied_command) > 200:
@@ -1043,7 +2231,7 @@ class BelloController:
                 )
             elif self.coder is not None:
                 try:
-                    await self.coder.steer_or_start(resolution.reason)
+                        await self._steer_coder(resolution.reason)
                 except AppServerError as exc:
                     if not _is_no_active_turn_to_steer_error(exc):
                         raise
@@ -1065,9 +2253,508 @@ class BelloController:
                     )
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
 
+    def _active_context_approval_binding(
+        self,
+        message: AppServerMessage,
+        *,
+        origin_role: ClientRole,
+        pending_key: PendingRequestKey,
+    ) -> dict[str, Any]:
+        """Bind a real Codex elicitation to one already-started Context call.
+
+        Codex deliberately uses a fresh app-server JSON-RPC id for the
+        elicitation.  The only safe bridge to the logical MCP item is therefore
+        its active transport/binding scope plus canonical equality between
+        ``_meta.tool_params`` and the arguments observed on ``item/started``.
+        Presentation text is never inspected.
+        """
+
+        empty = {
+            "binding_version": None,
+            "coder_generation": None,
+            "generation_lease_id": None,
+            "tool_name": None,
+            "canonical_cwd": None,
+            "normalized_arguments_digest": None,
+        }
+        mcp_empty = {
+            **empty,
+            "item_id": None,
+            "approval_id": None,
+            "command": None,
+            "cwd": None,
+            "paths": [],
+            "file_changes": [],
+            "diff": None,
+            "grant_root": None,
+            "network_approval_context": None,
+            "proposed_execpolicy_amendment": None,
+            "proposed_network_policy_amendments": None,
+            "available_decisions": None,
+        }
+        if message.method != MCP_ELICITATION_METHOD:
+            # Non-MCP approvals retain every field produced by the ordinary
+            # normalizer; Context correlation must not erase command/path
+            # policy inputs.
+            return {}
+
+        params = message.params
+        meta = _mcp_approval_meta(params)
+        if meta is None or meta.get(MCP_TOOL_APPROVAL_KIND_KEY) != MCP_TOOL_APPROVAL_KIND:
+            if params.get("serverName") == CONTEXT_SERVER_NAME:
+                issues = getattr(self, "_context_approval_correlation_issues", None)
+                if issues is None:
+                    issues = self._context_approval_correlation_issues = {}
+                issues[pending_key] = (
+                    "Context Mode approval lacks the exact Codex MCP approval kind"
+                )
+                return {
+                    **mcp_empty,
+                    # Classify only for the fail-closed denial/health path; an
+                    # invalid kind can never reach supervisor approval/grant.
+                    "request_type": ApprovalRequestType.MCP_TOOL_CALL,
+                }
+            return {}
+
+        issues = getattr(self, "_context_approval_correlation_issues", None)
+        if issues is None:
+            issues = self._context_approval_correlation_issues = {}
+        issues.pop(pending_key, None)
+
+        def fail(reason: str) -> dict[str, Any]:
+            issues[pending_key] = reason
+            return mcp_empty
+
+        if origin_role is not ClientRole.CODER:
+            return fail("Context Mode approvals are coder-only")
+        if params.get("mode") != "form":
+            return fail("Context Mode MCP approval is not an exact form elicitation")
+        if params.get("serverName") != CONTEXT_SERVER_NAME:
+            return fail("approval does not identify the Bello Context Mode server")
+        thread_id = params.get("threadId")
+        turn_id = params.get("turnId")
+        if not isinstance(thread_id, str) or not thread_id:
+            return fail("Context Mode MCP approval has no exact thread identity")
+        if not isinstance(turn_id, str) or not turn_id:
+            return fail("Context Mode MCP approval has no exact active turn identity")
+        arguments = _mcp_approval_arguments_from_params(params)
+        if not isinstance(arguments, Mapping):
+            return fail("Context Mode approval _meta.tool_params is not an exact JSON object")
+        try:
+            arguments_digest = context_arguments_digest(arguments)
+        except ContextModeDataError:
+            return fail("Context Mode approval _meta.tool_params is not canonical JSON")
+
+        store = getattr(self, "context_binding_store", None)
+        runtime = getattr(self, "context_runtime", None)
+        if store is None or runtime is None:
+            return fail("Context Mode runtime/binding authority is unavailable")
+        try:
+            binding = store.load()
+            canonical_value = context_canonical_cwd(
+                binding.stable.workspace_path,
+                binding.stable.workspace_path,
+            )
+        except (OSError, ValueError, ContextModeDataError):
+            return fail("Context Mode active binding/cwd could not be canonicalized")
+        if runtime.binding != binding:
+            return fail("Context Mode runtime and binding store disagree")
+
+        lifecycle = binding.lifecycle
+        cfg = self.store.get_bello_config()
+        active_comparisons = {
+            "process_epoch": (message.process_epoch, lifecycle.coder_process_epoch),
+            "app_server_instance_id": (
+                message.app_server_instance_id,
+                lifecycle.app_server_instance_id,
+            ),
+            "thread_id": (thread_id, lifecycle.provider_thread_id),
+            "active_thread_id": (thread_id, cfg.coder_thread_id),
+            "active_turn_id": (turn_id, cfg.active_coder_turn_id),
+        }
+        stale = [name for name, (actual, expected) in active_comparisons.items() if actual != expected]
+        if stale:
+            return fail(f"Context Mode approval belongs to a stale call: {stale!r}")
+
+        pending_calls = getattr(self, "_context_pending_approval_calls", None)
+        if pending_calls is None:
+            pending_calls = self._context_pending_approval_calls = {}
+        candidates = [
+            candidate
+            for candidate in pending_calls.values()
+            if candidate.logical_key[:2] == (thread_id, turn_id)
+            and candidate.arguments_digest == arguments_digest
+            and candidate.origin_role is ClientRole.CODER
+            and candidate.process_epoch == message.process_epoch
+            and candidate.app_server_instance_id == message.app_server_instance_id
+            and candidate.binding == binding
+        ]
+        if not candidates:
+            return fail(
+                "Context Mode approval does not match a pending unapproved item/started"
+            )
+        if len(candidates) != 1:
+            return fail(
+                "Context Mode approval ambiguously matches multiple pending item/started calls"
+            )
+        candidate = candidates[0]
+        if candidate.tool_name not in ALLOWED_TOOL_SET:
+            return fail("approval names an unknown or forbidden Context Mode tool")
+        if candidate.logical_key in getattr(self, "_context_capability_by_item", {}):
+            return fail("Context Mode call is already approved")
+        by_request = getattr(self, "_context_approval_item_by_request", None)
+        if by_request is None:
+            by_request = self._context_approval_item_by_request = {}
+        if pending_key in by_request:
+            return fail("Context Mode transport approval id was already correlated")
+
+        # Reserve the unique logical item before any supervisor work.  A second
+        # elicitation can no longer reuse the same unapproved call.
+        pending_calls.pop(candidate.logical_key, None)
+        by_request[pending_key] = candidate.logical_key
+        return {
+            "item_id": candidate.logical_key[2],
+            "approval_id": None,
+            "command": f"{CONTEXT_SERVER_NAME}/{candidate.tool_name}",
+            "cwd": canonical_value,
+            "paths": [],
+            "file_changes": [],
+            "diff": None,
+            "grant_root": None,
+            "network_approval_context": None,
+            "proposed_execpolicy_amendment": None,
+            "proposed_network_policy_amendments": None,
+            "available_decisions": None,
+            "raw_params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "serverName": CONTEXT_SERVER_NAME,
+                "mode": "form",
+                "_meta": {
+                    MCP_TOOL_APPROVAL_KIND_KEY: MCP_TOOL_APPROVAL_KIND,
+                    "tool_params": dict(arguments),
+                },
+            },
+            "binding_version": lifecycle.binding_version,
+            "coder_generation": lifecycle.coder_generation,
+            "generation_lease_id": lifecycle.generation_lease_id,
+            "tool_name": candidate.tool_name,
+            "canonical_cwd": canonical_value,
+            "normalized_arguments_digest": arguments_digest,
+        }
+
+    def _context_approval_issue(
+        self,
+        context: ApprovalContext,
+        *,
+        message: AppServerMessage,
+        origin_role: ClientRole,
+    ) -> str | None:
+        if context.request_type is not ApprovalRequestType.MCP_TOOL_CALL:
+            return None
+        request_id = message.request_id
+        if request_id is None:
+            return "Context Mode MCP approval has no transport request id"
+        pending_key = PendingRequestKey(origin_role, message.process_epoch, request_id)
+        correlation_issue = getattr(
+            self,
+            "_context_approval_correlation_issues",
+            {},
+        ).get(pending_key)
+        if correlation_issue is not None:
+            return correlation_issue
+        runtime = getattr(self, "context_runtime", None)
+        store = getattr(self, "context_binding_store", None)
+        if runtime is None or store is None or getattr(self, "context_capability_store", None) is None:
+            return "Context Mode runtime/capability authority is unavailable"
+        if origin_role is not ClientRole.CODER:
+            return "Context Mode approvals are coder-only"
+        if message.method != MCP_ELICITATION_METHOD:
+            return "Context Mode approval did not use the supported Codex elicitation method"
+        params = message.params
+        meta = _mcp_approval_meta(params)
+        if meta is None or meta.get(MCP_TOOL_APPROVAL_KIND_KEY) != MCP_TOOL_APPROVAL_KIND:
+            return "Context Mode approval lacks the exact Codex MCP approval kind"
+        if params.get("mode") != "form":
+            return "Context Mode MCP approval is not an exact form elicitation"
+        if params.get("serverName") != CONTEXT_SERVER_NAME:
+            return "approval does not identify the Bello Context Mode server"
+        if context.tool_name not in ALLOWED_TOOL_SET:
+            return "approval names an unknown or forbidden Context Mode tool"
+        arguments = _mcp_approval_arguments_from_params(params)
+        if not isinstance(arguments, Mapping):
+            return "Context Mode approval _meta.tool_params is not an exact JSON object"
+        if context.canonical_cwd is None or context.normalized_arguments_digest is None:
+            return "Context Mode approval cwd/arguments could not be canonicalized"
+        try:
+            arguments_digest = context_arguments_digest(arguments)
+            expected_cwd = context_canonical_cwd(
+                runtime.binding.stable.workspace_path,
+                runtime.binding.stable.workspace_path,
+            )
+        except ContextModeDataError:
+            return "Context Mode approval cwd/arguments could not be canonicalized"
+        if arguments_digest != context.normalized_arguments_digest:
+            return "Context Mode approval arguments changed after correlation"
+        if context.canonical_cwd != expected_cwd or context.cwd != expected_cwd:
+            return "Context Mode approval cwd is not the active canonical workspace"
+        binding = store.load()
+        if runtime.binding != binding:
+            return "Context Mode runtime and binding store disagree"
+        lifecycle = binding.lifecycle
+        cfg = self.store.get_bello_config()
+        comparisons = {
+            "process_epoch": (message.process_epoch, lifecycle.coder_process_epoch),
+            "context_process_epoch": (context.process_epoch, lifecycle.coder_process_epoch),
+            "app_server_instance_id": (
+                message.app_server_instance_id,
+                lifecycle.app_server_instance_id,
+            ),
+            "context_app_server_instance_id": (
+                context.app_server_instance_id,
+                lifecycle.app_server_instance_id,
+            ),
+            "binding_version": (context.binding_version, lifecycle.binding_version),
+            "coder_generation": (context.coder_generation, lifecycle.coder_generation),
+            "generation_lease_id": (
+                context.generation_lease_id,
+                lifecycle.generation_lease_id,
+            ),
+            "thread_id": (params.get("threadId"), lifecycle.provider_thread_id),
+            "context_thread_id": (context.thread_id, lifecycle.provider_thread_id),
+            "active_thread_id": (params.get("threadId"), cfg.coder_thread_id),
+            "active_turn_id": (params.get("turnId"), cfg.active_coder_turn_id),
+            "context_turn_id": (context.turn_id, cfg.active_coder_turn_id),
+        }
+        mismatches = [name for name, (actual, expected) in comparisons.items() if actual != expected]
+        if mismatches:
+            return f"Context Mode approval belongs to a stale call: {mismatches!r}"
+        if not isinstance(context.item_id, str) or not context.item_id:
+            return "Context Mode approval has no item identity"
+        logical_key = (context.thread_id or "", context.turn_id or "", context.item_id)
+        correlated = getattr(self, "_context_approval_item_by_request", {}).get(pending_key)
+        if correlated != logical_key:
+            return "Context Mode transport approval id is not bound to this logical item"
+        if context.command != f"{CONTEXT_SERVER_NAME}/{context.tool_name}":
+            return "Context Mode approval command identity is not canonical"
+        return None
+
+    async def _acquire_context_purge_approval_lease(
+        self,
+        context: ApprovalContext,
+        *,
+        pending_key: PendingRequestKey,
+    ) -> ExclusiveWorkspaceLease:
+        """Fence the active workspace before the purge approval decision waits."""
+
+        if context.tool_name != "ctx_purge":
+            raise ContextModeStartupError("exclusive purge lease requested for another tool")
+        if self._context_purge_lease is not None:
+            raise ContextModeStartupError("another ctx_purge lifecycle lease is already pending")
+        logical_key = getattr(self, "_context_approval_item_by_request", {}).get(pending_key)
+        if logical_key is None:
+            raise ContextModeStartupError("ctx_purge approval has no correlated logical call")
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is None:
+            raise ContextModeStartupError("ctx_purge runtime is unavailable")
+        owner = LogicalContextCallKey(
+            ContextClientRole.CODER,
+            logical_key[0],
+            logical_key[1],
+            logical_key[2],
+        ).stable_id
+        lease = await runtime.acquire_purge_lease(owner=owner, timeout_seconds=30.0)
+        self._context_purge_lease = lease
+        self._context_purge_logical_key = logical_key
+        self._context_purge_request_key = pending_key
+        return lease
+
+    async def _release_context_purge_approval_lease(self) -> None:
+        lease = getattr(self, "_context_purge_lease", None)
+        if lease is None:
+            return
+        runtime = getattr(self, "context_runtime", None)
+        try:
+            if runtime is None:
+                raise ContextModeStartupError("ctx_purge runtime disappeared while lease was active")
+            await runtime.resume(exclusive_workspace_lease=lease)
+        finally:
+            self._context_purge_lease = None
+            self._context_purge_logical_key = None
+            self._context_purge_request_key = None
+
+    async def _grant_context_approval_capability(
+        self,
+        context: ApprovalContext,
+        *,
+        message: AppServerMessage,
+        pending_key: PendingRequestKey,
+    ) -> None:
+        issue = self._context_approval_issue(
+            context,
+            message=message,
+            origin_role=pending_key.role,
+        )
+        if issue is not None:
+            raise ContextModeStartupError(issue)
+        tool_name = context.tool_name
+        assert tool_name is not None
+        if tool_name not in CAPABILITY_REQUIRED_TOOLS:
+            # In the all-tools-prompt fallback the read/index/doctor calls remain
+            # capability-free, but still passed every binding check above.
+            return
+        arguments = _mcp_approval_arguments_from_params(message.params)
+        assert isinstance(arguments, Mapping)
+        binding = self.context_binding_store.load()
+        request_key = {
+            "role": "coder",
+            "process_epoch": message.process_epoch,
+            "request_id": message.request_id,
+            "thread_id": context.thread_id,
+            "turn_id": context.turn_id,
+            "item_id": context.item_id,
+            "binding_version": binding.binding_version,
+            "coder_generation": binding.lifecycle.coder_generation,
+            "generation_lease_id": binding.lifecycle.generation_lease_id,
+        }
+        if tool_name == "ctx_purge":
+            purge_lease = getattr(self, "_context_purge_lease", None)
+            if purge_lease is None:
+                raise ContextModeStartupError(
+                    "ctx_purge capability has no exclusive native workspace lease"
+                )
+            leased_binding = self.context_runtime.coordinator.require_exclusive_workspace_lease(
+                purge_lease
+            )
+            if leased_binding != binding:
+                raise ContextModeStartupError(
+                    "ctx_purge capability binding changed after native lease acquisition"
+                )
+            request_key["exclusive_workspace_lease_id"] = purge_lease.lease_id
+            request_key["exclusive_workspace_lease_owner"] = purge_lease.owner
+        batch_children = None
+        if tool_name == "ctx_batch_execute":
+            raw_children = arguments.get("commands")
+            if not isinstance(raw_children, list) or not all(isinstance(child, Mapping) for child in raw_children):
+                raise ContextModeStartupError("ctx_batch_execute approval lacks ordered command children")
+            batch_children = [dict(child) for child in raw_children]
+        capability = self.context_capability_store.grant(
+            binding=binding,
+            process_epoch=message.process_epoch,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            cwd=context.canonical_cwd or "",
+            request_key=request_key,
+            batch_children=batch_children,
+        )
+        native_registered = False
+        try:
+            await _maybe_await(
+                self.context_runtime.native_runtime.register_approval_capability(
+                    capability=capability,
+                    request_key=request_key,
+                )
+            )
+            native_registered = True
+            assert context.thread_id is not None
+            assert context.turn_id is not None
+            assert context.item_id is not None
+            self.context_integration.attach_approval_capability(
+                logical_key=LogicalContextCallKey(
+                    ContextClientRole.CODER,
+                    context.thread_id,
+                    context.turn_id,
+                    context.item_id,
+                ),
+                capability_id=capability.capability_id,
+                tool_name=tool_name,
+                arguments_digest=context.normalized_arguments_digest or "",
+                active_binding=binding,
+            )
+        except Exception as exc:
+            self.context_capability_store.revoke(capability.capability_id)
+            if native_registered:
+                try:
+                    await _maybe_await(
+                        self.context_runtime.native_runtime.revoke_approval_capability(
+                            capability_id=capability.capability_id,
+                        )
+                    )
+                except Exception:
+                    pass
+            raise ContextModeStartupError(
+                f"approval capability binding was rejected: {exc.__class__.__name__}"
+            ) from exc
+        capability_map = getattr(self, "_context_approval_capabilities", None)
+        if capability_map is None:
+            capability_map = self._context_approval_capabilities = {}
+        capability_map[pending_key] = capability.capability_id
+        assert context.thread_id is not None and context.turn_id is not None and context.item_id is not None
+        capability_by_item = getattr(self, "_context_capability_by_item", None)
+        if capability_by_item is None:
+            capability_by_item = self._context_capability_by_item = {}
+        capability_by_item[
+            (context.thread_id, context.turn_id, context.item_id)
+        ] = capability.capability_id
+
+    async def _respond_to_origin(
+        self,
+        message: AppServerMessage,
+        response: Any,
+        *,
+        role: ClientRole,
+    ) -> None:
+        client = self._client_for_role(role)
+        request_id = message.request_id
+        if request_id is None:
+            raise AppServerError("cannot respond to a server request without an id")
+        if isinstance(client, AppServerClient):
+            await client.respond(
+                request_id,
+                response,
+                process_epoch=message.process_epoch or None,
+                app_server_instance_id=message.app_server_instance_id,
+            )
+        else:
+            await client.respond(request_id, response)
+
+    def _persisted_pending_request_keys(self) -> list[str | int]:
+        values: list[str | int] = []
+        for key in self.pending_approvals:
+            if isinstance(key, PendingRequestKey):
+                values.append(f"{key.role.value}:{key.process_epoch}:{key.request_id}")
+            elif isinstance(key, (str, int)):
+                values.append(key)
+        return values
+
     def _is_adversary_approval_context(self, context: ApprovalContext) -> bool:
         thread_id = getattr(self, "_active_adversary_thread_id", None)
         return bool(thread_id and context.thread_id == thread_id)
+
+    def _context_approval_wake_summary(
+        self,
+        context: ApprovalContext,
+    ) -> RedactedSummary | None:
+        if context.request_type is not ApprovalRequestType.MCP_TOOL_CALL:
+            return None
+        if context.tool_name not in ALLOWED_TOOL_SET:
+            raise ContextModeDataError(
+                "supervisor approval context names an unsupported Context Mode tool"
+            )
+        arguments = _mcp_approval_arguments_from_params(context.raw_params)
+        if not isinstance(arguments, Mapping):
+            raise ContextModeDataError(
+                "supervisor approval context lacks exact Context Mode arguments"
+            )
+        integration = getattr(self, "context_integration", None)
+        if integration is None:
+            raise ContextModeDataError(
+                "supervisor approval context has no redaction authority"
+            )
+        return integration.bounded_evidence_summary(
+            {"tool": context.tool_name, "arguments": dict(arguments)},
+            maximum_bytes=8 * 1024,
+        )
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
         if self.supervisor is None:
@@ -1076,7 +2763,12 @@ class BelloController:
         cfg = self.store.get_bello_config()
         wake_sequence = cfg.last_event_sequence + 1
         origin = "adversary_snapshot" if self._is_adversary_approval_context(context) else "coder"
-        approval_context = _approval_wake_context(context, reason, origin=origin)
+        approval_context = _approval_wake_context(
+            context,
+            reason,
+            origin=origin,
+            context_summary=self._context_approval_wake_summary(context),
+        )
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
             current_summary=f"Approval request needs judgment: {reason}",
@@ -1088,6 +2780,7 @@ class BelloController:
                     pending,
                     reason if pending.server_request_id == context.server_request_id else None,
                     origin="adversary_snapshot" if self._is_adversary_approval_context(pending) else "coder",
+                    context_summary=self._context_approval_wake_summary(pending),
                 )
                 for pending in self.pending_approvals.values()
             ],
@@ -1100,7 +2793,13 @@ class BelloController:
         )
         return await self.supervisor.decide(packet)
 
-    async def handle_notification(self, message: AppServerMessage) -> None:
+    async def handle_notification(
+        self,
+        message: AppServerMessage,
+        *,
+        role: ClientRole | None = None,
+    ) -> None:
+        origin_role = role or message.role or ClientRole.CODER
         params = message.params
         method = message.method or "notification"
         thread_id = params.get("threadId")
@@ -1109,17 +2808,80 @@ class BelloController:
         if _is_stream_delta_method(method):
             self._record_command_output_delta(method, params, item_id=item_id)
             return
-        self._append_event(AppEventSource.APP_SERVER, method, thread_id=thread_id, turn_id=turn_id, item_id=item_id)
+        self._append_event(
+            AppEventSource.APP_SERVER,
+            method,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item_id,
+            client_role=origin_role,
+            process_epoch=message.process_epoch,
+            app_server_instance_id=message.app_server_instance_id,
+        )
+        if method == "thread/tokenUsage/updated":
+            self._record_provider_token_usage(
+                origin_role,
+                params,
+                process_epoch=message.process_epoch,
+                app_server_instance_id=message.app_server_instance_id,
+            )
+            if origin_role is ClientRole.CODER:
+                await self._maybe_compact_coder_context()
+            return
         if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
             return
 
         cfg = self.store.get_bello_config()
+        item = params.get("item")
+        mutation_key = _logical_item_tuple(params)
+        if method == "item/started" and _item_may_mutate_workspace(item):
+            self._begin_workspace_mutation(mutation_key)
         if method == "serverRequest/resolved":
-            request_id = params.get("requestId")
+            request_id = require_json_rpc_id(
+                params.get("requestId"),
+                field="serverRequest/resolved requestId",
+            )
+            resolved_key = PendingRequestKey(origin_role, message.process_epoch, request_id)
+            self.pending_approvals.pop(resolved_key, None)
+            getattr(self, "_context_approval_capabilities", {}).pop(resolved_key, None)
+            getattr(self, "_context_approval_item_by_request", {}).pop(resolved_key, None)
+            getattr(self, "_context_approval_correlation_issues", {}).pop(resolved_key, None)
+            # Compatibility for persisted/test state written before role-scoped keys.
             self.pending_approvals.pop(request_id, None)
             self.store.update_bello_config(
-                lambda current: current.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
+                lambda current: current.model_copy(
+                    update={"pending_server_request_ids": self._persisted_pending_request_keys()}
+                )
             )
+            return
+        context_outcome: ContextIntegrationOutcome | None = None
+        if _is_bello_context_mode_item(params.get("item")):
+            context_outcome = self._normalize_context_mode_notification(
+                message,
+                origin_role=origin_role,
+            )
+            if context_outcome.health_violation:
+                if (
+                    origin_role is ClientRole.CODER
+                    and method == "item/completed"
+                    and context_outcome.action_counted
+                ):
+                    self._current_turn_action_count = getattr(self, "_current_turn_action_count", 0) + 1
+                    self.store.append_recent_action(_item_summary(params.get("item")))
+                await self.finalize(
+                    "Context Mode protocol/role health violation: "
+                    + ", ".join(context_outcome.protocol_issues or ("unknown",)),
+                    status=BelloStatus.PROVIDER_FAILURE,
+                )
+                return
+            if method == "item/started":
+                return
+        if origin_role is ClientRole.SUPERVISOR:
+            if _is_bello_context_mode_item(item):
+                await self.finalize(
+                    "supervisor app-server exposed Context Mode; role isolation health violation",
+                    status=BelloStatus.PROVIDER_FAILURE,
+                )
             return
         if method == "turn/started" and thread_id == cfg.coder_thread_id and isinstance(turn_id, str):
             if self.coder:
@@ -1131,7 +2893,6 @@ class BelloController:
             return
         if method == "item/completed" and thread_id == cfg.coder_thread_id:
             summary = _item_summary(params.get("item"))
-            item = params.get("item")
             if isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                 text = item["text"].strip()
                 if text:
@@ -1139,9 +2900,19 @@ class BelloController:
                 self.tui.render("CODER", text)
                 return
             if _is_completed_action(item):
+                if context_outcome is not None and not context_outcome.action_counted:
+                    return
                 self._current_turn_action_count = getattr(self, "_current_turn_action_count", 0) + 1
                 self.store.append_recent_action(summary)
                 triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=summary)
+                if context_outcome is not None:
+                    triggering_action = self._context_triggering_action(
+                        context_outcome,
+                        item_id=item_id,
+                        summary=summary,
+                    )
+                elif _action_may_mutate_workspace(triggering_action):
+                    self._complete_workspace_mutation(mutation_key)
                 repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_action")
                 self._record_changed_files(triggering_action)
                 declared_grading_issue = self._declared_grading_access_issue(triggering_action)
@@ -1171,11 +2942,26 @@ class BelloController:
                     item=validation_item,
                 )
                 validation_trigger_reasons: tuple[str, ...] = ()
+                context_validations: list[ValidationRun] = []
+                if context_outcome is not None:
+                    context_validations = self._validations_from_context_outcome(context_outcome)
+                    if context_validations:
+                        validation = context_validations[-1]
+                    context_inspection = self._inspection_from_context_outcome(context_outcome)
+                    if context_inspection is not None:
+                        inspection = context_inspection
                 if validation is not None:
-                    self.validations.append(validation)
+                    self.validations.extend(context_validations or [validation])
                     self.validations = self.validations[-VALIDATION_LEDGER_LIMIT:]
-                    self._record_validation_progress(validation)
-                    validation_trigger_reasons = self._record_validation_runtime_state(validation)
+                    trigger_reasons: list[str] = []
+                    for recorded_validation in context_validations or [validation]:
+                        self._record_validation_progress(recorded_validation)
+                        trigger_reasons.extend(self._record_validation_runtime_state(recorded_validation))
+                    validation_trigger_reasons = tuple(dict.fromkeys(trigger_reasons))
+                if context_outcome is not None and not context_outcome.trusted:
+                    validation_trigger_reasons = tuple(
+                        dict.fromkeys((*validation_trigger_reasons, "context_untrusted_result"))
+                    )
                 if inspection is not None:
                     self.inspections.append(inspection)
                     self.inspections = self.inspections[-INSPECTION_LEDGER_LIMIT:]
@@ -1207,11 +2993,361 @@ class BelloController:
                         triggering_action=triggering_action,
                         patch_summary=_patch_summary_from_item(item),
                     )
+                if (
+                    context_outcome is not None
+                    and context_outcome.classification is ContextCallClassification.PURGE
+                ):
+                    logical_key = (
+                        (
+                            context_outcome.logical_key.thread_id,
+                            context_outcome.logical_key.turn_id,
+                            context_outcome.logical_key.item_id,
+                        )
+                        if context_outcome.logical_key is not None
+                        else None
+                    )
+                    purge_lease = getattr(self, "_context_purge_lease", None)
+                    if (
+                        not context_outcome.trusted
+                        or purge_lease is None
+                        or logical_key != getattr(self, "_context_purge_logical_key", None)
+                    ):
+                        await self._fail_coder_process_restart(
+                            runtime=getattr(self, "context_runtime", None),
+                            reason="ctx_purge terminal did not match its exclusive workspace lease",
+                        )
+                        return
+                    await self.recycle_coder_process(
+                        "trusted ctx_purge rotated Context Mode state",
+                        rotate_context_state_epoch=True,
+                    )
             return
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
+            interrupted_for_compaction = getattr(
+                self,
+                "_coder_context_compaction_interrupt_turn_id",
+                None,
+            )
+            if isinstance(turn_id, str) and turn_id == interrupted_for_compaction:
+                self._coder_context_compaction_interrupt_turn_id = None
+                compacted = await self._maybe_compact_coder_context()
+                if compacted and self.running and not getattr(self, "_terminal_cleanup_started", False):
+                    await self._steer_coder(POST_COMPACTION_CONTINUE_NUDGE)
+                return
+            compaction_turns = getattr(self, "_coder_context_compaction_turn_ids", set())
+            if isinstance(turn_id, str) and turn_id in compaction_turns:
+                compaction_turns.discard(turn_id)
+                self.store.append_raw_log(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "coder_context_compaction_turn_completed",
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                    }
+                )
+                return
+            await self._maybe_compact_coder_context()
+            if not self.running or getattr(self, "_terminal_cleanup_started", False):
+                return
             await self._handle_coder_turn_completed(item_id=item_id)
+
+    def _normalize_context_mode_notification(
+        self,
+        message: AppServerMessage,
+        *,
+        origin_role: ClientRole,
+    ) -> ContextIntegrationOutcome:
+        runtime = getattr(self, "context_runtime", None)
+        integration = getattr(self, "context_integration", None)
+        if runtime is None or integration is None:
+            return ContextIntegrationOutcome(
+                recognized=True,
+                status=ContextOutcomeStatus.HEALTH_VIOLATION,
+                protocol_issues=("context_item_without_active_runtime",),
+                health_violation=True,
+            )
+        if not message.app_server_instance_id:
+            return ContextIntegrationOutcome(
+                recognized=True,
+                status=ContextOutcomeStatus.HEALTH_VIOLATION,
+                protocol_issues=("context_item_without_app_server_instance",),
+                health_violation=True,
+            )
+        params = message.params
+        item = params.get("item")
+        assert isinstance(item, dict)
+        thread_id = params.get("threadId")
+        turn_id = _turn_id_from_params(params)
+        item_id = _item_id_from_params(params)
+        logical_tuple = (
+            (thread_id, turn_id, item_id)
+            if all(isinstance(value, str) and value for value in (thread_id, turn_id, item_id))
+            else None
+        )
+        capability_id = (
+            self._context_capability_by_item.get(logical_tuple)
+            if logical_tuple is not None
+            else None
+        )
+        method = message.method or "notification"
+        current_revision = getattr(self, "_workspace_revision", 0)
+        overlapping_mutation = False
+        if method == "item/started" and logical_tuple is not None:
+            self._context_call_start_revision[logical_tuple] = current_revision
+        elif method == "item/completed":
+            if item.get("tool") in EXECUTION_TOOLS:
+                current_revision, overlapping_mutation = self._complete_workspace_mutation(logical_tuple)
+        outcome = integration.normalize_notification(
+            method=method,
+            params=params,
+            origin=ContextNotificationOrigin(
+                ContextClientRole(origin_role.value),
+                message.process_epoch,
+                message.app_server_instance_id,
+            ),
+            active_binding=runtime.binding,
+            workspace_revision=current_revision,
+            overlapping_mutation=overlapping_mutation,
+            approval_capability_id=capability_id,
+        )
+        if (
+            method == "item/started"
+            and logical_tuple is not None
+            and outcome.logical_key is not None
+            and outcome.logical_key.stable_id
+            == LogicalContextCallKey(
+                ContextClientRole.CODER,
+                logical_tuple[0],
+                logical_tuple[1],
+                logical_tuple[2],
+            ).stable_id
+            and outcome.status is ContextOutcomeStatus.STARTED
+            and outcome.ledger_disposition is ContextEventDisposition.ACCEPTED_STARTED
+            and not outcome.protocol_issues
+            and not outcome.health_violation
+            and capability_id is None
+        ):
+            arguments = item.get("arguments")
+            if isinstance(arguments, Mapping):
+                try:
+                    arguments_digest = context_arguments_digest(arguments)
+                except ContextModeDataError:
+                    arguments_digest = None
+                if arguments_digest is not None:
+                    pending_calls = getattr(self, "_context_pending_approval_calls", None)
+                    if pending_calls is None:
+                        pending_calls = self._context_pending_approval_calls = {}
+                    pending_calls.setdefault(
+                        logical_tuple,
+                        PendingContextApprovalCall(
+                            logical_key=logical_tuple,
+                            tool_name=str(item.get("tool")),
+                            arguments_digest=arguments_digest,
+                            origin_role=origin_role,
+                            process_epoch=message.process_epoch,
+                            app_server_instance_id=message.app_server_instance_id,
+                            binding=runtime.binding,
+                        ),
+                    )
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "context_mode_event",
+                "status": outcome.status.value,
+                "classification": outcome.classification.value if outcome.classification is not None else None,
+                "logical_call_id": outcome.logical_key.stable_id if outcome.logical_key is not None else None,
+                "trusted": outcome.trusted,
+                "protocol_issues": list(outcome.protocol_issues),
+                "summary": dict(outcome.redacted_summary or {}),
+                "process_epoch": message.process_epoch,
+                "app_server_instance_id": message.app_server_instance_id,
+            }
+        )
+        snapshot = integration.telemetry.snapshot()
+        self.store.update_runtime_metrics(
+            lambda current: {
+                **current,
+                **{
+                    metric: value
+                    for namespace in snapshot.values()
+                    for metric, value in namespace.items()
+                },
+                "context_mode_metric_authorities": snapshot,
+            }
+        )
+        if method == "item/completed" and logical_tuple is not None:
+            self._context_call_start_revision.pop(logical_tuple, None)
+            getattr(self, "_context_pending_approval_calls", {}).pop(logical_tuple, None)
+            request_items = getattr(self, "_context_approval_item_by_request", {})
+            correlation_issues = getattr(self, "_context_approval_correlation_issues", {})
+            for request_key, correlated_item in list(request_items.items()):
+                if correlated_item == logical_tuple:
+                    request_items.pop(request_key, None)
+                    correlation_issues.pop(request_key, None)
+            capability = self._context_capability_by_item.pop(logical_tuple, None)
+            if capability is not None:
+                self._context_approval_capabilities = {
+                    key: value
+                    for key, value in self._context_approval_capabilities.items()
+                    if value != capability
+                }
+        return outcome
+
+    def _begin_workspace_mutation(self, key: tuple[str, str, str] | None) -> None:
+        """Open a symmetric mutation interval for overlap-safe evidence."""
+
+        active = getattr(self, "_active_workspace_mutations", None)
+        if active is None:
+            active = self._active_workspace_mutations = {}
+        overlapped = getattr(self, "_overlapped_workspace_mutations", None)
+        if overlapped is None:
+            overlapped = self._overlapped_workspace_mutations = set()
+        if key is None:
+            # An unidentifiable writer cannot later be paired safely.  Taint
+            # every currently active operation and let its terminal advance the
+            # revision pessimistically.
+            overlapped.update(active)
+            return
+        if key in active or key in getattr(self, "_workspace_mutation_terminals", {}):
+            return
+        if active:
+            overlapped.update(active)
+            overlapped.add(key)
+        active[key] = getattr(self, "_workspace_revision", 0)
+
+    def _complete_workspace_mutation(
+        self,
+        key: tuple[str, str, str] | None,
+    ) -> tuple[int, bool]:
+        """Close one mutation exactly once and report terminal revision/overlap."""
+
+        active = getattr(self, "_active_workspace_mutations", None)
+        if active is None:
+            active = self._active_workspace_mutations = {}
+        overlapped = getattr(self, "_overlapped_workspace_mutations", None)
+        if overlapped is None:
+            overlapped = self._overlapped_workspace_mutations = set()
+        terminals = getattr(self, "_workspace_mutation_terminals", None)
+        if terminals is None:
+            terminals = self._workspace_mutation_terminals = {}
+        if key is not None and key in terminals:
+            return terminals[key]
+
+        current = getattr(self, "_workspace_revision", 0)
+        if key is None or key not in active:
+            overlapped.update(active)
+            overlapping = True
+        else:
+            started_revision = active.pop(key)
+            overlapping = key in overlapped or started_revision != current
+            overlapped.discard(key)
+        current += 1
+        self._workspace_revision = current
+        result = (current, overlapping)
+        if key is not None:
+            terminals[key] = result
+        return result
+
+    def _context_triggering_action(
+        self,
+        outcome: ContextIntegrationOutcome,
+        *,
+        item_id: str | None,
+        summary: str,
+    ) -> TriggeringAction:
+        receipt = outcome.provenance.receipt if outcome.provenance is not None else None
+        evidence = outcome.evidence
+        command = shlex.join(evidence[0].redacted_argv) if evidence else None
+        exit_codes = [entry.exit_code for entry in evidence if entry.exit_code is not None]
+        exit_code = next((value for value in exit_codes if value != 0), 0 if exit_codes else None)
+        paths: list[str] = []
+        if receipt is not None:
+            paths.extend((receipt.changed_paths or {}).keys())
+            paths.extend(record.relative_path for record in receipt.retrieval)
+        trust = "trusted" if outcome.trusted else "untrusted"
+        return TriggeringAction(
+            item_id=item_id,
+            kind="mcpToolCall",
+            command=command,
+            cwd=self._active_workspace_root().as_posix(),
+            paths=list(dict.fromkeys(paths)),
+            exit_code=exit_code,
+            status=outcome.status.value,
+            summary=f"{summary} ({trust} broker provenance)",
+        )
+
+    def _validations_from_context_outcome(
+        self,
+        outcome: ContextIntegrationOutcome,
+    ) -> list[ValidationRun]:
+        if not outcome.trusted or outcome.provenance is None:
+            return []
+        receipt = outcome.provenance.receipt
+        changed_paths = list((receipt.changed_paths or {}).keys())
+        validations: list[ValidationRun] = []
+        for evidence in outcome.evidence:
+            if not evidence.terminal_complete:
+                continue
+            command = shlex.join(evidence.redacted_argv)
+            record = receipt.commands[evidence.command_index]
+            output = "\n".join(
+                text
+                for text in (record.stdout_excerpt, record.stderr_excerpt)
+                if isinstance(text, str) and text
+            )
+            action = TriggeringAction(
+                item_id=f"{receipt.operation_id}:{evidence.command_index}",
+                kind="commandExecution",
+                command=command,
+                cwd=os.fspath(self._active_workspace_root() / evidence.relative_cwd),
+                exit_code=evidence.exit_code,
+                status="completed",
+                summary=(
+                    f"broker-attested Context command {evidence.command_index + 1}/"
+                    f"{len(outcome.evidence)}"
+                ),
+            )
+            validation = _validation_from_action(
+                action,
+                sequence=self._sequence,
+                item={"aggregatedOutput": output},
+                changed_paths=changed_paths,
+            )
+            if validation is not None:
+                validations.append(validation)
+        return validations
+
+    def _inspection_from_context_outcome(
+        self,
+        outcome: ContextIntegrationOutcome,
+    ) -> InspectionRun | None:
+        if (
+            not outcome.trusted
+            or outcome.provenance is None
+            or outcome.classification is not ContextCallClassification.RETRIEVAL
+            or not outcome.retrieval
+        ):
+            return None
+        receipt = outcome.provenance.receipt
+        paths = list(dict.fromkeys(record.relative_path for record in outcome.retrieval))
+        return InspectionRun(
+            inspection_id=f"context-search-{receipt.operation_id}",
+            command="ctx_search",
+            raw_command="ctx_search",
+            normalized_command="ctx_search",
+            cwd=os.fspath(self._active_workspace_root()),
+            exit_code=0,
+            shell_exit_code=0,
+            outcome="pass",
+            passed=True,
+            summary=f"broker-attested local retrieval ({len(paths)} source paths)",
+            captured_output="",
+            captured_output_truncated=False,
+            sequence=self._sequence,
+            inspected_paths=paths,
+        )
 
     def _record_command_output_delta(self, method: str, params: dict[str, Any], *, item_id: str | None) -> None:
         if not _is_command_output_delta_method(method):
@@ -1358,7 +3494,7 @@ class BelloController:
         patch_health(self.store, HealthDelta(generation=cfg.generation, interventions=1))
         self.tui.render("SUPERVISOR", reason)
         if self.coder:
-            await self.coder.steer_or_start(message)
+            await self._steer_coder(message)
 
     async def _handle_no_marker_idle(self) -> None:
         cfg = self.store.get_bello_config()
@@ -1370,7 +3506,7 @@ class BelloController:
             # run via restart-with-exhausted-budget). Kick the coder instead; steer_or_start starts
             # a turn if the restart kickoff died.
             if self.coder:
-                await self.coder.steer_or_start(POST_RESTART_CONTINUE_NUDGE)
+                await self._steer_coder(POST_RESTART_CONTINUE_NUDGE)
             return
         latest_validation_sequence = max((validation.sequence for validation in self.validations), default=None)
         last_message_sequence = self.last_coder_message.sequence if self.last_coder_message is not None else None
@@ -1412,22 +3548,416 @@ class BelloController:
         await self._resolve_pending_approvals("paused")
         self.tui.status("paused")
 
+    async def recover_coder_process(self, reason: str) -> None:
+        """Recover only the coder transport without rotating logical generation."""
+
+        await self._restart_coder_process(
+            reason=reason,
+            controlled=False,
+            rotate_context_state_epoch=False,
+        )
+
+    async def recycle_coder_process(
+        self,
+        reason: str,
+        *,
+        rotate_context_state_epoch: bool = False,
+    ) -> None:
+        """Controlled coder recycle (for purge/binding changes), not a crash recovery."""
+
+        await self._restart_coder_process(
+            reason=reason,
+            controlled=True,
+            rotate_context_state_epoch=rotate_context_state_epoch,
+        )
+
+    def _clear_process_scoped_context_journals(self) -> None:
+        """Drop observations that can never receive a terminal from the new process."""
+
+        active_mutations = getattr(self, "_active_workspace_mutations", {})
+        if active_mutations:
+            # A writer disappeared without an attributable terminal.  Advance
+            # the controller revision once so pre-crash evidence cannot remain
+            # fresh merely because its unfinished interval was discarded.
+            self._workspace_revision = int(getattr(self, "_workspace_revision", 0)) + 1
+        for name in (
+            "_context_call_start_revision",
+            "_context_pending_approval_calls",
+            "_active_workspace_mutations",
+            "_overlapped_workspace_mutations",
+            "_workspace_mutation_terminals",
+        ):
+            collection = getattr(self, name, None)
+            if collection is not None:
+                collection.clear()
+
+    async def _fail_coder_process_restart(
+        self,
+        *,
+        runtime: PreparedContextMode | None,
+        reason: str,
+    ) -> None:
+        """Make every partial Context/process transition terminal and fail-closed."""
+
+        if runtime is not None:
+            runtime.coordinator.mark_failed()
+        self.store.update_bello_config(
+            lambda current: current.model_copy(update={"status": BelloStatus.PROVIDER_FAILURE})
+        )
+        if runtime is not None and getattr(self, "context_runtime", None) is runtime:
+            try:
+                await self._stop_context_runtime()
+            except Exception as exc:
+                self._append_cleanup_error(
+                    cleanup_kind="failed_coder_process_restart_context_stop",
+                    thread_id=getattr(getattr(self, "coder", None), "thread_id", None) or "unknown",
+                    turn_id=getattr(getattr(self, "coder", None), "active_turn_id", None),
+                    error=exc,
+                )
+        try:
+            await self.finalize(reason, status=BelloStatus.PROVIDER_FAILURE)
+        except Exception as exc:
+            self.running = False
+            self._terminal_cleanup_started = True
+            self._append_cleanup_error(
+                cleanup_kind="failed_coder_process_restart_finalize",
+                thread_id=getattr(getattr(self, "coder", None), "thread_id", None) or "unknown",
+                turn_id=getattr(getattr(self, "coder", None), "active_turn_id", None),
+                error=exc,
+            )
+            self._wake_event_loop_for_shutdown()
+
+    async def _restart_coder_process(
+        self,
+        *,
+        reason: str,
+        controlled: bool,
+        rotate_context_state_epoch: bool = False,
+    ) -> None:
+        if rotate_context_state_epoch and not controlled:
+            raise ContextModeStartupError("state epoch rotation requires a controlled coder recycle")
+        lock = getattr(self, "_coder_process_restart_lock", None)
+        if lock is None:
+            lock = self._coder_process_restart_lock = asyncio.Lock()
+        async with lock:
+            if getattr(self, "_terminal_cleanup_started", False):
+                return
+            runtime = getattr(self, "context_runtime", None)
+            metric = "coder_process_controlled_recycles" if controlled else "coder_process_recoveries"
+            budget_name = "_coder_controlled_recycle_budget" if controlled else "_coder_process_recovery_budget"
+            budget = int(getattr(self, budget_name, 2 if controlled else 3))
+            cfg = self.store.get_bello_config()
+            used = cfg.coder_process_controlled_recycles if controlled else cfg.coder_process_recoveries
+            if used >= budget:
+                failure_reason = (
+                    f"coder process {'recycle' if controlled else 'recovery'} budget exhausted: {reason}"
+                )
+                if rotate_context_state_epoch:
+                    await self._fail_coder_process_restart(
+                        runtime=runtime,
+                        reason=failure_reason,
+                    )
+                else:
+                    await self.finalize(
+                        failure_reason,
+                        status=BelloStatus.PROVIDER_FAILURE,
+                    )
+                return
+
+            old_coder = getattr(self, "coder", None)
+            old_thread_id = getattr(old_coder, "thread_id", None)
+            old_binding = None
+            next_binding = None
+            checkpoint_cursor: CheckpointCursor | None = None
+            purge_lease = (
+                getattr(self, "_context_purge_lease", None)
+                if rotate_context_state_epoch
+                else None
+            )
+            try:
+                if rotate_context_state_epoch and (
+                    runtime is None
+                    or not runtime.purge_protocol_attested
+                    or purge_lease is None
+                ):
+                    raise ContextModeStartupError(
+                        "ctx_purge recycle requires its pending exclusive workspace lease"
+                    )
+                if old_coder is not None:
+                    try:
+                        await old_coder.interrupt()
+                    except Exception:
+                        pass
+                await self._resolve_pending_approvals(
+                    f"coder process {'controlled recycle' if controlled else 'recovery'}: {reason}",
+                    best_effort=not rotate_context_state_epoch,
+                )
+                if runtime is not None:
+                    old_binding = await runtime.quiesce(timeout_seconds=30.0)
+                    checkpoint_cursor = await self._checkpoint_context_runtime(
+                        reason=reason,
+                        transition=(
+                            "state_epoch_rotation_then_controlled_recycle"
+                            if rotate_context_state_epoch
+                            else ("controlled_recycle" if controlled else "process_recovery")
+                        ),
+                        recovery_kind=(
+                            None
+                            if rotate_context_state_epoch
+                            else CheckpointRecoveryKind.PROCESS_RECOVERY
+                        ),
+                    )
+                    if rotate_context_state_epoch:
+                        assert purge_lease is not None
+                        old_binding, purge_lease = await runtime.rotate_state_epoch(
+                            exclusive_workspace_lease=purge_lease,
+                            timeout_seconds=30.0,
+                        )
+                        self._context_purge_lease = purge_lease
+                        self.store.update_bello_config(
+                            lambda current: current.model_copy(
+                                update={
+                                    "context_state_epoch": old_binding.lifecycle.context_state_epoch,
+                                    "context_binding_version": old_binding.binding_version,
+                                }
+                            )
+                        )
+                self._clear_process_scoped_context_journals()
+                await self.coder_client.stop()
+                if runtime is not None:
+                    process_epoch, instance_id = self.coder_client.reserve_next_identity()
+                    assert old_binding is not None
+                    transition = (
+                        TransitionReason.CONTROLLED_RECYCLE
+                        if controlled
+                        else TransitionReason.PROCESS_RECOVERY
+                    )
+                    next_binding = await runtime.transition_binding(
+                        expected_version=old_binding.binding_version,
+                        reason=transition,
+                        coder_process_epoch=process_epoch,
+                        app_server_instance_id=instance_id,
+                        provider_thread_id=old_thread_id if isinstance(old_thread_id, str) else None,
+                    )
+                await self.coder_client.start()
+                await self.coder_client.initialize()
+                self._verify_coder_transport_binding()
+                await self._preflight_context_app_server_boundary()
+                # A purge deliberately switches to a new empty state epoch and
+                # does not recover the old checkpoint.  Ordinary recovery stays
+                # quiesced until the resumed thread's SessionStart is verified.
+                if runtime is not None and rotate_context_state_epoch:
+                    assert purge_lease is not None
+                    await runtime.resume(exclusive_workspace_lease=purge_lease)
+                    self._context_purge_lease = None
+                    self._context_purge_logical_key = None
+                    self._context_purge_request_key = None
+            except (Exception, asyncio.CancelledError) as exc:
+                await self._fail_coder_process_restart(
+                    runtime=runtime,
+                    reason=(
+                        f"coder app-server {'recycle' if controlled else 'recovery'} failed: {exc}"
+                    ),
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
+
+            try:
+                process_epoch = int(
+                    getattr(self.coder_client, "process_epoch", cfg.coder_process_epoch + 1)
+                )
+                updates = {
+                    "coder_process_epoch": process_epoch,
+                    metric: used + 1,
+                    "active_coder_turn_id": None,
+                    "coder_thread_id": old_thread_id if next_binding is not None else None,
+                }
+                if next_binding is not None:
+                    updates["context_binding_version"] = next_binding.binding_version
+                    updates["context_state_epoch"] = next_binding.lifecycle.context_state_epoch
+                self.store.update_bello_config(lambda current: current.model_copy(update=updates))
+                if next_binding is not None:
+                    if checkpoint_cursor is None:
+                        raise ContextModeStartupError(
+                            "coder process transition has no verified checkpoint cursor"
+                        )
+                    recovery = CoderRecoveryContext.from_payload(
+                        checkpoint_cursor.checkpoint_id,
+                        {
+                            "transition": (
+                                "state_epoch_rotation_then_controlled_recycle"
+                                if rotate_context_state_epoch
+                                else ("controlled_recycle" if controlled else "process_recovery")
+                            ),
+                            "checkpoint_digest": digest_json(checkpoint_cursor.to_dict()),
+                            "context_event_seq": checkpoint_cursor.context_event_seq,
+                            "previous_thread_id": old_thread_id,
+                            "context_state_epoch": next_binding.lifecycle.context_state_epoch,
+                        },
+                    )
+                    resumed = False
+                    if old_coder is not None and isinstance(old_thread_id, str):
+                        try:
+                            result = await old_coder.recover_transport(
+                                CoderContextBindingSnapshot.from_context_binding(next_binding),
+                                reason=reason,
+                                resume_thread=True,
+                                recovery_context=recovery,
+                            )
+                            self.coder = old_coder
+                            if not rotate_context_state_epoch:
+                                await self._recover_context_checkpoint(
+                                    checkpoint_id=checkpoint_cursor.checkpoint_id,
+                                    recovery_kind=CheckpointRecoveryKind.PROCESS_RECOVERY,
+                                )
+                            await self.coder.start_recovery_turn(result.recovery_context, reason=reason)
+                            resumed = True
+                        except Exception as exc:
+                            self.store.append_raw_log(
+                                {
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "type": "coder_process_resume_fallback",
+                                    "error_type": exc.__class__.__name__,
+                                    "error": str(exc),
+                                }
+                            )
+                    if not resumed:
+                        if not rotate_context_state_epoch:
+                            raise ContextModeStartupError(
+                                "Context Mode process recovery could not resume the bound provider "
+                                "thread and cannot switch sessions before checkpoint acknowledgement"
+                            )
+                        await runtime.quiesce(timeout_seconds=30.0)
+                        current_binding = runtime.binding_store.load()
+                        if current_binding.lifecycle.provider_thread_id is not None:
+                            current_binding = await runtime.transition_binding(
+                                expected_version=current_binding.binding_version,
+                                reason=TransitionReason.CLEAR_THREAD_CLAIM,
+                                provider_thread_id=None,
+                            )
+                        await runtime.resume()
+                        self.coder = CoderSession(
+                            self.coder_client,
+                            self.store,
+                            self._active_workspace_root(),
+                            self._active_task_path(),
+                            model=self._coder_model(),
+                            fast=self._fast_mode(),
+                            intelligence=self._coder_intelligence(),
+                            context_binding=CoderContextBindingSnapshot.from_context_binding(current_binding),
+                            on_thread_start=self._mark_coder_thread_started,
+                        )
+                        await self.coder.start_thread()
+                        await self._claim_context_provider_thread(self.coder.thread_id)
+                        await self.coder.start_recovery_turn(recovery, reason=reason)
+                else:
+                    self.coder = CoderSession(
+                        self.coder_client,
+                        self.store,
+                        self._active_workspace_root(),
+                        self._active_task_path(),
+                        model=self._coder_model(),
+                        fast=self._fast_mode(),
+                        intelligence=self._coder_intelligence(),
+                        on_thread_start=self._mark_coder_thread_started,
+                    )
+                    await self.coder.start_thread()
+                    recovery_context = (
+                        f"Coder app-server process was {'recycled' if controlled else 'recovered'} without a logical "
+                        f"generation change. Previous provider thread: {old_thread_id or 'none'}. Reason: {reason}. "
+                        "Re-read HANDOFF.md if present, verify current workspace state, and continue."
+                    )
+                    await self.coder.start_turn(recovery_context[:4096])
+                self.store.update_runtime_metrics(
+                    lambda current: {**current, metric: int(current.get(metric) or 0) + 1}
+                )
+                self.tui.render(
+                    "SYSTEM",
+                    f"coder process {'controlled recycle' if controlled else 'recovery'} complete",
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                await self._fail_coder_process_restart(
+                    runtime=runtime,
+                    reason=(
+                        "coder logical session recovery after app-server "
+                        f"{'recycle' if controlled else 'recovery'} failed: {exc}"
+                    ),
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
+
     async def restart(self, reason: str, *, handoff: RestartHandoff | None = None) -> None:
+        """Compatibility entry point for a logical coder generation restart."""
+
+        await self.restart_coder_generation(reason, handoff=handoff)
+
+    async def restart_coder_generation(
+        self,
+        reason: str,
+        *,
+        handoff: RestartHandoff | None = None,
+        phase_rollover: bool = False,
+    ) -> None:
+        async with self._get_coder_transition_lock():
+            await self._restart_coder_generation_unlocked(
+                reason,
+                handoff=handoff,
+                phase_rollover=phase_rollover,
+            )
+
+    async def _restart_coder_generation_unlocked(
+        self,
+        reason: str,
+        *,
+        handoff: RestartHandoff | None = None,
+        phase_rollover: bool = False,
+    ) -> None:
         cfg = self.store.get_bello_config()
-        if cfg.restart_count >= cfg.max_restarts:
+        if not phase_rollover and cfg.restart_count >= cfg.max_restarts:
             await self.finalize("restart cap reached", status=BelloStatus.STUCK)
             return
-        self._append_event(AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "controller/coder_phase_rollover" if phase_rollover else "controller/restart",
+            reason=reason,
+        )
         await self._close_completion_review_session()
         self.store.update_bello_config(lambda current: current.model_copy(update={"status": BelloStatus.RESTARTING}))
+        runtime = getattr(self, "context_runtime", None)
         if self.coder:
             try:
                 await self.coder.interrupt()
             except AppServerError:
                 raise
             except Exception:
-                pass
+                if runtime is not None:
+                    raise
         await self._resolve_pending_approvals("restart")
+        if runtime is not None and self.coder is not None:
+            # Successful archive is the provider-side terminal barrier for the
+            # old thread and its live MCP connection.  A best-effort close here
+            # would let that connection survive the generation lease rotation.
+            await self.coder.archive_thread()
+        next_context_binding = None
+        checkpoint_cursor: CheckpointCursor | None = None
+        bootstrap_lease: ExclusiveWorkspaceLease | None = None
+        if runtime is not None:
+            bootstrap_lease = await runtime.acquire_logical_restart_bootstrap_lease(
+                owner=f"controller:logical-restart:{cfg.generation + 1}",
+                timeout_seconds=30.0,
+            )
+            old_context_binding = runtime.binding_store.load()
+            checkpoint_cursor = await self._checkpoint_context_runtime(
+                reason=reason,
+                transition=(
+                    "post_adversary_coder_rollover"
+                    if phase_rollover
+                    else "logical_generation_restart"
+                ),
+                recovery_kind=CheckpointRecoveryKind.LOGICAL_RESTART,
+            )
         handoff = handoff or _fallback_restart_handoff(
             task_contents=self._canonical_task_text(),
             reason=reason,
@@ -1435,33 +3965,56 @@ class BelloController:
         )
         self.store.write_handoff(handoff.model_dump_json(indent=2) + "\n")
         self._repair_snapshot_runtime_controls(source="restart")
-        self.prior_interventions = []
+        if not phase_rollover:
+            self.prior_interventions = []
         self.no_marker_idle_nudge_count = 0
         self._last_completion_marker_sequence = None
+        self.last_coder_message = None
         # The new generation has produced no coder work yet; until its first turn starts,
         # completion machinery must not judge (or restart over) the previous generation's state.
         self._generation_has_coder_turn = False
         self.completion_review_return_sequence = None
         self.completion_review_return_validation_sequence = None
-        self._pending_adversary_report = None
+        if not phase_rollover:
+            self._pending_adversary_report = None
         self._active_adversary_thread_id = None
         self._active_adversary_workspace_root = None
         self._adversary_denied_commands: list[str] = []
-        self.validation_runtime_state = {}
+        if not phase_rollover:
+            self.validation_runtime_state = {}
         patch_health(
             self.store,
             HealthDelta(
                 generation=cfg.generation,
-                restart_count=1,
+                restart_count=0 if phase_rollover else 1,
                 reset_generation_scoped=True,
                 new_generation=cfg.generation + 1,
             ),
+        )
+        if runtime is not None:
+            next_context_binding = await runtime.transition_binding(
+                expected_version=old_context_binding.binding_version,
+                reason=TransitionReason.LOGICAL_GENERATION_RESTART,
+                coder_generation=old_context_binding.lifecycle.coder_generation + 1,
+                generation_lease_id=new_generation_lease_id(),
+                provider_thread_id=None,
+            )
+        next_lease_id = (
+            next_context_binding.lifecycle.generation_lease_id
+            if next_context_binding is not None
+            else secrets.token_urlsafe(32)
         )
         self.store.update_bello_config(
             lambda current: current.model_copy(
                 update={
                     "generation": current.generation + 1,
-                    "restart_count": current.restart_count + 1,
+                    "coder_generation_lease_id": next_lease_id,
+                    "context_binding_version": (
+                        next_context_binding.binding_version
+                        if next_context_binding is not None
+                        else current.context_binding_version
+                    ),
+                    "restart_count": current.restart_count + (0 if phase_rollover else 1),
                     "active_coder_turn_id": None,
                     "coder_thread_id": None,
                     "status": BelloStatus.RUNNING,
@@ -1469,17 +4022,56 @@ class BelloController:
             )
         )
         self.coder = CoderSession(
-            self.client,
+            self.coder_client,
             self.store,
             self._active_workspace_root(),
             self._active_task_path(),
             model=self._coder_model(),
             fast=self._fast_mode(),
             intelligence=self._coder_intelligence(),
+            context_binding=(
+                CoderContextBindingSnapshot.from_context_binding(next_context_binding)
+                if next_context_binding is not None
+                else None
+            ),
+            on_thread_start=self._mark_coder_thread_started,
         )
         await self.coder.start_thread()
-        await self.coder.start_restart_turn()
-        self.tui.render("SYSTEM", "restart complete")
+        await self._claim_context_provider_thread(self.coder.thread_id)
+        if runtime is not None:
+            if checkpoint_cursor is None:
+                raise ContextModeStartupError(
+                    "logical generation restart lost its verified checkpoint cursor"
+                )
+            await self._recover_context_checkpoint(
+                checkpoint_id=checkpoint_cursor.checkpoint_id,
+                recovery_kind=CheckpointRecoveryKind.LOGICAL_RESTART,
+                exclusive_workspace_lease=bootstrap_lease,
+            )
+            recovery = CoderRecoveryContext.from_payload(
+                checkpoint_cursor.checkpoint_id,
+                {
+                    "transition": (
+                        "post_adversary_coder_rollover"
+                        if phase_rollover
+                        else "logical_generation_restart"
+                    ),
+                    "checkpoint_digest": digest_json(checkpoint_cursor.to_dict()),
+                    "context_event_seq": checkpoint_cursor.context_event_seq,
+                    "binding_version": runtime.binding.binding_version,
+                },
+            )
+            await self.coder.start_recovery_turn(
+                recovery,
+                reason=reason,
+                transition=CoderLifecycleTransition.LOGICAL_GENERATION_HANDOFF,
+            )
+        else:
+            await self.coder.start_restart_turn()
+        self.tui.render(
+            "SYSTEM",
+            "post-adversary coder rollover complete" if phase_rollover else "restart complete",
+        )
 
     async def finalize(
         self,
@@ -1488,7 +4080,27 @@ class BelloController:
         status: BelloStatus = BelloStatus.COMPLETE,
         completion_review_accepted: bool = False,
     ) -> None:
+        # Arm the terminal gate before any quiesce/diff/report work so late
+        # notifications and approvals cannot enter a snapshot being finalized.
+        self._terminal_cleanup_started = True
+        self.running = False
         self._reconcile_intervention_accounting()
+        await self._quiesce_coder_before_snapshot(result)
+        runtime = getattr(self, "context_runtime", None)
+        if (
+            runtime is not None
+            and runtime.coordinator.state is RuntimeState.QUIESCED
+            and getattr(runtime, "checkpoint_protocol_attested", False)
+            and runtime.binding.lifecycle.provider_thread_id is not None
+        ):
+            await runtime.checkpoint(
+                reason=result,
+                transition="terminal_shutdown",
+                timeout_seconds=30.0,
+            )
+        # Stop the native tree and both app-servers before reading the final
+        # diff or applying the snapshot back to the real workspace.
+        await self._prepare_terminal_shutdown(result)
         diff = await self.diff_summary()
         changed_files = await self.changed_files()
         patch_error, recovery_path = await self._apply_final_snapshot_patch_if_needed(status)
@@ -1537,9 +4149,42 @@ class BelloController:
         self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": status}))
         self.tui.render("SUPERVISOR", result)
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
-        await self._prepare_terminal_shutdown(result)
         self.running = False
         self._wake_event_loop_for_shutdown()
+
+    async def _quiesce_coder_before_snapshot(self, reason: str) -> None:
+        """Stop every potential coder/context writer before diff or patch-back."""
+
+        if getattr(self, "_coder_quiesced_for_snapshot", False):
+            return
+        coder = getattr(self, "coder", None)
+        if coder is not None:
+            try:
+                await coder.interrupt()
+            except Exception as exc:
+                self._append_cleanup_error(
+                    cleanup_kind="snapshot_quiesce_coder_interrupt",
+                    thread_id=getattr(coder, "thread_id", None) or "unknown",
+                    turn_id=getattr(coder, "active_turn_id", None),
+                    error=exc,
+                )
+        if getattr(self, "pending_approvals", None):
+            await self._resolve_pending_approvals(
+                f"terminal snapshot quiesce: {reason}",
+                best_effort=True,
+            )
+        runtime = getattr(self, "context_runtime", None)
+        if runtime is not None and runtime.coordinator.state is not RuntimeState.FAILED:
+            await _maybe_await(runtime.quiesce(timeout_seconds=30.0))
+        coder_client = getattr(self, "coder_client", None)
+        if coder_client is not None and hasattr(coder_client, "stop"):
+            await coder_client.stop()
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is not None and hasattr(snapshot, "mark_quiesced"):
+            snapshot.mark_quiesced()
+        # Set only after every potential writer is stopped.  A failed first
+        # attempt must remain retryable and must never authorize patch-back.
+        self._coder_quiesced_for_snapshot = True
 
     async def _apply_final_snapshot_patch_if_needed(
         self,
@@ -1548,6 +4193,14 @@ class BelloController:
         snapshot = getattr(self, "_coder_snapshot", None)
         if snapshot is None or getattr(self, "_snapshot_patch_applied", False):
             return None, getattr(self, "_snapshot_recovery_path", None)
+        if not getattr(self, "_writer_trees_reaped_for_snapshot", False):
+            recovery_path = str(snapshot.snapshot_root)
+            self._snapshot_recovery_path = recovery_path
+            return (
+                "escalated: native/app-server writer trees were not proven reaped; "
+                f"workspace was not patched or deleted and remains at {recovery_path}",
+                recovery_path,
+            )
         if status != BelloStatus.COMPLETE:
             if not getattr(self, "_coder_started", False):
                 snapshot.cleanup()
@@ -1564,7 +4217,9 @@ class BelloController:
                 recovery_path,
             )
         try:
-            result = await asyncio.to_thread(apply_snapshot_patch, snapshot)
+            # Terminal shutdown has quiesced the coder; applying synchronously
+            # avoids leaving a cancelled executor writer alive past run cleanup.
+            result = apply_snapshot_patch(snapshot, require_quiesced=True)
         except (SnapshotPatchError, WorkspaceSnapshotError) as exc:
             recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason="patch_failed")
             message = (
@@ -1623,7 +4278,7 @@ class BelloController:
             return str(existing)
         destination = self.store.next_recovery_dir()
         try:
-            workspace = await asyncio.to_thread(snapshot.preserve, destination)
+            workspace = snapshot.preserve(destination)
             recovery_path = str(workspace)
         except WorkspaceSnapshotError:
             recovery_path = str(snapshot.snapshot_root)
@@ -1650,7 +4305,7 @@ class BelloController:
         self._final_report_archived = True
 
     async def _prepare_terminal_shutdown(self, reason: str) -> None:
-        if getattr(self, "_terminal_cleanup_started", False):
+        if getattr(self, "_terminal_cleanup_finished", False):
             return
         self._terminal_cleanup_started = True
         self.running = False
@@ -1666,7 +4321,7 @@ class BelloController:
                     turn_id=getattr(coder, "active_turn_id", None),
                     error=exc,
                 )
-        if getattr(self, "pending_approvals", None) and getattr(self, "client", None) is not None:
+        if getattr(self, "pending_approvals", None) and getattr(self, "coder_client", None) is not None:
             try:
                 await self._resolve_pending_approvals(f"terminal state reached: {reason}")
             except Exception as exc:
@@ -1679,17 +4334,27 @@ class BelloController:
         task = getattr(self, "_supervisor_task", None)
         if task is not None and task is not asyncio.current_task():
             await self._stop_supervisor_task()
-        client = getattr(self, "client", None)
-        if client is not None and hasattr(client, "stop"):
+        coder_client = getattr(self, "coder_client", None)
+        supervisor_client = getattr(self, "supervisor_client", None)
+        role_clients_stopped = (
+            coder_client is None
+            and supervisor_client is None
+            and getattr(self, "context_runtime", None) is None
+        )
+        if coder_client is not None and supervisor_client is not None:
             try:
-                await client.stop()
+                await self._stop_role_clients()
+                role_clients_stopped = True
             except Exception as exc:
+                role_clients_stopped = False
                 self._append_cleanup_error(
-                    cleanup_kind="terminal_appserver_stop",
+                    cleanup_kind="terminal_role_appservers_stop",
                     thread_id="unknown",
                     turn_id=None,
                     error=exc,
                 )
+        self._writer_trees_reaped_for_snapshot = role_clients_stopped
+        self._terminal_cleanup_finished = role_clients_stopped
 
     async def _close_completion_review_session(self) -> None:
         supervisor = self._completion_supervisor_agent()
@@ -1707,6 +4372,9 @@ class BelloController:
             )
 
     def _wake_event_loop_for_shutdown(self) -> None:
+        signal_event = getattr(self, "_shutdown_signal", None)
+        if signal_event is not None:
+            signal_event.set()
         queue = getattr(self, "event_queue", None)
         if queue is None:
             return
@@ -2015,6 +4683,425 @@ class BelloController:
 
         self.store.update_runtime_metrics(patch)
 
+    def _register_provider_logical_role(
+        self,
+        transport_role: ClientRole,
+        thread_id: str,
+        logical_role: Literal["coder", "runtime", "completion", "adversary"],
+    ) -> None:
+        """Bind a provider thread to its Bello role before its first model turn."""
+
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        key = ProviderThreadKey(ContextClientRole(transport_role.value), thread_id)
+        roles = getattr(self, "_provider_logical_roles", None)
+        if not isinstance(roles, dict):
+            roles = self._provider_logical_roles = {}
+        existing = roles.get(key)
+        if existing is None:
+            roles[key] = logical_role
+            return
+        if existing == logical_role:
+            return
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "provider_token_role_conflict",
+                "transport_role": transport_role.value,
+                "thread_id": thread_id,
+                "existing_logical_role": existing,
+                "new_logical_role": logical_role,
+            }
+        )
+        self.store.update_runtime_metrics(
+            lambda current: {
+                **current,
+                "provider_token_usage_anomalies": int(
+                    current.get("provider_token_usage_anomalies") or 0
+                )
+                + 1,
+            }
+        )
+
+    def _mark_coder_thread_started(self, thread_id: str) -> None:
+        self._register_provider_logical_role(ClientRole.CODER, thread_id, "coder")
+        if getattr(self, "_coder_context_thread_id", None) == thread_id:
+            return
+        self._coder_context_thread_id = thread_id
+        self._coder_context_input_tokens = None
+        self._coder_context_compaction_baseline_tokens = None
+        self._coder_context_compactions_completed = 0
+        self._coder_context_awaiting_post_compaction_sample = False
+        self._coder_context_compaction_pending = False
+        self._coder_context_compaction_in_progress = False
+        self._coder_context_compaction_interrupt_turn_id = None
+        self._coder_context_compaction_turn_ids = set()
+
+    def _record_coder_context_token_sample(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        token_usage: Mapping[str, Any],
+    ) -> None:
+        if getattr(self, "_coder_context_thread_id", None) != thread_id:
+            return
+        last = token_usage.get("last")
+        if not isinstance(last, Mapping):
+            return
+        input_tokens = last.get("inputTokens")
+        if isinstance(input_tokens, bool) or not isinstance(input_tokens, int) or input_tokens < 0:
+            return
+        self._coder_context_input_tokens = input_tokens
+        compact_turn_ids = getattr(self, "_coder_context_compaction_turn_ids", set())
+        is_compaction_turn = isinstance(turn_id, str) and turn_id in compact_turn_ids
+        baseline = getattr(self, "_coder_context_compaction_baseline_tokens", None)
+        if (
+            getattr(self, "_coder_context_awaiting_post_compaction_sample", False)
+            and not getattr(self, "_coder_context_compaction_in_progress", False)
+            and not is_compaction_turn
+        ):
+            baseline = input_tokens
+            self._coder_context_compaction_baseline_tokens = baseline
+            self._coder_context_awaiting_post_compaction_sample = False
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "coder_context_compaction_baseline_accepted",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "input_tokens": input_tokens,
+                }
+            )
+        growth = max(0, input_tokens - baseline) if isinstance(baseline, int) else None
+        completed = int(getattr(self, "_coder_context_compactions_completed", 0))
+        due = (
+            not getattr(self, "_coder_context_awaiting_post_compaction_sample", False)
+            and input_tokens >= CODER_CONTEXT_COMPACT_THRESHOLD_TOKENS
+            and (
+                completed == 0
+                or (
+                    isinstance(growth, int)
+                    and growth >= CODER_CONTEXT_COMPACT_MIN_GROWTH_TOKENS
+                )
+            )
+        )
+        self._coder_context_compaction_pending = due
+
+        def patch(current: dict[str, Any]) -> dict[str, Any]:
+            current["coder_context_input_tokens"] = input_tokens
+            current["coder_context_compaction_baseline_tokens"] = baseline
+            current["coder_context_growth_tokens"] = growth
+            current["coder_context_compaction_pending"] = due
+            current["coder_context_compactions_completed"] = completed
+            current["coder_context_awaiting_post_compaction_sample"] = bool(
+                getattr(self, "_coder_context_awaiting_post_compaction_sample", False)
+            )
+            return current
+
+        self.store.update_runtime_metrics(patch)
+
+    def _get_coder_transition_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_coder_transition_lock", None)
+        if lock is None:
+            lock = self._coder_transition_lock = asyncio.Lock()
+        return lock
+
+    async def _steer_coder(self, message: str) -> str | None:
+        async with self._get_coder_transition_lock():
+            coder = getattr(self, "coder", None)
+            if coder is None:
+                return None
+            return await coder.steer_or_start(message)
+
+    async def _interrupt_coder_for_context_compaction(self) -> bool:
+        async with self._get_coder_transition_lock():
+            coder = getattr(self, "coder", None)
+            turn_id = getattr(coder, "active_turn_id", None) if coder is not None else None
+            if (
+                coder is None
+                or not isinstance(turn_id, str)
+                or not turn_id
+                or not getattr(self, "_coder_context_compaction_pending", False)
+            ):
+                return False
+            existing = getattr(self, "_coder_context_compaction_interrupt_turn_id", None)
+            if existing == turn_id:
+                return False
+            if existing is not None:
+                raise RuntimeError(
+                    "a different coder turn is already pending compaction interruption"
+                )
+            self._coder_context_compaction_interrupt_turn_id = turn_id
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "coder_context_compaction_interrupt_requested",
+                    "thread_id": coder.thread_id,
+                    "turn_id": turn_id,
+                    "input_tokens": getattr(self, "_coder_context_input_tokens", None),
+                }
+            )
+            self.tui.render(
+                "SYSTEM",
+                "interrupting coder turn at the context compaction threshold",
+            )
+            try:
+                await coder.interrupt()
+            except BaseException:
+                self._coder_context_compaction_interrupt_turn_id = None
+                raise
+            return True
+
+    async def _maybe_compact_coder_context(self) -> bool:
+        if (
+            not getattr(self, "running", False)
+            or getattr(self, "paused", False)
+            or getattr(self, "_terminal_cleanup_started", False)
+            or not getattr(self, "_coder_context_compaction_pending", False)
+            or getattr(self, "_coder_context_compaction_in_progress", False)
+        ):
+            return False
+        runtime = getattr(self, "context_runtime", None)
+        coder = getattr(self, "coder", None)
+        if runtime is None or coder is None or not coder.thread_id:
+            return False
+        if getattr(self, "pending_approvals", None):
+            return False
+        if coder.active_turn_id:
+            await self._interrupt_coder_for_context_compaction()
+            return False
+
+        async with self._get_coder_transition_lock():
+            coder = getattr(self, "coder", None)
+            if (
+                coder is None
+                or not coder.thread_id
+                or coder.active_turn_id
+                or coder.thread_id != getattr(self, "_coder_context_thread_id", None)
+                or not getattr(self, "_coder_context_compaction_pending", False)
+            ):
+                return False
+            thread_id = coder.thread_id
+            input_tokens = getattr(self, "_coder_context_input_tokens", None)
+            baseline = getattr(self, "_coder_context_compaction_baseline_tokens", None)
+            growth = (
+                max(0, input_tokens - baseline)
+                if isinstance(input_tokens, int) and isinstance(baseline, int)
+                else None
+            )
+            self._coder_context_compaction_in_progress = True
+            self._coder_context_compaction_pending = False
+            checkpoint_cursor: CheckpointCursor | None = None
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "coder_context_compaction_started",
+                    "thread_id": thread_id,
+                    "input_tokens": input_tokens,
+                    "baseline_tokens": baseline,
+                    "growth_tokens": growth,
+                    "threshold_tokens": CODER_CONTEXT_COMPACT_THRESHOLD_TOKENS,
+                    "minimum_growth_tokens": CODER_CONTEXT_COMPACT_MIN_GROWTH_TOKENS,
+                }
+            )
+            self.tui.render(
+                "SYSTEM",
+                f"compacting coder context at {input_tokens} input tokens",
+            )
+            try:
+                await runtime.quiesce(timeout_seconds=30.0)
+                checkpoint_cursor = await self._checkpoint_context_runtime(
+                    reason="PreCompact",
+                    transition="compaction",
+                    recovery_kind=CheckpointRecoveryKind.COMPACTION,
+                )
+                completed = await coder.compact_thread()
+                compact_turn_id = _turn_id_from_params(completed.params)
+                if isinstance(compact_turn_id, str):
+                    self._coder_context_compaction_turn_ids.add(compact_turn_id)
+                await self._recover_context_checkpoint(
+                    checkpoint_id=checkpoint_cursor.checkpoint_id,
+                    recovery_kind=CheckpointRecoveryKind.COMPACTION,
+                )
+                self._coder_context_compactions_completed = int(
+                    getattr(self, "_coder_context_compactions_completed", 0)
+                ) + 1
+                self._coder_context_compaction_baseline_tokens = None
+                self._coder_context_awaiting_post_compaction_sample = True
+                self.store.append_raw_log(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "coder_context_compaction_recovered",
+                        "thread_id": thread_id,
+                        "turn_id": compact_turn_id,
+                        "checkpoint_id": checkpoint_cursor.checkpoint_id,
+                        "input_tokens_before": input_tokens,
+                    }
+                )
+                self.store.update_runtime_metrics(
+                    lambda current: {
+                        **current,
+                        "coder_context_compaction_pending": False,
+                        "coder_context_compactions_completed": self._coder_context_compactions_completed,
+                        "coder_context_compaction_baseline_tokens": None,
+                        "coder_context_growth_tokens": None,
+                        "coder_context_awaiting_post_compaction_sample": True,
+                    }
+                )
+                self.tui.render("SYSTEM", "coder context compaction recovered")
+                return True
+            except (Exception, asyncio.CancelledError) as exc:
+                runtime.coordinator.mark_failed()
+                self.store.append_raw_log(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "coder_context_compaction_failed",
+                        "thread_id": thread_id,
+                        "checkpoint_id": (
+                            checkpoint_cursor.checkpoint_id if checkpoint_cursor is not None else None
+                        ),
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    }
+                )
+                await self.finalize(
+                    f"coder context compaction failed closed: {exc}",
+                    status=BelloStatus.PROVIDER_FAILURE,
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return False
+            finally:
+                self._coder_context_compaction_in_progress = False
+
+    def _mark_supervisor_thread_started(
+        self,
+        thread_id: str,
+        logical_role: Literal["runtime", "completion"],
+    ) -> None:
+        self._register_provider_logical_role(ClientRole.SUPERVISOR, thread_id, logical_role)
+
+    def _mark_runtime_thread_started(self, thread_id: str) -> None:
+        self._register_provider_logical_role(ClientRole.SUPERVISOR, thread_id, "runtime")
+
+    def _record_provider_token_usage(
+        self,
+        role: ClientRole,
+        params: dict[str, Any],
+        *,
+        process_epoch: int | None = None,
+        app_server_instance_id: str | None = None,
+    ) -> None:
+        """Persist every provider sample plus cumulative gauges; never sum notifications."""
+
+        thread_id = params.get("threadId")
+        token_usage = params.get("tokenUsage")
+        self._provider_token_sample_sequence = int(
+            getattr(self, "_provider_token_sample_sequence", 0)
+        ) + 1
+        turn_id = params.get("turnId") if isinstance(params.get("turnId"), str) else None
+        ledger_entry: dict[str, Any] = {
+            "schemaVersion": 1,
+            "sequence": self._provider_token_sample_sequence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "eventType": "thread/tokenUsage/updated",
+            "appEventSequence": self._sequence,
+            "transportRole": role.value,
+            "role": None,
+            "threadId": thread_id if isinstance(thread_id, str) else None,
+            "turnId": turn_id,
+            "processEpoch": process_epoch,
+            "appServerInstanceId": app_server_instance_id,
+            "tokenUsage": token_usage,
+        }
+        if not isinstance(thread_id, str) or not thread_id or not isinstance(token_usage, dict):
+            ledger_entry.update(
+                {
+                    "accepted": False,
+                    "error": "notification is missing a non-empty threadId or tokenUsage object",
+                }
+            )
+            self.store.append_provider_token_usage(ledger_entry)
+            self.store.update_runtime_metrics(
+                lambda current: {
+                    **current,
+                    "provider_token_usage_anomalies": int(current.get("provider_token_usage_anomalies") or 0) + 1,
+                }
+            )
+            return
+        gauges = getattr(self, "provider_token_gauges", None)
+        if gauges is None:
+            gauges = self.provider_token_gauges = ProviderTokenGaugeBook()
+        key = ProviderThreadKey(ContextClientRole(role.value), thread_id)
+        roles = getattr(self, "_provider_logical_roles", {})
+        ledger_entry["role"] = roles.get(key) if isinstance(roles, dict) else None
+        try:
+            update = gauges.update(key, token_usage)
+        except ContextModeDataError as exc:
+            ledger_entry.update(
+                {
+                    "accepted": False,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            self.store.append_provider_token_usage(ledger_entry)
+            self.store.update_runtime_metrics(
+                lambda current: {
+                    **current,
+                    "provider_token_usage_anomalies": int(current.get("provider_token_usage_anomalies") or 0) + 1,
+                }
+            )
+            return
+        ledger_entry.update(
+            {
+                "accepted": True,
+                "cumulative": {
+                    "numericTotalGauge": dict(update.numeric_total_gauge),
+                    "authoritativeTotalTokens": update.authoritative_total_tokens,
+                    "adjustedTotalTokens": update.adjusted_total_tokens,
+                    "liveDeltaTokens": update.live_delta_tokens,
+                    "ambiguous": update.ambiguous,
+                    "anomalyFields": list(update.anomaly_fields),
+                },
+            }
+        )
+        self.store.append_provider_token_usage(ledger_entry)
+        if (
+            role is ClientRole.CODER
+            and ledger_entry.get("role") == "coder"
+            and isinstance(token_usage, Mapping)
+        ):
+            self._record_coder_context_token_sample(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                token_usage=token_usage,
+            )
+        totals = gauges.role_totals(ContextClientRole(role.value))
+        names = provider_metric_names(ContextClientRole(role.value))
+
+        def patch(current: dict[str, Any]) -> dict[str, Any]:
+            for field, metric_name in names.items():
+                value = totals.get(field)
+                # ``None`` is an authoritative "unavailable/ambiguous" value.
+                # Leaving an older integer behind would silently turn a fork or
+                # incomplete provider schema into a false exact aggregate.
+                current[metric_name] = value if isinstance(value, int) else None
+            current["provider_token_usage_anomalies"] = gauges.anomaly_count
+            current["provider_token_usage_ambiguous_threads"] = gauges.ambiguous_thread_count
+            current["provider_token_usage_last_observation"] = {
+                "role": role.value,
+                "thread_id": thread_id,
+                "turn_id": params.get("turnId") if isinstance(params.get("turnId"), str) else None,
+                "numeric_total_gauge": dict(update.numeric_total_gauge),
+                "live_delta_tokens": update.live_delta_tokens,
+                "ambiguous": update.ambiguous,
+                "anomaly_fields": list(update.anomaly_fields),
+            }
+            return current
+
+        self.store.update_runtime_metrics(patch)
+
     def _record_supervisor_decision_metric(self, *, use_case: str, decision: str) -> None:
         def patch(current: dict[str, Any]) -> dict[str, Any]:
             counts = current.get("supervisor_decision_counts")
@@ -2156,7 +5243,7 @@ class BelloController:
             **completion_details,
         )
         if completion_review:
-            budget_action = self._completion_review_budget_action(packet=packet)
+            budget_action = self._completion_review_budget_action()
             if budget_action == "adversary":
                 await self._run_adversary_before_complete(None, packet=packet)
                 return
@@ -2485,7 +5572,7 @@ class BelloController:
                 generation=cfg.generation,
                 issue=issue,
             )
-            await self.coder.steer_or_start(decision.message_to_coder)
+            await self._steer_coder(decision.message_to_coder)
             return
         if decision.decision == SupervisorDecisionKind.RESTART:
             if not restart_candidate:
@@ -2499,7 +5586,7 @@ class BelloController:
                     issue=issue,
                 )
                 if self.coder:
-                    await self.coder.steer_or_start(message)
+                    await self._steer_coder(message)
                 return
             if restart_candidate_reason:
                 self.tui.render("SUPERVISOR", f"restart candidate: {restart_candidate_reason}")
@@ -2574,8 +5661,22 @@ class BelloController:
             return
         if decision.decision == CompletionReviewDecisionKind.RETURN:
             self._pending_completion_gate_rejection = None
+            post_adversary_rollover = self._packet_has_fresh_adversary_report(packet)
             decision = self._attach_adversary_report_to_return(decision, packet=packet)
+            if post_adversary_rollover:
+                report = packet.adversary_report if packet is not None else None
+                await self.restart_coder_generation(
+                    "start a clean coder chat before applying the confirmed adversary report"
+                    + (
+                        f" from adversary thread {report.thread_id}"
+                        if report is not None and report.thread_id
+                        else ""
+                    ),
+                    phase_rollover=True,
+                )
             await self._return_completion_to_coder(decision)
+            if post_adversary_rollover:
+                self._pending_adversary_report = None
             return
         if decision.decision == CompletionReviewDecisionKind.RESTART:
             if not getattr(self, "_generation_has_coder_turn", True):
@@ -2592,7 +5693,7 @@ class BelloController:
                     reason=decision.reason,
                 )
                 if self.coder:
-                    await self.coder.steer_or_start(POST_RESTART_CONTINUE_NUDGE)
+                    await self._steer_coder(POST_RESTART_CONTINUE_NUDGE)
                 return
             self._pending_completion_gate_rejection = None
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
@@ -2648,7 +5749,7 @@ class BelloController:
         self._active_adversary_workspace_root = snapshot_root
         self._adversary_denied_commands = []
         agent = AdversaryAgent(
-            self.client,
+            self.supervisor_client,
             snapshot_root,
             model=self._adversary_model(),
             intelligence=self._adversary_intelligence(),
@@ -2752,34 +5853,20 @@ class BelloController:
             completion_review=True,
         )
 
-    def _completion_review_budget_action(
-        self,
-        *,
-        packet: SupervisorWakePacket | None = None,
-    ) -> Literal["adversary", "complete"] | None:
+    def _completion_review_budget_action(self) -> Literal["adversary", "complete"] | None:
         cfg = self.store.get_bello_config()
         if self._effective_max_adversary_runs() <= 0:
             limit = cfg.max_completion_returns_before_adversary
-            if review_limit_reached(limit, cfg.completion_return_count):
+            if limit > 0 and cfg.completion_return_count >= limit:
                 return "complete"
             return None
         if cfg.adversary_run_count == 0:
             limit = cfg.max_completion_returns_before_adversary
-            if review_limit_reached(limit, cfg.completion_return_count):
+            if limit > 0 and cfg.completion_return_count >= limit:
                 return "adversary"
             return None
-        adversary_report = packet.adversary_report if packet is not None else None
-        if (
-            cfg.completion_returns_since_adversary == 0
-            and adversary_report is not None
-            and self._packet_has_fresh_adversary_report(packet)
-            and adversary_report.candidate_finding
-        ):
-            # Candidate findings always receive one independent adjudication. Optional
-            # post-adversary return budgets apply after that required check.
-            return None
         limit = cfg.max_completion_returns_after_adversary
-        if not review_limit_reached(limit, cfg.completion_returns_since_adversary):
+        if limit <= 0 or cfg.completion_returns_since_adversary < limit:
             return None
         if self._adversary_runs_remaining():
             return "adversary"
@@ -3067,6 +6154,7 @@ class BelloController:
 
     def _mark_adversary_thread_started(self, thread_id: str) -> None:
         self._active_adversary_thread_id = thread_id
+        self._register_provider_logical_role(ClientRole.SUPERVISOR, thread_id, "adversary")
 
     def _mark_adversary_thread_done(self, thread_id: str) -> None:
         if getattr(self, "_active_adversary_thread_id", None) == thread_id:
@@ -3586,7 +6674,7 @@ class BelloController:
             )
         )
         if self.coder and decision.message_to_coder:
-            await self.coder.steer_or_start(decision.message_to_coder)
+            await self._steer_coder(decision.message_to_coder)
         # Fresh completion-review thread per review: close the session after each return so
         # the next readiness review starts a new thread instead of accumulating prior turns.
         # The persistent thread otherwise grows ~55-85k tokens per return and crossed the
@@ -3597,7 +6685,27 @@ class BelloController:
         if supervisor is not None and hasattr(supervisor, "close_completion_review"):
             await supervisor.close_completion_review()
 
-    async def _resolve_pending_approvals(self, reason: str) -> None:
+    async def _resolve_pending_approvals(self, reason: str, *, best_effort: bool = False) -> None:
+        capability_store = getattr(self, "context_capability_store", None)
+        runtime = getattr(self, "context_runtime", None)
+        capability_ids = set(getattr(self, "_context_approval_capabilities", {}).values())
+        capability_ids.update(getattr(self, "_context_capability_by_item", {}).values())
+        for capability_id in capability_ids:
+            if capability_store is not None:
+                capability_store.revoke(capability_id)
+            if runtime is not None:
+                try:
+                    await _maybe_await(
+                        runtime.native_runtime.revoke_approval_capability(capability_id=capability_id)
+                    )
+                except Exception:
+                    if not best_effort:
+                        raise
+        getattr(self, "_context_approval_capabilities", {}).clear()
+        getattr(self, "_context_capability_by_item", {}).clear()
+        getattr(self, "_context_pending_approval_calls", {}).clear()
+        getattr(self, "_context_approval_item_by_request", {}).clear()
+        getattr(self, "_context_approval_correlation_issues", {}).clear()
         approvals = getattr(self, "approvals", None)
         if approvals is None:
             manager = ApprovalManager(
@@ -3607,10 +6715,35 @@ class BelloController:
             )
         else:
             manager = approvals
-        for request_id, context in list(self.pending_approvals.items()):
+        for pending_key, context in list(self.pending_approvals.items()):
             resolution = manager._deny(context, reason)
-            await self.client.respond(request_id, manager.response_payload(context, resolution))
-            self.pending_approvals.pop(request_id, None)
+            role_value = context.client_role or (
+                pending_key.role.value if isinstance(pending_key, PendingRequestKey) else ClientRole.CODER.value
+            )
+            client = self._client_for_role(ClientRole(role_value))
+            request_id = context.server_request_id
+            response = manager.response_payload(context, resolution)
+            try:
+                if isinstance(client, AppServerClient):
+                    await client.respond(
+                        request_id,
+                        response,
+                        process_epoch=context.process_epoch or None,
+                        app_server_instance_id=context.app_server_instance_id,
+                    )
+                else:
+                    await client.respond(request_id, response)
+            except Exception as exc:
+                if not best_effort:
+                    raise
+                self._append_cleanup_error(
+                    cleanup_kind="terminal_pending_approval_response",
+                    thread_id=context.thread_id or "unknown",
+                    turn_id=context.turn_id,
+                    error=exc,
+                )
+            finally:
+                self.pending_approvals.pop(pending_key, None)
         self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"pending_server_request_ids": []}))
 
     async def _stop_supervisor_task(self) -> None:
@@ -3886,13 +7019,60 @@ class BelloController:
         return "\n\n".join(parts)
 
     async def _on_notification(self, message: AppServerMessage) -> None:
-        await self.event_queue.put(ControllerEvent(kind="notification", message=message))
+        await self._queue_app_server_message("notification", message, fallback_role=ClientRole.CODER)
 
     async def _on_server_request(self, message: AppServerMessage) -> None:
-        await self.event_queue.put(ControllerEvent(kind="server_request", message=message))
+        await self._queue_app_server_message("server_request", message, fallback_role=ClientRole.CODER)
 
     async def _on_transport_error(self, error: BaseException) -> None:
-        await self.event_queue.put(ControllerEvent(kind="transport_error", error=error, error_message=str(error)))
+        await self._queue_transport_error(error, fallback_role=ClientRole.CODER)
+
+    async def _on_coder_notification(self, message: AppServerMessage) -> None:
+        await self._queue_app_server_message("notification", message, fallback_role=ClientRole.CODER)
+
+    async def _on_coder_server_request(self, message: AppServerMessage) -> None:
+        await self._queue_app_server_message("server_request", message, fallback_role=ClientRole.CODER)
+
+    async def _on_coder_transport_error(self, error: BaseException) -> None:
+        await self._queue_transport_error(error, fallback_role=ClientRole.CODER)
+
+    async def _on_supervisor_notification(self, message: AppServerMessage) -> None:
+        await self._queue_app_server_message("notification", message, fallback_role=ClientRole.SUPERVISOR)
+
+    async def _on_supervisor_server_request(self, message: AppServerMessage) -> None:
+        await self._queue_app_server_message("server_request", message, fallback_role=ClientRole.SUPERVISOR)
+
+    async def _on_supervisor_transport_error(self, error: BaseException) -> None:
+        await self._queue_transport_error(error, fallback_role=ClientRole.SUPERVISOR)
+
+    async def _queue_app_server_message(
+        self,
+        kind: str,
+        message: AppServerMessage,
+        *,
+        fallback_role: ClientRole,
+    ) -> None:
+        await self.event_queue.put(
+            ControllerEvent(
+                kind=kind,
+                role=message.role or fallback_role,
+                process_epoch=message.process_epoch,
+                app_server_instance_id=message.app_server_instance_id,
+                message=message,
+            )
+        )
+
+    async def _queue_transport_error(self, error: BaseException, *, fallback_role: ClientRole) -> None:
+        await self.event_queue.put(
+            ControllerEvent(
+                kind="transport_error",
+                role=_client_role_from_error(error) or fallback_role,
+                process_epoch=_process_epoch_from_error(error),
+                app_server_instance_id=_instance_id_from_error(error),
+                error=error,
+                error_message=str(error),
+            )
+        )
 
     def _append_cleanup_error(
         self,
@@ -3924,6 +7104,10 @@ class BelloController:
         item_id: Any = None,
         decision: Any = None,
         reason: str | None = None,
+        client_role: ClientRole | str | None = None,
+        process_epoch: int | None = None,
+        app_server_instance_id: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         self._sequence += 1
         cfg = self.store.get_bello_config()
@@ -3937,6 +7121,10 @@ class BelloController:
             item_id=item_id if isinstance(item_id, str) else None,
             decision=decision,
             reason=reason,
+            client_role=ClientRole(client_role).value if client_role is not None else None,
+            process_epoch=process_epoch,
+            app_server_instance_id=app_server_instance_id,
+            payload=payload or {},
         )
         self.store.append_event(event)
         self.store.update_bello_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
@@ -3964,7 +7152,11 @@ class BelloController:
             digest = hashlib.sha256()
             for path in sorted(out_dir.rglob("*.json")):
                 digest.update(str(path.relative_to(out_dir)).encode("utf-8"))
-                digest.update(path.read_bytes())
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"app-server schema is not canonicalizable: {path.name}") from exc
+                digest.update(canonical_json_bytes(payload))
             return digest.hexdigest()
 
     async def _generate_schema_hash_async(self) -> str:
@@ -3972,7 +7164,7 @@ class BelloController:
 
     async def _structured_output_self_test(self) -> None:
         agent = StatelessSupervisorAgent(
-            self.client,
+            self.supervisor_client,
             self.store,
             self.task_path,
             workspace_root=self._active_workspace_root(),
@@ -3980,6 +7172,7 @@ class BelloController:
             model=self._runtime_model(),
             fast=self._fast_mode(),
             intelligence=self._runtime_intelligence(),
+            on_thread_start=self._mark_supervisor_thread_started,
         )
         cfg = self.store.get_bello_config()
         packet = SupervisorWakePacket(
@@ -4016,10 +7209,11 @@ class BelloController:
             )
             return
         reviewer = CheapRuntimeReviewer(
-            self.client,
+            self.supervisor_client,
             self._active_workspace_root(),
             model=config.model,
             timeout_seconds=config.timeout_seconds,
+            on_thread_start=self._mark_runtime_thread_started,
         )
         try:
             await self._cheap_runtime_structured_output_self_test(reviewer)
@@ -4104,6 +7298,7 @@ def _approval_wake_context(
     reason: str | None = None,
     *,
     origin: str = "coder",
+    context_summary: RedactedSummary | None = None,
 ) -> ApprovalWakeContext:
     return ApprovalWakeContext(
         request_type=context.request_type.value,
@@ -4111,6 +7306,15 @@ def _approval_wake_context(
         method=context.server_request_method,
         available_decisions=context.available_decisions,
         command=context.command,
+        context_arguments_summary=(
+            dict(context_summary.value) if context_summary is not None else None
+        ),
+        context_arguments_correlation_digest=(
+            context_summary.correlation_digest if context_summary is not None else None
+        ),
+        context_arguments_redacted_or_truncated=(
+            context_summary.redacted_or_truncated if context_summary is not None else None
+        ),
         file_changes=context.file_changes,
         paths=context.paths,
         cwd=context.cwd,
@@ -4482,6 +7686,13 @@ def _classify_validation_command(command: str, *, changed_paths: list[str]) -> s
         return "static"
     if _is_behavioral_validation_command(command):
         return "behavioral"
+    # A shell pipeline/sequencing operator makes its exit status untrustworthy,
+    # but it must not make an actually executed test runner disappear from the
+    # validation ledger.  Recognize only tokenized command segments whose
+    # executable is a runner; arbitrary mentions such as ``echo pytest`` remain
+    # non-validations.
+    if _masked_behavioral_runner_identity(command) is not None:
+        return "behavioral"
     if _is_behavior_demo_command(command, changed_paths=changed_paths):
         return "behavior_demo"
     return None
@@ -4643,23 +7854,113 @@ def _is_read_only_inspection_tokens(tokens: list[str]) -> bool:
 
 
 def _is_behavioral_validation_command(command: str) -> bool:
+    return _behavioral_runner_identity(command) is not None
+
+
+def _masked_behavioral_runner_identity(command: str) -> str | None:
     inner = _shell_command_payload(command)
-    if inner is not None and inner != command:
-        return _is_behavioral_validation_command(inner)
-    lowered = command.lower()
-    executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
-    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
-    node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
-    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
-    patterns = (
-        executable_prefix + r"mocha(\s|$)",
-        r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?test(\s|$|:)",
-        r"(^|[\s;&|()'\"])" + node_exec + r"\s+--test(\s|$)",
-        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
-        executable_prefix + r"(jest|ava|tap|vitest|playwright|cypress|pytest|tox|rspec)(\s|$)",
-        executable_prefix + r"(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
+    candidate = inner if inner is not None and inner != command else command
+    if _generic_validation_masking_reason(candidate) is None:
+        return None
+    try:
+        lexer = shlex.shlex(candidate, posix=True, punctuation_chars="|;&<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = [token for token in lexer if token]
+    except ValueError:
+        return None
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in {"&&", "||", ";", "|"}:
+            if not current:
+                return None
+            segments.append(current)
+            current = []
+            continue
+        if token == "&" or any(char in token for char in "<>"):
+            return None
+        current.append(token)
+    if current:
+        segments.append(current)
+    for segment in segments:
+        identity = _behavioral_runner_identity(shlex.join(segment))
+        if identity is not None:
+            return identity
+    return None
+
+
+def _behavioral_runner_identity(command: str) -> str | None:
+    """Return a direct, tokenized test runner; never search arbitrary text."""
+
+    inner = _shell_command_payload(command)
+    candidate = inner if inner is not None and inner != command else command
+    if any(marker in candidate for marker in ("&&", "||", ";", "|", "`", "$(", ">", "<")):
+        return None
+    try:
+        tokens = _strip_env_command_prefix(shlex.split(candidate))
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    arguments = [token.lower() for token in tokens[1:]]
+    direct_runners = {
+        "mocha",
+        "jest",
+        "ava",
+        "tap",
+        "vitest",
+        "playwright",
+        "cypress",
+        "pytest",
+        "pytest-3",
+        "tox",
+        "rspec",
+    }
+    if executable in direct_runners:
+        return executable
+    if executable == "npx" and arguments:
+        nested = arguments[0].rsplit("/", 1)[-1]
+        return f"npx:{nested}" if nested in direct_runners else None
+    if executable in {"npm", "pnpm", "yarn"}:
+        normalized = arguments[1:] if arguments[:1] == ["run"] else arguments
+        if normalized and (normalized[0] == "test" or normalized[0].startswith("test:")):
+            return f"{executable}:test"
+        return None
+    if executable in {"node", "nodejs"} and "--test" in arguments:
+        return "node:test"
+    if re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable):
+        for index, token in enumerate(arguments[:-1]):
+            if token == "-m" and arguments[index + 1] in {
+                "pytest",
+                "unittest",
+                "tox",
+                "nose",
+                "nose2",
+            }:
+                return f"python:{arguments[index + 1]}"
+        if arguments and not arguments[0].startswith("-") and _test_script_basename(arguments[0]):
+            return "python:test-script"
+        return None
+    if executable in {"go", "cargo", "mvn", "gradle", "gradlew", "swift", "dotnet", "make"}:
+        if "test" in arguments:
+            return f"{executable}:test"
+        return None
+    if _test_script_basename(tokens[0]):
+        return "test-script"
+    return None
+
+
+def _test_script_basename(value: str) -> bool:
+    basename = value.rsplit("/", 1)[-1].lower()
+    return bool(
+        re.fullmatch(
+            r"(?:tests?(?:[._-][\w.-]+)*|[\w.-]+[._-]tests?(?:[._-][\w.-]+)*)"
+            r"\.(?:py|js|mjs|cjs|rb|sh)",
+            basename,
+        )
     )
-    return any(re.search(pattern, lowered) for pattern in patterns) or _is_test_wrapper_script_command(command)
 
 
 def _is_test_wrapper_script_command(command: str) -> bool:
@@ -4806,7 +8107,7 @@ def _command_requires_changed_module(command: str, changed_paths: list[str]) -> 
 
 
 def _tests_executed(command: str, output: str) -> bool:
-    if not _is_behavioral_validation_command(command):
+    if _behavioral_runner_identity(command) is None:
         return True
     lowered = output.lower()
     zero_test_patterns = (
@@ -4817,7 +8118,18 @@ def _tests_executed(command: str, output: str) -> bool:
         r"\bran\s+0\s+tests?\b",
         r"\bno tests?\s+(found|run|executed)\b",
     )
-    return not any(re.search(pattern, lowered) for pattern in zero_test_patterns)
+    if any(re.search(pattern, lowered) for pattern in zero_test_patterns):
+        return False
+    positive_test_patterns = (
+        r"\b[1-9]\d*\s+(?:passed|passing|failed|failing|tests?|specs?)\b",
+        r"\bran\s+[1-9]\d*\s+tests?\b",
+        r"(?m)^#\s*tests\s+[1-9]\d*\s*$",
+        r"(?m)^1\.\.[1-9]\d*\s*$",
+        r"(?m)^ok\s+[^\n]+",
+        r"\btest result:\s*(?:ok|failed)\b[^\n]*\b[1-9]\d*\s+(?:passed|failed)\b",
+        r"\b(?:passed|failed)\b[^\n]*::(?:test|spec)[\w.-]*\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in positive_test_patterns)
 
 
 def _command_output_from_item(item: Any, *, limit: int = 20000) -> str:
@@ -7379,9 +10691,9 @@ def _workspace_path_fingerprint(
         file_stat.st_ctime_ns,
         file_stat.st_ino,
     )
-    cached = cache.get(relative_path)
-    if cached is not None and cached[0] == stat_key:
-        return cached[1]
+    # Do not trust timestamp/size tuples for security-sensitive trigger
+    # deduplication: coarse or virtual filesystems can rewrite same-sized
+    # content without changing either timestamp.
     if not stat.S_ISREG(file_stat.st_mode):
         fingerprint = hashlib.sha256(repr(stat_key).encode("ascii")).hexdigest()
     else:
@@ -7914,6 +11226,40 @@ def _run_probe(args: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     return completed.returncode == 0, (completed.stdout + completed.stderr).strip()
 
 
+def _strict_json_equal(actual: Any, expected: Any) -> bool:
+    """Compare protocol values without Python's ``True == 1`` aliasing."""
+
+    try:
+        return canonical_json_bytes(actual) == canonical_json_bytes(expected)
+    except ContextModeDataError:
+        return False
+
+
+def _role_app_server_environment_overrides(
+    run_root: Path,
+    role: Literal["coder", "supervisor"],
+) -> dict[str, str]:
+    home = (Path(run_root) / f"app-server-home-{role}").resolve(strict=True)
+    temp = (Path(run_root) / f"app-server-tmp-{role}").resolve(strict=True)
+    return {
+        "HOME": os.fspath(home),
+        "TMPDIR": os.fspath(temp),
+        "TMP": os.fspath(temp),
+        "TEMP": os.fspath(temp),
+        "XDG_CONFIG_HOME": os.fspath(home / ".config"),
+        "XDG_CACHE_HOME": os.fspath(home / ".cache"),
+    }
+
+
+def _pinned_codex_version_from_output(output: str) -> str:
+    matches = re.findall(r"(?m)^codex-cli [0-9]+\.[0-9]+\.[0-9]+$", output)
+    if len(matches) != 1:
+        raise ContextModeStartupError(
+            "Context Mode could not identify one exact Codex CLI version line"
+        )
+    return matches[0]
+
+
 def _resolve_controller_models(
     *,
     model: str | None,
@@ -8230,6 +11576,79 @@ def _item_id_from_params(params: dict[str, Any]) -> str | None:
     return None
 
 
+def _client_role_from_error(error: BaseException | None) -> ClientRole | None:
+    value = getattr(error, "role", None)
+    try:
+        return ClientRole(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _process_epoch_from_error(error: BaseException | None) -> int:
+    value = getattr(error, "process_epoch", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _instance_id_from_error(error: BaseException | None) -> str | None:
+    value = getattr(error, "app_server_instance_id", None)
+    return value if isinstance(value, str) and value else None
+
+
+async def _maybe_await(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left = Path(left).resolve(strict=False)
+    right = Path(right).resolve(strict=False)
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalized_json_digest(value: Any) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        encoded = b"<invalid-json>"
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _mcp_approval_meta(params: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return only the stock Codex elicitation metadata object."""
+
+    meta = params.get("_meta")
+    return meta if isinstance(meta, dict) else None
+
+
+def _mcp_approval_arguments_from_params(params: Mapping[str, Any]) -> Any | None:
+    """Read the sole authoritative argument source for Codex MCP approval."""
+
+    meta = _mcp_approval_meta(params)
+    if meta is None or "tool_params" not in meta:
+        return None
+    return meta["tool_params"]
+
+
+def _is_bello_context_mode_item(item: Any) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "mcpToolCall":
+        return False
+    return item.get("server") == "bello_context_mode"
+
+
 def _item_summary(item: Any) -> str:
     if not isinstance(item, dict):
         return "item completed"
@@ -8249,6 +11668,27 @@ def _item_summary(item: Any) -> str:
 
 def _is_completed_action(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+
+
+def _logical_item_tuple(params: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    thread_id = params.get("threadId")
+    turn_id = _turn_id_from_params(params)
+    item_id = _item_id_from_params(params)
+    if all(isinstance(value, str) and value for value in (thread_id, turn_id, item_id)):
+        return thread_id, turn_id, item_id
+    return None
+
+
+def _item_may_mutate_workspace(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if _is_bello_context_mode_item(item):
+        return item.get("tool") in EXECUTION_TOOLS
+    return item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
+
+
+def _action_may_mutate_workspace(action: TriggeringAction) -> bool:
+    return action.kind in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
 
 
 def _adversary_enabled_from_env() -> bool | None:

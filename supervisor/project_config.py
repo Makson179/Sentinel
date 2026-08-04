@@ -5,14 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from supervisor.review_limits import (
-    EXPLICIT_REVIEW_LIMIT_FORMAT,
-    REVIEW_LIMIT_FORMAT_FIELD,
-    ReviewLimit,
-    normalize_review_limit,
-    normalize_review_limit_payload,
-)
-
 
 MODEL_GPT_5_6_SOL = "gpt-5.6-sol"
 MODEL_GPT_5_6_TERRA = "gpt-5.6-terra"
@@ -49,6 +41,7 @@ RUNTIME_SYNC_FIELDS = (
     "completion_returns_after_adversary",
     "clean",
     "protected_path",
+    "context_mode",
 )
 
 
@@ -73,10 +66,16 @@ class ProjectConfig:
     completion_review: bool = False
     adversary: bool = False
     adversary_runs: int = 1
-    completion_returns_before_adversary: ReviewLimit = 1
-    completion_returns_after_adversary: ReviewLimit = 0
+    completion_returns_before_adversary: int = 4
+    completion_returns_after_adversary: int = 2
     clean: bool = False
     protected_path: tuple[str, ...] = ()
+    # Context Mode is a Bello-owned, coder-only offline runtime.  The security
+    # properties are intentionally not configurable: disabling the integration
+    # is the only supported policy switch.
+    # Context Mode remains opt-in until a signed platform runtime/broker bundle
+    # has passed the release gates in task.md stage 8.
+    context_mode: bool = False
 
     @property
     def fast(self) -> bool:
@@ -84,7 +83,6 @@ class ProjectConfig:
 
     def to_json_data(self) -> dict[str, Any]:
         return {
-            REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
             "task": self.task,
             "coder_mod": self.coder_mod,
             "runtime_mod": self.runtime_mod,
@@ -104,6 +102,13 @@ class ProjectConfig:
             "max_completion_returns_after_adversary": self.completion_returns_after_adversary,
             "clean": self.clean,
             "protected_path": list(self.protected_path),
+            "context_mode": {
+                "enabled": self.context_mode,
+                "coder_only": True,
+                "offline": True,
+                "full_local_functionality": True,
+                "persist_for_run": True,
+            },
         }
 
 
@@ -143,13 +148,7 @@ def load_project_config(project_root: Path, *, create: bool = True) -> ProjectCo
         raise ProjectConfigError(f"could not read Bello config at {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ProjectConfigError(f"invalid Bello config at {path}: expected a JSON object")
-    normalized_payload = normalize_review_limit_payload(payload)
-    if normalized_payload.get(REVIEW_LIMIT_FORMAT_FIELD) != EXPLICIT_REVIEW_LIMIT_FORMAT:
-        raise ProjectConfigError(
-            f"invalid Bello config at {path}: {REVIEW_LIMIT_FORMAT_FIELD} must be "
-            f"'{EXPLICIT_REVIEW_LIMIT_FORMAT}'"
-        )
-    return _config_from_payload(normalized_payload, path=path)
+    return _config_from_payload(payload, path=path)
 
 
 def save_project_config(project_root: Path, config: ProjectConfig) -> None:
@@ -190,7 +189,7 @@ def sync_runtime_config_fields(project_root: Path, config: ProjectConfig, fields
     runtime_config: BelloConfig
     if isinstance(raw_config, dict) and raw_config:
         try:
-            runtime_config = BelloConfig.model_validate(normalize_review_limit_payload(raw_config))
+            runtime_config = BelloConfig.model_validate(raw_config)
         except ValidationError:
             runtime_config = _runtime_config_from_project_config(project_root, config)
     else:
@@ -291,7 +290,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         ),
         adversary=_adversary_from_payload(payload, default.adversary, path=path),
         adversary_runs=_adversary_runs_from_payload(payload, default.adversary_runs, path=path),
-        completion_returns_before_adversary=_review_limit(
+        completion_returns_before_adversary=_non_negative_int(
             _first_present(
                 payload,
                 ("max_completion_returns_before_adversary", "max_completion_returns_per_generation"),
@@ -300,7 +299,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
             "max_completion_returns_before_adversary",
             path=path,
         ),
-        completion_returns_after_adversary=_review_limit(
+        completion_returns_after_adversary=_non_negative_int(
             payload.get(
                 "max_completion_returns_after_adversary",
                 default.completion_returns_after_adversary,
@@ -316,6 +315,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
                 path=path,
             )
         ),
+        context_mode=_context_mode_from_payload(payload, default.context_mode, path=path),
     )
 
 
@@ -378,13 +378,6 @@ def _adversary_runs_value(value: Any, *, path: Path) -> int:
     return _non_negative_int(value, "max_adversary_runs", path=path)
 
 
-def _review_limit(value: Any, field: str, *, path: Path) -> ReviewLimit:
-    try:
-        return normalize_review_limit(value)
-    except ValueError as exc:
-        raise ProjectConfigError(f"invalid Bello config at {path}: {field} {exc}") from exc
-
-
 def _non_negative_int(value: Any, field: str, *, path: Path) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
@@ -395,6 +388,42 @@ def _bool(value: Any, field: str, *, path: Path) -> bool:
     if isinstance(value, bool):
         return value
     raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be true or false")
+
+
+def _context_mode_from_payload(payload: dict[str, Any], default: bool, *, path: Path) -> bool:
+    """Read the versioned Context Mode policy without accepting unsafe knobs.
+
+    Older run configs may carry a flat ``context_mode_enabled`` field.  New
+    configs persist an object mirroring the documented TOML section.  Fixed
+    security fields, when present, must retain their mandatory values.
+    """
+
+    value = _first_present(payload, ("context_mode", "context_mode_enabled"), default)
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, dict):
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: context_mode must be true, false, or an object"
+        )
+    allowed = {
+        "enabled",
+        "coder_only",
+        "offline",
+        "full_local_functionality",
+        "persist_for_run",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: unsupported context_mode fields: {', '.join(unknown)}"
+        )
+    required_true = ("coder_only", "offline", "full_local_functionality", "persist_for_run")
+    for field in required_true:
+        if field in value and value[field] is not True:
+            raise ProjectConfigError(
+                f"invalid Bello config at {path}: context_mode.{field} is fixed to true"
+            )
+    return _bool(value.get("enabled", default), "context_mode.enabled", path=path)
 
 
 def _string_list(value: Any, field: str, *, path: Path) -> list[str]:
@@ -465,6 +494,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "protected_path" in selected:
         updates["protected_path"] = list(config.protected_path)
         updates["protected_paths"] = list(config.protected_path)
+    if "context_mode" in selected:
+        updates["context_mode_enabled"] = config.context_mode
     if "completion_review" in selected:
         updates["completion_review_enabled"] = config.completion_review
     if selected.intersection({"adversary", "adversary_runs"}):

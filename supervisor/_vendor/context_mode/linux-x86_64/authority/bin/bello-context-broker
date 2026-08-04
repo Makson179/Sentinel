@@ -1,0 +1,1824 @@
+#!/usr/bin/python3
+"""Linux Context Mode authority broker.
+
+This file is intentionally self contained: the signed authority payload may not
+import the Bello wheel (or any package from the user's Python environment).
+The controller side is newline-delimited JSON-RPC; the public side is an opaque
+Linux abstract AF_UNIX socket used only by the signed launcher.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import ctypes
+import datetime as _datetime
+import errno
+import fnmatch
+import hashlib
+import hmac
+import json
+import os
+import platform
+import resource
+import secrets
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path, PurePosixPath
+from typing import Any, Mapping
+
+
+CONTROLLER_PROTOCOL = "bello-context-native-v1"
+PROXY_PROTOCOL = "bello-context-proxy-v1"
+ALLOWED_TOOLS = (
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_batch_execute",
+    "ctx_index",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_doctor",
+    "ctx_purge",
+)
+CAPABILITY_TOOLS = frozenset(
+    {"ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_purge"}
+)
+REQUIRED_HOOKS = (
+    "PreToolUse",
+    "PostToolUse",
+    "SessionStart",
+    "PreCompact",
+    "UserPromptSubmit",
+    "Stop",
+)
+PINNED_CODEX_VERSION = "codex-cli 0.146.0"
+PINNED_APPSERVER_SCHEMA = (
+    "8b4f3070be27707f5f621196fff0bad967f9b47093737fe1699c859a69d52289"
+)
+APPROVAL_FIELDS = (
+    "role",
+    "process_epoch",
+    "request_id",
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "server",
+    "tool",
+    "arguments",
+    "cwd",
+    "binding_version",
+    "generation_lease_id",
+)
+PURGE_ATTESTATION = {
+    "exclusive_lifecycle_lease": True,
+    "quiesce_before_epoch_rotation": True,
+    "receipt_committed_before_terminal": True,
+    "physical_epoch_isolation": True,
+    "active_epoch_mount_only": True,
+    "atomic_epoch_switch": True,
+    "writer_reap_before_epoch_retirement": True,
+    "old_epoch_retained_until_recycle": True,
+    "lease_bound_purge_capability": True,
+}
+CHECKPOINT_ATTESTATION = {
+    "cursor_hmac_authority_is_broker_only": True,
+    "wal_commit_before_checkpoint_ack": True,
+    "session_start_before_recovery_ack": True,
+    "reason_specific_binding_validation": True,
+    "bounded_replay_acknowledgement": True,
+    "checkpoint_idempotency_persisted": True,
+}
+LINUX_CHECKS = frozenset(
+    {
+        "network_namespace",
+        "loopback_down",
+        "mount_namespace",
+        "pid_namespace",
+        "seccomp_network_deny",
+        "descendant_inheritance",
+        "fd_isolation",
+        "nested_readonly_mounts",
+        "workspace_path_filter",
+        "exact_bootstrap_file_mount",
+        "authenticated_direct_exec_runner",
+        "ptrace_denied",
+        "process_vm_readv_denied",
+        "process_vm_writev_denied",
+        "cross_tree_signals_denied",
+        "non_dumpable",
+        "core_dump_disabled",
+        "rlimit_cpu_enforced",
+        "rlimit_address_space_enforced",
+        "rlimit_processes_enforced",
+        "rlimit_open_files_enforced",
+        "rlimit_file_size_enforced",
+        "wall_time_process_tree_enforced",
+        "process_tree_kill_reap",
+    }
+)
+MAX_LINE = 8 * 1024 * 1024
+MAX_RESULT = 64 * 1024
+MAX_HOOK_INPUT = 256 * 1024
+MAX_CHANGED_PATHS = 4096
+
+
+class BrokerError(RuntimeError):
+    pass
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                return result.hexdigest()
+            result.update(block)
+
+
+def _strict_file(path: Path, *, mode: int | None = None) -> os.stat_result:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise BrokerError(f"not a regular non-symlink file: {path}")
+    if mode is not None and stat.S_IMODE(info.st_mode) != mode:
+        raise BrokerError(f"unsafe file mode for {path}")
+    return info
+
+
+def _binding_parts(binding: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    if set(binding) != {"schema_version", "stable", "lifecycle"} or binding.get("schema_version") != 1:
+        raise BrokerError("binding schema mismatch")
+    stable = binding.get("stable")
+    lifecycle = binding.get("lifecycle")
+    if not isinstance(stable, Mapping) or not isinstance(lifecycle, Mapping):
+        raise BrokerError("binding identity is malformed")
+    return stable, lifecycle
+
+
+def _same_json(left: Any, right: Any) -> bool:
+    return type(left) is type(right) and left == right
+
+
+def _safe_relative(path: str) -> bool:
+    candidate = PurePosixPath(path)
+    return bool(path) and not candidate.is_absolute() and all(
+        part not in {"", ".", ".."} for part in candidate.parts
+    )
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    payload = _canonical(value) + b"\n"
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(12)}"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _prctl(option: int, argument: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(option, argument, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _secure_process() -> None:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    _prctl(4, 0)  # PR_SET_DUMPABLE
+
+
+def _seccomp_syscalls() -> tuple[int, ...]:
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        network = (
+            # socketpair(2) is intentionally omitted: Node child_process uses
+            # an AF_UNIX socketpair for its local exec-error channel. Network
+            # families remain blocked at socket(2), and the namespace has no
+            # loopback or external routes.
+            41, 42, 43, 44, 45, 46, 47, 49, 50,
+            288, 299, 307,
+        )
+        process = (101, 310, 311, 165, 166, 272, 308)
+    elif machine in {"aarch64", "arm64"}:
+        network = (
+            198, 200, 201, 202, 203, 206, 207, 211, 212, 242, 243, 269,
+        )
+        process = (117, 270, 271, 40, 39, 97, 268)
+    else:
+        raise BrokerError(f"unsupported seccomp architecture: {machine}")
+    return tuple(sorted(set(network + process)))
+
+
+def _seccomp_fd() -> int:
+    # bubblewrap accepts a raw array of Linux struct sock_filter records.
+    # For each forbidden syscall: JEQ -> ERRNO(EPERM), otherwise continue.
+    records: list[tuple[int, int, int, int]] = [(0x20, 0, 0, 0)]  # LD nr
+    for syscall_number in _seccomp_syscalls():
+        records.append((0x15, 0, 1, syscall_number))
+        records.append((0x06, 0, 0, 0x00050000 | errno.EPERM))
+    records.append((0x06, 0, 0, 0x7FFF0000))  # SECCOMP_RET_ALLOW
+    payload = b"".join(struct.pack("HBBI", *record) for record in records)
+    descriptor = os.memfd_create("bello-seccomp", getattr(os, "MFD_CLOEXEC", 0))
+    os.write(descriptor, payload)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return descriptor
+
+
+def _sandbox_preexec(limits: Mapping[str, Any]) -> None:
+    _secure_process()
+    pairs = (
+        (resource.RLIMIT_CPU, int(limits.get("cpu_time_seconds", 1800))),
+        (resource.RLIMIT_AS, int(limits.get("address_space_bytes", 2 * 1024**3))),
+        (resource.RLIMIT_NPROC, int(limits.get("processes", 128))),
+        (resource.RLIMIT_NOFILE, int(limits.get("open_files", 512))),
+        (resource.RLIMIT_FSIZE, int(limits.get("single_file_bytes", 512 * 1024**2))),
+        (resource.RLIMIT_CORE, 0),
+    )
+    for kind, ceiling in pairs:
+        resource.setrlimit(kind, (ceiling, ceiling))
+
+
+def _probe_backend() -> Mapping[str, Any]:
+    bwrap = Path("/usr/bin/bwrap")
+    unshare = Path("/usr/bin/unshare")
+    _strict_file(bwrap)
+    _strict_file(unshare)
+    if not os.access(bwrap, os.X_OK):
+        raise BrokerError("bubblewrap is not executable")
+    if not os.access(unshare, os.X_OK):
+        raise BrokerError("unshare is not executable")
+    host_mnt = os.readlink("/proc/self/ns/mnt")
+    host_net = os.readlink("/proc/self/ns/net")
+    host_pid_namespace = os.readlink("/proc/self/ns/pid")
+    probe_script = r'''
+import ctypes, errno, json, os, resource, socket, subprocess
+libc = ctypes.CDLL(None, use_errno=True)
+assert os.getpid() in (1, 2)
+assert os.readlink('/proc/self/ns/mnt') != os.environ['HOST_MNT_NS']
+assert os.readlink('/proc/self/ns/net') != os.environ['HOST_NET_NS']
+assert os.readlink('/proc/self/ns/pid') != os.environ['HOST_PID_NS']
+assert len(open('/proc/net/route').read().splitlines()) <= 1
+# A freshly unshared Linux network namespace may contain an active loopback
+# interface. Route absence is checked here; a separate pre-seccomp probe
+# verifies that an attempted external connection cannot leave the namespace.
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+except OSError as exc:
+    assert exc.errno == errno.EPERM
+else:
+    raise AssertionError('network socket escaped seccomp')
+left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+left.close()
+right.close()
+try:
+    open('/probe/readonly/value', 'w').write('changed')
+except OSError:
+    pass
+else:
+    raise AssertionError('readonly mount was writable')
+assert open('/bootstrap.json').read() == 'bootstrap\n'
+assert not os.path.exists('/bootstrap-secret.json')
+assert not os.path.exists('/workspace/.codex/secret')
+for fd in range(3, 128):
+    try:
+        os.fstat(fd)
+    except OSError:
+        continue
+    raise AssertionError('inherited descriptor %d' % fd)
+assert libc.prctl(4, 0, 0, 0, 0) == 0
+assert libc.prctl(3, 0, 0, 0, 0) == 0
+assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+for kind in (resource.RLIMIT_CPU, resource.RLIMIT_AS, resource.RLIMIT_NPROC,
+             resource.RLIMIT_NOFILE, resource.RLIMIT_FSIZE):
+    soft, hard = resource.getrlimit(kind)
+    assert soft == hard and soft > 0
+try:
+    os.kill(int(os.environ['HOST_BROKER_PID']), 0)
+except (ProcessLookupError, PermissionError):
+    pass
+else:
+    raise AssertionError('host process visible from child PID namespace')
+child = subprocess.run(['/usr/bin/python3', '-c',
+    'import socket,sys;\ntry: socket.socket(); sys.exit(2)\nexcept PermissionError: sys.exit(0)'],
+    close_fds=True)
+assert child.returncode == 0
+print(json.dumps({'ok': True}, sort_keys=True, separators=(',', ':')))
+'''
+    limits = {
+        "cpu_time_seconds": 10,
+        "address_space_bytes": 1024 * 1024 * 1024,
+        "processes": 32,
+        "open_files": 128,
+        "single_file_bytes": 16 * 1024 * 1024,
+    }
+    network_probe = r'''
+import errno, fcntl, socket, struct
+assert len(open('/proc/net/route').read().splitlines()) <= 1
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+request = struct.pack('16sH14x', b'lo', 0)
+flags = struct.unpack('16sH14x', fcntl.ioctl(sock.fileno(), 0x8913, request))[1]
+sock.close()
+assert not flags & 0x1, 'loopback unexpectedly UP in isolated namespace'
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(1.0)
+result = sock.connect_ex(('1.1.1.1', 443))
+sock.close()
+assert result in (errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH), (
+    'isolated namespace unexpectedly reached external address: %d' % result
+)
+'''
+    network_result = subprocess.run(
+        [
+            os.fspath(unshare),
+            "--user",
+            "--map-root-user",
+            "--net",
+            os.fspath(bwrap),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "/usr/bin/python3",
+            "-c",
+            network_probe,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if network_result.returncode != 0:
+        detail = network_result.stderr.decode("utf-8", "replace")[-4096:]
+        raise BrokerError(
+            f"bubblewrap network-isolation probe failed ({network_result.returncode}): {detail}"
+        )
+    with tempfile.TemporaryDirectory(prefix="bello-context-probe-") as temporary_name:
+        temporary = Path(temporary_name)
+        readonly = temporary / "readonly"
+        workspace = temporary / "workspace"
+        codex = workspace / ".codex"
+        readonly.mkdir()
+        codex.mkdir(parents=True)
+        (readonly / "value").write_text("original\n", encoding="utf-8")
+        bootstrap = temporary / "bootstrap.json"
+        bootstrap.write_text("bootstrap\n", encoding="utf-8")
+        (temporary / "bootstrap-secret.json").write_text("secret\n", encoding="utf-8")
+        (codex / "secret").write_text("secret\n", encoding="utf-8")
+        seccomp = _seccomp_fd()
+        argv = [
+            os.fspath(unshare),
+            "--user", "--map-root-user", "--net",
+            os.fspath(bwrap),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--cap-drop", "ALL",
+            "--clearenv",
+            "--setenv", "HOST_MNT_NS", host_mnt,
+            "--setenv", "HOST_NET_NS", host_net,
+            "--setenv", "HOST_PID_NS", host_pid_namespace,
+            "--setenv", "HOST_BROKER_PID", str(os.getpid()),
+            "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/lib", "/lib",
+            "--ro-bind-try", "/lib64", "/lib64",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/tmp",
+            "--ro-bind", os.fspath(readonly), "/probe/readonly",
+            "--bind", os.fspath(workspace), "/workspace",
+            "--tmpfs", "/workspace/.codex",
+            "--ro-bind", os.fspath(bootstrap), "/bootstrap.json",
+            "--seccomp", str(seccomp),
+            "/usr/bin/python3", "-c", probe_script,
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                pass_fds=(seccomp,),
+                preexec_fn=lambda: _sandbox_preexec(limits),
+                timeout=20,
+                check=False,
+            )
+        finally:
+            os.close(seccomp)
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace")[-4096:]
+            raise BrokerError(f"bubblewrap isolation probe failed ({result.returncode}): {detail}")
+        if json.loads(result.stdout) != {"ok": True}:
+            raise BrokerError("bubblewrap isolation probe returned an invalid result")
+    version = subprocess.run(
+        [os.fspath(bwrap), "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=5,
+    ).stdout.strip()
+    unshare_version = subprocess.run(
+        [os.fspath(unshare), "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=5,
+    ).stdout.strip()
+    verification = hashlib.sha256(
+        b"bello-linux-bwrap-v1\0"
+        + version
+        + b"\0"
+        + unshare_version
+        + b"\0"
+        + _file_digest(Path(__file__)).encode("ascii")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "platform": "linux-arm64" if platform.machine().lower() in {"aarch64", "arm64"} else "linux-x86_64",
+        "broker_protocol": CONTROLLER_PROTOCOL,
+        "backend": "linux-bwrap-seccomp",
+        "executable": os.path.realpath(bwrap),
+        "verification_id": verification,
+        "completed_checks": sorted(LINUX_CHECKS),
+    }
+
+
+class NativeBroker:
+    def __init__(self) -> None:
+        self.runtime_id = "runtime-" + secrets.token_urlsafe(24).replace("-", "_")
+        self.channel = "bello." + secrets.token_hex(24)
+        self.bundle_root: Path | None = None
+        self.run_root: Path | None = None
+        self.binding: dict[str, Any] | None = None
+        self.policies: dict[str, dict[str, Any]] = {}
+        self.policy_digests: dict[str, str] = {}
+        self.backend: dict[str, Any] = {}
+        self.capabilities: dict[str, dict[str, Any]] = {}
+        self.consumed_capabilities: set[str] = set()
+        self.purge_lease: dict[str, Any] | None = None
+        self.quiesced = False
+        self.stopping = False
+        self.active_operations = 0
+        self.receipt_seq = 0
+        self.context_event_seq = 0
+        self.last_operation_id: str | None = None
+        self.receipts: list[dict[str, Any]] = []
+        self.checkpoints: dict[str, dict[str, Any]] = {}
+        self.recovered_checkpoints: set[str] = set()
+        self.pending_precompact: dict[str, Any] | None = None
+        self.compaction_session_start: dict[str, Any] | None = None
+        self.authority_key = secrets.token_bytes(32)
+        self.server: asyncio.AbstractServer | None = None
+        self.workers: set[asyncio.subprocess.Process] = set()
+        self.worker_tasks: set[asyncio.Task[Any]] = set()
+        self.stdout_lock = asyncio.Lock()
+        self.operation_condition = asyncio.Condition()
+        self.stop_event = asyncio.Event()
+
+    @property
+    def metadata_root(self) -> Path:
+        if self.run_root is None:
+            raise BrokerError("runtime is not started")
+        return self.run_root / "runtime-metadata"
+
+    def _persist(self) -> None:
+        if self.run_root is None:
+            return
+        _atomic_json(
+            self.metadata_root / "native-broker-state.json",
+            {
+                "schema_version": 1,
+                "runtime_instance_id": self.runtime_id,
+                "binding": self.binding,
+                "receipt_seq": self.receipt_seq,
+                "context_event_seq": self.context_event_seq,
+                "last_operation_id": self.last_operation_id,
+                "checkpoints": self.checkpoints,
+                "recovered_checkpoint_ids": sorted(self.recovered_checkpoints),
+                "pending_precompact": self.pending_precompact,
+                "compaction_session_start": self.compaction_session_start,
+            },
+        )
+        _atomic_json(
+            self.metadata_root / "native-broker-receipts.json",
+            {"schema_version": 1, "receipts": self.receipts},
+        )
+
+    async def emit(self, value: Mapping[str, Any]) -> None:
+        payload = _canonical(dict(value)) + b"\n"
+        if len(payload) > MAX_LINE:
+            raise BrokerError("controller message exceeds hard limit")
+        async with self.stdout_lock:
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+
+    async def start_public_server(self) -> None:
+        self.server = await asyncio.start_unix_server(
+            self.handle_proxy,
+            path="\0" + self.channel,
+            limit=MAX_LINE + 1,
+        )
+
+    def require_binding(self, supplied: Any) -> dict[str, Any]:
+        if not isinstance(supplied, Mapping) or self.binding is None:
+            raise BrokerError("binding is unavailable")
+        candidate = dict(supplied)
+        if not _same_json(candidate, self.binding):
+            raise BrokerError("stale or non-authoritative binding")
+        return candidate
+
+    async def rpc(self, method: str, params: Mapping[str, Any]) -> Any:
+        if params.get("schema_version") != 1:
+            raise BrokerError("request schema mismatch")
+        if method == "runtime/start":
+            return await self.rpc_start(params)
+        if self.binding is None:
+            raise BrokerError("runtime/start must be the first request")
+        if method == "runtime/verify-app-server-boundary":
+            return self.rpc_boundary(params)
+        if method == "runtime/register-approval-capability":
+            self.rpc_register_capability(params)
+            return None
+        if method == "runtime/revoke-approval-capability":
+            self.capabilities.pop(str(params.get("capability_id")), None)
+            return None
+        if method == "runtime/update-binding":
+            self.rpc_update_binding(params)
+            return None
+        if method == "runtime/acquire-purge-lease":
+            return await self.rpc_acquire_purge(params)
+        if method == "runtime/release-purge-lease":
+            self.rpc_release_purge(params)
+            return None
+        if method == "runtime/activate-state-epoch":
+            return await self.rpc_activate_epoch(params)
+        if method == "runtime/quiesce":
+            self.require_binding(params.get("binding"))
+            self.quiesced = True
+            async with self.operation_condition:
+                await self.operation_condition.wait_for(lambda: self.active_operations == 0)
+            return None
+        if method == "runtime/resume":
+            self.require_binding(params.get("binding"))
+            if self.purge_lease is not None:
+                raise BrokerError("exclusive purge lease is still active")
+            self.quiesced = False
+            return None
+        if method == "runtime/checkpoint":
+            return self.rpc_checkpoint(params)
+        if method == "runtime/recover-checkpoint":
+            return self.rpc_recover(params)
+        if method == "runtime/stop":
+            await self.stop_workers()
+            result = {
+                "schema_version": 1,
+                "runtime_instance_id": self.runtime_id,
+                "process_tree_reaped": True,
+                "descendants_reaped": True,
+                "writer_handles_closed": True,
+            }
+            self.stopping = True
+            return result
+        raise BrokerError(f"unknown native method: {method}")
+
+    async def rpc_start(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.binding is not None:
+            raise BrokerError("runtime already started")
+        bundle = Path(str(params.get("bundle_root", ""))).resolve(strict=True)
+        run_root = Path(str(params.get("run_root", ""))).resolve(strict=True)
+        if run_root != Path.cwd().resolve(strict=True):
+            raise BrokerError("broker cwd/run_root mismatch")
+        node = bundle / "node" / "bin" / "node"
+        entrypoint = bundle / "package" / "server.bundle.mjs"
+        _strict_file(node)
+        _strict_file(entrypoint)
+        if not os.access(node, os.X_OK):
+            raise BrokerError("bundled Node is not executable")
+        policies = params.get("policies")
+        if not isinstance(policies, list) or len(policies) != 4:
+            raise BrokerError("exact four-profile policy set required")
+        parsed: dict[str, dict[str, Any]] = {}
+        for policy in policies:
+            if not isinstance(policy, Mapping) or policy.get("profile") not in {"mcp", "hook", "command", "proxy"}:
+                raise BrokerError("invalid sandbox policy")
+            profile = str(policy["profile"])
+            if profile in parsed:
+                raise BrokerError("duplicate sandbox profile")
+            if any(policy.get(name) is not False for name in (
+                "network_allowed", "loopback_allowed", "allow_host_unix_sockets"
+            )):
+                raise BrokerError("network-capable Context policy rejected")
+            parsed[profile] = dict(policy)
+        binding = params.get("binding")
+        if not isinstance(binding, Mapping):
+            raise BrokerError("missing binding")
+        _, lifecycle = _binding_parts(binding)
+        digests = {profile: _digest(policy) for profile, policy in parsed.items()}
+        if lifecycle.get("sandbox_policy_digest") != digests["mcp"]:
+            raise BrokerError("binding/policy digest mismatch")
+        backend = params.get("backend")
+        if not isinstance(backend, Mapping) or backend.get("name") != "linux-bwrap-seccomp":
+            raise BrokerError("unverified sandbox backend")
+        self.bundle_root = bundle
+        self.run_root = run_root
+        self.binding = dict(binding)
+        self.policies = parsed
+        self.policy_digests = digests
+        self.backend = dict(backend)
+        self._persist()
+        await self.start_public_server()
+        return {
+            "schema_version": 1,
+            "runtime_instance_id": self.runtime_id,
+            "channel": self.channel,
+        }
+
+    def rpc_boundary(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        binding = self.require_binding(params.get("binding"))
+        for role in ("coder", "supervisor"):
+            identity = params.get(role)
+            if not isinstance(identity, Mapping):
+                raise BrokerError(f"missing {role} process identity")
+            pid = identity.get("pid")
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid < 2 or not Path(f"/proc/{pid}").exists():
+                raise BrokerError(f"{role} process identity is not live")
+        assert self.bundle_root is not None and self.run_root is not None
+        catalogue_path = self.bundle_root / "package" / "configs" / "bello-tool-schemas.json"
+        _strict_file(catalogue_path)
+        catalogue = json.loads(catalogue_path.read_bytes())
+        if not isinstance(catalogue, dict) or tuple(catalogue) != ALLOWED_TOOLS:
+            # Canonical catalogues commonly sort keys; identity is a set here,
+            # while the report always emits the pinned release order.
+            if not isinstance(catalogue, dict) or set(catalogue) != set(ALLOWED_TOOLS):
+                raise BrokerError("tool schema catalogue is not exact")
+        launcher = Path(__file__).with_name("bello-context-launcher").resolve(strict=True)
+        launcher_info = _strict_file(launcher)
+        hooks: dict[str, Any] = {}
+        for event in REQUIRED_HOOKS:
+            bootstrap = self.run_root / "bootstrap" / f"hook-{event}.json"
+            info = _strict_file(bootstrap, mode=0o600)
+            hooks[event] = {
+                "launcher_path": os.fspath(launcher),
+                "launcher_uid": launcher_info.st_uid,
+                "launcher_mode": stat.S_IMODE(launcher_info.st_mode),
+                "launcher_sha256": _file_digest(launcher),
+                "bootstrap_path": os.fspath(bootstrap),
+                "bootstrap_uid": info.st_uid,
+                "bootstrap_mode": stat.S_IMODE(info.st_mode),
+                "bootstrap_sha256": _file_digest(bootstrap),
+            }
+        _, lifecycle = _binding_parts(binding)
+        return {
+            "schema_version": 3,
+            "codex_version": PINNED_CODEX_VERSION,
+            "appserver_schema_hash": PINNED_APPSERVER_SCHEMA,
+            "binding_version": lifecycle["binding_version"],
+            "role_sandboxes": {"coder": True, "supervisor": True},
+            "discovery_disabled": {"coder": True, "supervisor": True},
+            "supervisor_context_entries": [],
+            "coder_context_tools": [
+                {"name": name, "inputSchema": catalogue[name]} for name in ALLOWED_TOOLS
+            ],
+            "coder_hooks": list(REQUIRED_HOOKS),
+            "coder_hook_attestations": hooks,
+            "unmanifested_extensions": {"coder": [], "supervisor": []},
+            "approval_correlation_fields": list(APPROVAL_FIELDS),
+            "purge_lifecycle_attestation": dict(PURGE_ATTESTATION),
+            "checkpoint_lifecycle_attestation": dict(CHECKPOINT_ATTESTATION),
+            "doctor": {
+                "schema_version": 1,
+                "offline": True,
+                "network_allowed": False,
+                "sandbox_backend": "linux-bwrap-seccomp",
+                "sandbox_policy_digest": lifecycle["sandbox_policy_digest"],
+                "database": "ok",
+                "fts5": True,
+            },
+        }
+
+    def rpc_register_capability(self, params: Mapping[str, Any]) -> None:
+        capability = params.get("capability")
+        request_key = params.get("request_key")
+        if not isinstance(capability, Mapping) or not isinstance(request_key, Mapping):
+            raise BrokerError("approval capability payload is malformed")
+        required = {
+            "schema_version", "capability_id", "role", "process_epoch", "binding_version",
+            "coder_generation", "generation_lease_id", "tool_name", "arguments_digest",
+            "canonical_cwd", "request_digest", "issued_at", "expires_at",
+            "ordered_children_digest",
+        }
+        if set(capability) != required or capability.get("schema_version") != 1:
+            raise BrokerError("approval capability schema mismatch")
+        capability_id = capability.get("capability_id")
+        if not isinstance(capability_id, str) or not capability_id or capability_id in self.capabilities or capability_id in self.consumed_capabilities:
+            raise BrokerError("approval capability identity is invalid or replayed")
+        tool = capability.get("tool_name")
+        if tool not in CAPABILITY_TOOLS or capability.get("role") != "coder":
+            raise BrokerError("approval capability tool/role mismatch")
+        assert self.binding is not None
+        _, lifecycle = _binding_parts(self.binding)
+        checks = (
+            capability.get("process_epoch") == lifecycle.get("coder_process_epoch"),
+            capability.get("binding_version") == lifecycle.get("binding_version"),
+            capability.get("coder_generation") == lifecycle.get("coder_generation"),
+            capability.get("generation_lease_id") == lifecycle.get("generation_lease_id"),
+            capability.get("request_digest") == _digest(dict(request_key)),
+        )
+        if not all(checks):
+            raise BrokerError("approval capability belongs to a stale binding/request")
+        if tool == "ctx_purge":
+            lease = self.purge_lease
+            if lease is None or request_key.get("exclusive_workspace_lease_id") != lease["exclusive_lease_id"]:
+                raise BrokerError("ctx_purge capability is not bound to the active exclusive lease")
+        self.capabilities[capability_id] = {
+            "capability": dict(capability),
+            "request_key": dict(request_key),
+        }
+
+    def rpc_update_binding(self, params: Mapping[str, Any]) -> None:
+        previous = self.require_binding(params.get("previous_binding"))
+        candidate = params.get("binding")
+        if not isinstance(candidate, Mapping):
+            raise BrokerError("candidate binding missing")
+        previous_stable, previous_lifecycle = _binding_parts(previous)
+        stable, lifecycle = _binding_parts(candidate)
+        if not _same_json(dict(stable), dict(previous_stable)):
+            raise BrokerError("stable binding identity changed")
+        if lifecycle.get("binding_version") != previous_lifecycle.get("binding_version", 0) + 1:
+            raise BrokerError("binding version is not the exact successor")
+        if lifecycle.get("sandbox_policy_digest") != self.policy_digests.get("mcp"):
+            raise BrokerError("binding changed the active policy without epoch activation")
+        self.binding = dict(candidate)
+        self.capabilities.clear()
+        self._persist()
+
+    async def rpc_acquire_purge(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        binding = self.require_binding(params.get("binding"))
+        if self.purge_lease is not None:
+            raise BrokerError("exclusive purge lease already active")
+        self.quiesced = True
+        async with self.operation_condition:
+            await self.operation_condition.wait_for(lambda: self.active_operations == 0)
+        lease_id = params.get("exclusive_lease_id")
+        owner = params.get("owner")
+        if not isinstance(lease_id, str) or not lease_id or not isinstance(owner, str) or not owner:
+            raise BrokerError("purge lease identity is invalid")
+        stable, lifecycle = _binding_parts(binding)
+        self.purge_lease = {"exclusive_lease_id": lease_id, "owner": owner}
+        return {
+            "schema_version": 1,
+            "runtime_instance_id": self.runtime_id,
+            "exclusive_lease_id": lease_id,
+            "owner": owner,
+            "binding_version": lifecycle["binding_version"],
+            "workspace_id": stable["workspace_id"],
+            "context_session_id": stable["context_session_id"],
+            "context_state_epoch": lifecycle["context_state_epoch"],
+            "active_operations": 0,
+            "exclusive": True,
+            "quiesced": True,
+            "purge_only_bypass": True,
+        }
+
+    def rpc_release_purge(self, params: Mapping[str, Any]) -> None:
+        self.require_binding(params.get("binding"))
+        if self.purge_lease is None or params.get("exclusive_lease_id") != self.purge_lease["exclusive_lease_id"]:
+            raise BrokerError("purge lease release identity mismatch")
+        self.purge_lease = None
+        self.quiesced = False
+
+    async def rpc_activate_epoch(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        previous = self.require_binding(params.get("previous_binding"))
+        candidate = params.get("binding")
+        policies = params.get("policies")
+        if not isinstance(candidate, Mapping) or not isinstance(policies, list) or len(policies) != 4:
+            raise BrokerError("epoch activation payload malformed")
+        if self.purge_lease is None or params.get("exclusive_lease_id") != self.purge_lease["exclusive_lease_id"]:
+            raise BrokerError("epoch activation lacks its exclusive lease")
+        previous_root = Path(str(params.get("previous_epoch_root", ""))).resolve(strict=True)
+        active_root = Path(str(params.get("active_epoch_root", ""))).resolve(strict=True)
+        if previous_root == active_root:
+            raise BrokerError("epoch root was reused")
+        expected_entries = {"sessions", "content", "stats", "checkpoints", "database.sqlite"}
+        if {entry.name for entry in active_root.iterdir()} != expected_entries:
+            raise BrokerError("new epoch layout is not exact")
+        if (active_root / "database.sqlite").stat().st_size != 0:
+            raise BrokerError("new epoch database is not empty")
+        parsed = {str(policy.get("profile")): dict(policy) for policy in policies if isinstance(policy, Mapping)}
+        if set(parsed) != {"mcp", "hook", "command", "proxy"}:
+            raise BrokerError("replacement policy set is not exact")
+        previous_stable, previous_lifecycle = _binding_parts(previous)
+        stable, lifecycle = _binding_parts(candidate)
+        mcp_digest = _digest(parsed["mcp"])
+        if (
+            not _same_json(dict(stable), dict(previous_stable))
+            or lifecycle.get("binding_version") != previous_lifecycle.get("binding_version", 0) + 1
+            or lifecycle.get("context_state_epoch") != previous_lifecycle.get("context_state_epoch", -1) + 1
+            or lifecycle.get("sandbox_policy_digest") != mcp_digest
+        ):
+            raise BrokerError("epoch candidate binding is not the exact successor")
+        await self.stop_workers()
+        self.binding = dict(candidate)
+        self.policies = parsed
+        self.policy_digests = {profile: _digest(policy) for profile, policy in parsed.items()}
+        self.capabilities.clear()
+        self.context_event_seq = 0
+        self._persist()
+        return {
+            "schema_version": 1,
+            "runtime_instance_id": self.runtime_id,
+            "exclusive_lease_id": self.purge_lease["exclusive_lease_id"],
+            "run_id": previous_stable["run_id"],
+            "workspace_id": previous_stable["workspace_id"],
+            "context_session_id": previous_stable["context_session_id"],
+            "previous_binding_version": previous_lifecycle["binding_version"],
+            "binding_version": lifecycle["binding_version"],
+            "previous_epoch": previous_lifecycle["context_state_epoch"],
+            "active_epoch": lifecycle["context_state_epoch"],
+            "previous_epoch_root": os.fspath(previous_root),
+            "active_epoch_root": os.fspath(active_root),
+            "active_policy_digest": mcp_digest,
+            "new_epoch_empty": True,
+            "active_epoch_switched": True,
+            "old_epoch_unmounted": True,
+            "process_tree_reaped": True,
+            "descendants_reaped": True,
+            "writer_handles_closed": True,
+            "old_epoch_retained": previous_root.exists(),
+        }
+
+    def rpc_checkpoint(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        binding = self.require_binding(params.get("binding"))
+        if not self.quiesced:
+            raise BrokerError("checkpoint requires a quiesced runtime")
+        reason = params.get("reason")
+        transition = params.get("transition")
+        if not isinstance(reason, str) or not reason or not isinstance(transition, str) or not transition:
+            raise BrokerError("checkpoint reason/transition invalid")
+        stable, lifecycle = _binding_parts(binding)
+        provider_thread = lifecycle.get("provider_thread_id")
+        if not isinstance(provider_thread, str) or not provider_thread:
+            raise BrokerError("checkpoint cannot precede provider thread claim")
+        checkpoint_id = "checkpoint-" + secrets.token_urlsafe(24)
+        unsigned = {
+            "schema_version": 1,
+            "checkpoint_id": checkpoint_id,
+            "reason": reason,
+            "run_id": stable["run_id"],
+            "workspace_id": stable["workspace_id"],
+            "context_session_id": stable["context_session_id"],
+            "context_state_epoch": lifecycle["context_state_epoch"],
+            "coder_generation": lifecycle["coder_generation"],
+            "generation_lease_id": lifecycle["generation_lease_id"],
+            "coder_process_epoch": lifecycle["coder_process_epoch"],
+            "provider_thread_id": provider_thread,
+            "binding_version": lifecycle["binding_version"],
+            "context_event_seq": self.context_event_seq,
+            "last_committed_operation_id": self.last_operation_id,
+            "created_at": _datetime.datetime.now(_datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        cursor_hmac = hmac.new(self.authority_key, _canonical(unsigned), hashlib.sha256).hexdigest()
+        cursor = {**unsigned, "cursor_hmac": cursor_hmac}
+        self.checkpoints[checkpoint_id] = {"cursor": cursor, "binding": binding, "transition": transition}
+        self._persist()
+        return {
+            "schema_version": 1,
+            "cursor": cursor,
+            "acknowledgement": {
+                "schema_version": 1,
+                "runtime_instance_id": self.runtime_id,
+                "checkpoint_id": checkpoint_id,
+                "reason": reason,
+                "transition": transition,
+                "binding_version": lifecycle["binding_version"],
+                "cursor_hmac": cursor_hmac,
+                "cursor_hmac_verified": True,
+                "wal_committed": True,
+                "state_integrity_verified": True,
+            },
+        }
+
+    def rpc_recover(
+        self,
+        params: Mapping[str, Any],
+        *,
+        session_start_hook: bool = False,
+    ) -> Mapping[str, Any]:
+        cursor = params.get("cursor")
+        checkpoint_binding = params.get("checkpoint_binding")
+        active_binding = params.get("binding")
+        kind = params.get("recovery_kind")
+        if not isinstance(cursor, Mapping) or not isinstance(checkpoint_binding, Mapping) or not isinstance(active_binding, Mapping):
+            raise BrokerError("recovery payload malformed")
+        checkpoint_id = cursor.get("checkpoint_id")
+        record = self.checkpoints.get(str(checkpoint_id))
+        if record is None or not _same_json(dict(cursor), record["cursor"]) or not _same_json(dict(checkpoint_binding), record["binding"]):
+            raise BrokerError("unknown or altered checkpoint cursor")
+        unsigned = dict(cursor)
+        signature = unsigned.pop("cursor_hmac", None)
+        expected = hmac.new(self.authority_key, _canonical(unsigned), hashlib.sha256).hexdigest()
+        if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+            raise BrokerError("checkpoint cursor HMAC mismatch")
+        self.require_binding(active_binding)
+        if kind not in {"compaction", "logical_restart", "process_recovery"}:
+            raise BrokerError("unknown recovery kind")
+        if kind == "compaction":
+            if session_start_hook:
+                pending = self.pending_precompact
+                pending_cursor = (
+                    pending.get("checkpoint", {}).get("cursor")
+                    if isinstance(pending, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(pending_cursor, Mapping)
+                    or pending_cursor.get("checkpoint_id") != checkpoint_id
+                ):
+                    raise BrokerError(
+                        "SessionStart compaction recovery does not match the pending PreCompact checkpoint"
+                    )
+            else:
+                observed = self.compaction_session_start
+                if not isinstance(observed, Mapping):
+                    raise BrokerError(
+                        "compaction recovery requires an observed SessionStart(source=compact)"
+                    )
+                if observed.get("controller_checkpoint_id") is not None:
+                    raise BrokerError(
+                        "compaction SessionStart proof was already claimed by a controller checkpoint"
+                    )
+                if not _same_json(observed.get("binding"), active_binding):
+                    raise BrokerError(
+                        "compaction SessionStart proof does not match the active binding"
+                    )
+        checkpoint_lifecycle = _binding_parts(checkpoint_binding)[1]
+        active_lifecycle = _binding_parts(active_binding)[1]
+        self.recovered_checkpoints.add(str(checkpoint_id))
+        if kind == "compaction" and not session_start_hook:
+            assert isinstance(self.compaction_session_start, dict)
+            self.compaction_session_start["controller_checkpoint_id"] = str(checkpoint_id)
+        self._persist()
+        return {
+            "schema_version": 1,
+            "runtime_instance_id": self.runtime_id,
+            "checkpoint_id": checkpoint_id,
+            "recovery_kind": kind,
+            "cursor_hmac": signature,
+            "context_event_seq": cursor["context_event_seq"],
+            "last_committed_operation_id": cursor["last_committed_operation_id"],
+            "replayed_through_context_event_seq": max(self.context_event_seq, cursor["context_event_seq"]),
+            "stable": {
+                "run_id": cursor["run_id"],
+                "workspace_id": cursor["workspace_id"],
+                "context_session_id": cursor["context_session_id"],
+                "context_state_epoch": cursor["context_state_epoch"],
+            },
+            "recovered_from": dict(checkpoint_lifecycle),
+            "active": dict(active_lifecycle),
+            "cursor_hmac_verified": True,
+            "wal_integrity_verified": True,
+            "session_start_verified": True,
+        }
+
+    def validate_bootstrap(self, bootstrap: Any, *, kind: str, event: str | None) -> Mapping[str, Any]:
+        if not isinstance(bootstrap, Mapping) or bootstrap.get("schema_version") != 1:
+            raise BrokerError("proxy bootstrap schema mismatch")
+        if bootstrap.get("runtime_instance_id") != self.runtime_id or bootstrap.get("kind") != kind:
+            raise BrokerError("proxy bootstrap runtime/kind mismatch")
+        endpoint = bootstrap.get("public_endpoint")
+        if not isinstance(endpoint, Mapping) or endpoint != {"channel": self.channel}:
+            raise BrokerError("proxy endpoint mismatch")
+        if kind == "hook" and (event not in REQUIRED_HOOKS or bootstrap.get("event") != event):
+            raise BrokerError("hook event mismatch")
+        assert self.binding is not None
+        stable, lifecycle = _binding_parts(self.binding)
+        expected = {
+            "run_id": stable["run_id"],
+            "workspace_id": stable["workspace_id"],
+            "context_session_id": stable["context_session_id"],
+            "binding_version": lifecycle["binding_version"],
+            "context_state_epoch": lifecycle["context_state_epoch"],
+            "coder_generation": lifecycle["coder_generation"],
+            "generation_lease_id": lifecycle["generation_lease_id"],
+            "coder_process_epoch": lifecycle["coder_process_epoch"],
+            "app_server_instance_id": lifecycle["app_server_instance_id"],
+            "sandbox_policy_digest": lifecycle["sandbox_policy_digest"],
+            "provider_thread_id": lifecycle["provider_thread_id"],
+            "policy_digests": self.policy_digests,
+        }
+        mismatches = [name for name, value in expected.items() if not _same_json(bootstrap.get(name), value)]
+        if mismatches:
+            raise BrokerError(f"stale proxy bootstrap fields: {mismatches}")
+        return bootstrap
+
+    async def handle_proxy(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is None:
+                raise BrokerError("proxy peer socket unavailable")
+            credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+            if peer_pid < 2 or peer_uid != os.getuid():
+                raise BrokerError("proxy peer credentials rejected")
+            line = await reader.readline()
+            if not line or len(line) > MAX_LINE:
+                raise BrokerError("proxy handshake missing or oversized")
+            handshake = json.loads(line)
+            if not isinstance(handshake, Mapping) or handshake.get("protocol") != PROXY_PROTOCOL:
+                raise BrokerError("proxy protocol mismatch")
+            kind = handshake.get("kind")
+            event = handshake.get("event")
+            if kind not in {"mcp", "hook"}:
+                raise BrokerError("unsupported proxy kind")
+            self.validate_bootstrap(handshake.get("bootstrap"), kind=str(kind), event=event if isinstance(event, str) else None)
+            writer.write(_canonical({"protocol": PROXY_PROTOCOL, "accepted": True}) + b"\n")
+            await writer.drain()
+            if kind == "hook":
+                await self.handle_hook(reader, writer, str(event))
+            else:
+                await self.handle_mcp(reader, writer, handshake, peer_pid)
+        except BaseException as exc:
+            try:
+                writer.write(_canonical({"protocol": PROXY_PROTOCOL, "accepted": False, "error": str(exc)[:512]}) + b"\n")
+                await writer.drain()
+            except BaseException:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except BaseException:
+                pass
+
+    async def handle_hook(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, event: str) -> None:
+        line = await reader.readline()
+        if not line or len(line) > MAX_LINE:
+            raise BrokerError("hook invocation missing")
+        request = json.loads(line)
+        if not isinstance(request, Mapping) or set(request) != {"payload"}:
+            raise BrokerError("hook invocation schema mismatch")
+        encoded = request.get("payload")
+        if not isinstance(encoded, str):
+            raise BrokerError("hook payload is not base64")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except ValueError as exc:
+            raise BrokerError("hook payload base64 is invalid") from exc
+        if len(payload) > MAX_HOOK_INPUT:
+            raise BrokerError("hook payload exceeds 256 KiB")
+        try:
+            parsed = json.loads(payload) if payload.strip() else {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise BrokerError("hook payload is not strict JSON") from exc
+        if not isinstance(parsed, Mapping):
+            raise BrokerError("hook payload must be an object")
+        response = self.process_hook_event(event, parsed)
+        writer.write(_canonical({"output": base64.b64encode(_canonical(response) + b"\n").decode("ascii")}) + b"\n")
+        await writer.drain()
+
+    @staticmethod
+    def _hook_value(payload: Mapping[str, Any], field: str) -> Any:
+        if field in payload:
+            return payload[field]
+        visible = payload.get("visible")
+        return visible.get(field) if isinstance(visible, Mapping) else None
+
+    def process_hook_event(self, event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply lifecycle hook side effects before acknowledging the hook."""
+
+        if event == "PreCompact":
+            trigger = self._hook_value(payload, "trigger")
+            if trigger not in {"manual", "auto"}:
+                raise BrokerError("PreCompact trigger is not recognized")
+            if not self.quiesced:
+                raise BrokerError("PreCompact checkpoint requires a quiesced runtime")
+            if self.pending_precompact is not None:
+                raise BrokerError("another PreCompact checkpoint is still pending SessionStart")
+            previous = self.compaction_session_start
+            if (
+                isinstance(previous, Mapping)
+                and previous.get("controller_checkpoint_id") is None
+            ):
+                raise BrokerError(
+                    "previous compaction SessionStart proof was not claimed by the controller"
+                )
+            if self.binding is None:
+                raise BrokerError("PreCompact has no active binding")
+            checkpoint_binding = dict(self.binding)
+            checkpoint = self.rpc_checkpoint(
+                {
+                    "binding": checkpoint_binding,
+                    "reason": "PreCompact",
+                    "transition": "compaction",
+                }
+            )
+            self.pending_precompact = {
+                "schema_version": 1,
+                "trigger": trigger,
+                "checkpoint": checkpoint,
+                "checkpoint_binding": checkpoint_binding,
+            }
+            self._persist()
+            return {}
+
+        if event == "SessionStart":
+            source = self._hook_value(payload, "source")
+            if source not in {"startup", "resume", "clear", "compact", "recovery"}:
+                raise BrokerError("SessionStart source is not recognized")
+            if source != "compact":
+                return {}
+            pending = self.pending_precompact
+            if not isinstance(pending, Mapping):
+                raise BrokerError("SessionStart(source=compact) has no pending PreCompact checkpoint")
+            checkpoint = pending.get("checkpoint")
+            checkpoint_binding = pending.get("checkpoint_binding")
+            if not isinstance(checkpoint, Mapping) or not isinstance(checkpoint_binding, Mapping):
+                raise BrokerError("pending PreCompact checkpoint is malformed")
+            cursor = checkpoint.get("cursor")
+            if not isinstance(cursor, Mapping) or self.binding is None:
+                raise BrokerError("pending PreCompact cursor or active binding is unavailable")
+            active_binding = dict(self.binding)
+            recovery = self.rpc_recover(
+                {
+                    "cursor": dict(cursor),
+                    "checkpoint_binding": dict(checkpoint_binding),
+                    "binding": active_binding,
+                    "recovery_kind": "compaction",
+                },
+                session_start_hook=True,
+            )
+            self.compaction_session_start = {
+                "schema_version": 1,
+                "hook_checkpoint_id": cursor["checkpoint_id"],
+                "binding": active_binding,
+                "recovery": recovery,
+                "controller_checkpoint_id": None,
+            }
+            self.pending_precompact = None
+            self._persist()
+        return {}
+
+    def _mount_arguments(self, policy: Mapping[str, Any]) -> list[str]:
+        arguments: list[str] = [
+            "/usr/bin/unshare", "--user", "--map-root-user", "--net",
+            "/usr/bin/bwrap",
+            "--die-with-parent", "--new-session",
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--cap-drop", "ALL", "--clearenv",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+            # Exact signed runtimes still need the host dynamic loader.  These
+            # mounts are read-only; executable discovery remains policy-PATH
+            # constrained and network syscalls are denied by seccomp.
+            "--ro-bind", "/lib", "/lib",
+            "--ro-bind-try", "/lib64", "/lib64",
+            "--ro-bind", "/usr/lib", "/usr/lib",
+        ]
+        environment = policy.get("environment")
+        mounts = policy.get("mounts")
+        if not isinstance(environment, Mapping) or not isinstance(mounts, list):
+            raise BrokerError("sandbox policy environment/mounts malformed")
+        workspace_rule: Mapping[str, Any] | None = None
+        nested: list[Mapping[str, Any]] = []
+        for mount in mounts:
+            if not isinstance(mount, Mapping):
+                raise BrokerError("sandbox mount malformed")
+            source = Path(str(mount.get("source", "")))
+            target = Path(str(mount.get("target", "")))
+            if not source.is_absolute() or not target.is_absolute() or source == Path("/") or target == Path("/"):
+                raise BrokerError("sandbox mount path invalid")
+            source = source.resolve(strict=True)
+            if os.fspath(source) != os.fspath(target):
+                raise BrokerError("signed Linux profile requires identity mounts")
+            if mount.get("path_class") == "workspace":
+                workspace_rule = mount
+            if mount.get("path_class") in {"workspace_git", "immutable_task", "readonly_dependency"}:
+                nested.append(mount)
+                continue
+            option = "--bind" if mount.get("access") == "read_write" else "--ro-bind"
+            arguments.extend((option, os.fspath(source), os.fspath(target)))
+        for mount in nested:
+            arguments.extend(("--ro-bind", str(mount["source"]), str(mount["target"])))
+        for key, value in sorted(environment.items()):
+            if not isinstance(key, str) or not isinstance(value, str) or not key or "\x00" in key + value:
+                raise BrokerError("sandbox environment contains invalid data")
+            arguments.extend(("--setenv", key, value))
+        workspace_paths = policy.get("workspace_paths")
+        if workspace_rule is not None and isinstance(workspace_paths, Mapping):
+            root = Path(str(workspace_paths.get("root", ""))).resolve(strict=True)
+            candidates: set[Path] = set()
+            for raw in workspace_paths.get("masked_paths", []):
+                if isinstance(raw, str):
+                    candidates.add(Path(raw))
+            denied_components = set(workspace_paths.get("deny_component_names", []))
+            denied_globs = tuple(workspace_paths.get("deny_filename_globs", []))
+            count = 0
+            for directory, names, files in os.walk(root, followlinks=False):
+                count += len(names) + len(files)
+                if count > 100_000:
+                    break
+                base = Path(directory)
+                for name in tuple(names):
+                    if name in denied_components:
+                        candidates.add(base / name)
+                        names.remove(name)
+                for name in files:
+                    if name in denied_components or any(fnmatch.fnmatchcase(name, pattern) for pattern in denied_globs):
+                        candidates.add(base / name)
+            for candidate in sorted(candidates, key=lambda value: len(value.parts)):
+                try:
+                    candidate.relative_to(root)
+                    info = candidate.lstat()
+                except (ValueError, FileNotFoundError):
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    arguments.extend(("--tmpfs", os.fspath(candidate)))
+                elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    arguments.extend(("--ro-bind", "/dev/null", os.fspath(candidate)))
+        return arguments
+
+    async def spawn_worker(self) -> asyncio.subprocess.Process:
+        assert self.bundle_root is not None and self.binding is not None
+        policy = self.policies["mcp"]
+        argv = self._mount_arguments(policy)
+        seccomp = _seccomp_fd()
+        node = self.bundle_root / "node" / "bin" / "node"
+        entrypoint = self.bundle_root / "package" / "server.bundle.mjs"
+        stable, _ = _binding_parts(self.binding)
+        argv.extend(
+            (
+                "--chdir", str(stable["workspace_path"]),
+                "--seccomp", str(seccomp),
+                os.fspath(node), os.fspath(entrypoint),
+            )
+        )
+        limits = policy.get("limits")
+        if not isinstance(limits, Mapping):
+            os.close(seccomp)
+            raise BrokerError("sandbox resource limits missing")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                pass_fds=(seccomp,),
+                preexec_fn=lambda: _sandbox_preexec(limits),
+                start_new_session=True,
+                limit=MAX_LINE + 1,
+            )
+        finally:
+            os.close(seccomp)
+        self.workers.add(process)
+        return process
+
+    async def _drain_worker_stderr(self, process: asyncio.subprocess.Process) -> None:
+        if process.stderr is None:
+            return
+        remaining = 64 * 1024
+        while remaining:
+            block = await process.stderr.read(min(8192, remaining))
+            if not block:
+                return
+            remaining -= len(block)
+            sys.stderr.buffer.write(block)
+            sys.stderr.buffer.flush()
+
+    def _call_cwd(self, arguments: Mapping[str, Any], launcher_cwd: str) -> str:
+        assert self.binding is not None
+        stable, _ = _binding_parts(self.binding)
+        workspace = Path(str(stable["workspace_path"])).resolve(strict=True)
+        raw = arguments.get("cwd")
+        candidate = Path(raw) if isinstance(raw, str) and raw else Path(launcher_cwd)
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        candidate = candidate.resolve(strict=True)
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise BrokerError("tool cwd escapes the workspace") from exc
+        return os.fspath(candidate)
+
+    def consume_capability(self, tool: str, arguments: Mapping[str, Any], cwd: str, metadata: Mapping[str, Any]) -> str | None:
+        if tool not in CAPABILITY_TOOLS:
+            if metadata.get("capability_id") is not None:
+                raise BrokerError("auto-approved tool carried a capability")
+            return None
+        arguments_digest = _digest(dict(arguments))
+        selected = metadata.get("capability_id")
+        candidates: list[str]
+        if isinstance(selected, str) and selected:
+            candidates = [selected]
+        else:
+            candidates = [
+                identity
+                for identity, record in self.capabilities.items()
+                if record["capability"].get("tool_name") == tool
+                and record["capability"].get("arguments_digest") == arguments_digest
+                and record["capability"].get("canonical_cwd") == cwd
+            ]
+        if len(candidates) != 1:
+            raise BrokerError("tool call has no unique matching one-shot capability")
+        identity = candidates[0]
+        record = self.capabilities.get(identity)
+        if record is None or identity in self.consumed_capabilities:
+            raise BrokerError("approval capability is unknown, revoked, or replayed")
+        capability = record["capability"]
+        assert self.binding is not None
+        _, lifecycle = _binding_parts(self.binding)
+        checks = (
+            capability.get("tool_name") == tool,
+            capability.get("arguments_digest") == arguments_digest,
+            capability.get("canonical_cwd") == cwd,
+            capability.get("binding_version") == lifecycle.get("binding_version"),
+            capability.get("coder_generation") == lifecycle.get("coder_generation"),
+            capability.get("generation_lease_id") == lifecycle.get("generation_lease_id"),
+            capability.get("process_epoch") == lifecycle.get("coder_process_epoch"),
+            isinstance(capability.get("expires_at"), (int, float)) and time.time() <= capability["expires_at"],
+        )
+        if not all(checks):
+            raise BrokerError("one-shot capability does not match tool/args/cwd/binding")
+        if tool == "ctx_batch_execute" and capability.get("ordered_children_digest") != _digest(arguments.get("commands")):
+            raise BrokerError("batch capability child order mismatch")
+        if tool == "ctx_purge" and self.purge_lease is None:
+            raise BrokerError("ctx_purge capability has no active exclusive lease")
+        self.capabilities.pop(identity)
+        self.consumed_capabilities.add(identity)
+        return identity
+
+    def _workspace_snapshot(self) -> dict[str, tuple[int, int]]:
+        assert self.binding is not None
+        stable, _ = _binding_parts(self.binding)
+        root = Path(str(stable["workspace_path"]))
+        result: dict[str, tuple[int, int]] = {}
+        for directory, names, files in os.walk(root, followlinks=False):
+            names[:] = [name for name in names if name not in {".git", ".codex", ".bello", "context-mode"}]
+            for name in files:
+                path = Path(directory) / name
+                try:
+                    info = path.lstat()
+                    relative = path.relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                if stat.S_ISREG(info.st_mode) and _safe_relative(relative):
+                    result[relative] = (info.st_mtime_ns, info.st_size)
+                    if len(result) >= 100_000:
+                        return result
+        return result
+
+    def _changed_paths(self, before: Mapping[str, tuple[int, int]]) -> dict[str, str]:
+        assert self.binding is not None
+        stable, _ = _binding_parts(self.binding)
+        root = Path(str(stable["workspace_path"]))
+        after = self._workspace_snapshot()
+        changed: dict[str, str] = {}
+        for relative, identity in after.items():
+            if before.get(relative) == identity:
+                continue
+            try:
+                changed[relative] = _file_digest(root / relative)
+            except OSError:
+                continue
+            if len(changed) >= MAX_CHANGED_PATHS:
+                break
+        return dict(sorted(changed.items()))
+
+    def _clean_result(self, result: Any) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        if not isinstance(result, Mapping):
+            raise BrokerError("MCP tool result is not an object")
+        cleaned = dict(result)
+        metadata: Mapping[str, Any] = {}
+        top_meta = cleaned.get("_meta")
+        if isinstance(top_meta, Mapping):
+            copied = dict(top_meta)
+            candidate = copied.pop("_belloWorker", None)
+            if isinstance(candidate, Mapping):
+                metadata = candidate
+            if copied:
+                cleaned["_meta"] = copied
+            else:
+                cleaned.pop("_meta", None)
+        structured = cleaned.get("structuredContent")
+        if isinstance(structured, Mapping):
+            copied_structured = dict(structured)
+            candidate = copied_structured.pop("_belloWorker", None)
+            if isinstance(candidate, Mapping):
+                metadata = candidate
+            cleaned["structuredContent"] = copied_structured
+        else:
+            cleaned["structuredContent"] = {}
+        content = cleaned.get("content")
+        if not isinstance(content, list) or not content:
+            cleaned["content"] = [{"type": "text", "text": "Context Mode operation completed."}]
+        if len(_canonical(cleaned)) > MAX_RESULT:
+            cleaned = {
+                "content": [{"type": "text", "text": "Context Mode result exceeded 64 KiB; use ctx_search for bounded retrieval."}],
+                "structuredContent": {},
+                "isError": True,
+            }
+            metadata = {}
+        return cleaned, metadata
+
+    async def complete_tool_call(
+        self,
+        *,
+        request_id: int | str,
+        tool: str,
+        arguments: Mapping[str, Any],
+        capability_id: str | None,
+        operation_id: str,
+        started: float,
+        before: Mapping[str, tuple[int, int]],
+        raw_result: Any,
+    ) -> dict[str, Any]:
+        cleaned, worker_metadata = self._clean_result(raw_result)
+        changed = await asyncio.to_thread(self._changed_paths, before)
+        result_digest = _digest(cleaned)
+        assert self.binding is not None
+        stable, lifecycle = _binding_parts(self.binding)
+        self.receipt_seq += 1
+        self.context_event_seq += 1
+        duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        receipt = {
+            "schema_version": 1,
+            "receipt_seq": self.receipt_seq,
+            "role": "coder",
+            "app_server_instance_id": lifecycle["app_server_instance_id"],
+            "process_epoch": lifecycle["coder_process_epoch"],
+            "run_id": stable["run_id"],
+            "workspace_id": stable["workspace_id"],
+            "context_session_id": stable["context_session_id"],
+            "context_state_epoch": lifecycle["context_state_epoch"],
+            "binding_version": lifecycle["binding_version"],
+            "coder_generation": lifecycle["coder_generation"],
+            "generation_lease_id": lifecycle["generation_lease_id"],
+            "mcp_request_id": request_id,
+            "tool_name": tool,
+            "arguments_digest": _digest(dict(arguments)),
+            "operation_id": operation_id,
+            "result_digest": result_digest,
+            "sandbox_backend": "linux-bwrap-seccomp",
+            "sandbox_policy_digest": self.policy_digests["mcp"],
+            "capability_id": capability_id,
+            "context_event_seq": self.context_event_seq,
+            "duration_ms": duration_ms,
+            "source_bytes": worker_metadata.get("source_bytes") if isinstance(worker_metadata.get("source_bytes"), int) else None,
+            "returned_bytes": worker_metadata.get("returned_bytes") if isinstance(worker_metadata.get("returned_bytes"), int) else len(_canonical(cleaned)),
+            "indexed_bytes": worker_metadata.get("indexed_bytes") if isinstance(worker_metadata.get("indexed_bytes"), int) else None,
+            "commands": worker_metadata.get("commands") if isinstance(worker_metadata.get("commands"), list) else [],
+            "retrieval": worker_metadata.get("retrieval") if tool == "ctx_search" and isinstance(worker_metadata.get("retrieval"), list) else [],
+            "changed_paths": changed,
+        }
+        receipt_digest = _digest(receipt)
+        envelope = {
+            "broker_receipt_seq": self.receipt_seq,
+            "broker_receipt_digest": receipt_digest,
+            "operation_id": operation_id,
+            "tool_name": tool,
+            "run_id": stable["run_id"],
+            "workspace_id": stable["workspace_id"],
+            "context_session_id": stable["context_session_id"],
+            "context_state_epoch": lifecycle["context_state_epoch"],
+            "binding_version": lifecycle["binding_version"],
+            "coder_generation": lifecycle["coder_generation"],
+            "generation_lease_id": lifecycle["generation_lease_id"],
+            "mcp_request_id": request_id,
+            "arguments_digest": receipt["arguments_digest"],
+            "capability_id": capability_id,
+            "result_digest": result_digest,
+            "sandbox_backend": "linux-bwrap-seccomp",
+            "sandbox_policy_digest": self.policy_digests["mcp"],
+            "schema_version": 1,
+        }
+        structured = dict(cleaned.get("structuredContent", {}))
+        structured["belloContextMode"] = envelope
+        cleaned["structuredContent"] = structured
+        self.last_operation_id = operation_id
+        self.receipts.append(receipt)
+        self._persist()  # fsync before out-of-band receipt and terminal result
+        await self.emit({"method": "broker/receipt", "params": receipt})
+        return cleaned
+
+    async def handle_mcp(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        handshake: Mapping[str, Any],
+        peer_pid: int,
+    ) -> None:
+        if self.quiesced and self.purge_lease is None:
+            raise BrokerError("runtime is quiesced")
+        process = await self.spawn_worker()
+        assert process.stdin is not None and process.stdout is not None
+        stderr_task = asyncio.create_task(self._drain_worker_stderr(process))
+        pending_methods: dict[int | str, str] = {}
+        pending_calls: dict[int | str, dict[str, Any]] = {}
+        launcher_cwd = handshake.get("cwd")
+        if not isinstance(launcher_cwd, str):
+            raise BrokerError("launcher cwd missing")
+
+        async def client_to_worker() -> None:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                    return
+                if len(line) > MAX_LINE:
+                    raise BrokerError("MCP request exceeds hard limit")
+                value = json.loads(line)
+                if not isinstance(value, Mapping):
+                    raise BrokerError("MCP frame is not an object")
+                request_id = value.get("id")
+                method = value.get("method")
+                if request_id is not None and (isinstance(request_id, bool) or not isinstance(request_id, (int, str))):
+                    raise BrokerError("invalid MCP JSON-RPC id")
+                if request_id is not None and isinstance(method, str):
+                    pending_methods[request_id] = method
+                if method == "tools/call" and request_id is not None:
+                    params = value.get("params")
+                    if not isinstance(params, Mapping):
+                        raise BrokerError("tools/call params malformed")
+                    tool = params.get("name")
+                    arguments = params.get("arguments", {})
+                    if tool not in ALLOWED_TOOLS or not isinstance(arguments, Mapping):
+                        raise BrokerError("forbidden/unknown tool or malformed arguments")
+                    arguments = dict(arguments)
+                    worker_metadata = arguments.pop("_belloWorker", {})
+                    if not isinstance(worker_metadata, Mapping):
+                        raise BrokerError("internal worker metadata malformed")
+                    if self.quiesced and tool != "ctx_purge":
+                        raise BrokerError("ordinary Context call rejected while quiesced")
+                    cwd = self._call_cwd(arguments, launcher_cwd)
+                    capability_id = self.consume_capability(str(tool), arguments, cwd, worker_metadata)
+                    before = await asyncio.to_thread(self._workspace_snapshot)
+                    operation_id = "operation-" + secrets.token_urlsafe(24)
+                    pending_calls[request_id] = {
+                        "tool": tool,
+                        "arguments": arguments,
+                        "capability_id": capability_id,
+                        "operation_id": operation_id,
+                        "started": time.monotonic(),
+                        "before": before,
+                    }
+                    async with self.operation_condition:
+                        self.active_operations += 1
+                    if tool == "ctx_purge":
+                        raw = {
+                            "content": [{"type": "text", "text": "Context Mode state purge authorized; controller epoch rotation is pending."}],
+                            "structuredContent": {"purgeAuthorized": True},
+                        }
+                        cleaned = await self.complete_tool_call(request_id=request_id, raw_result=raw, **pending_calls.pop(request_id))
+                        async with self.operation_condition:
+                            self.active_operations -= 1
+                            self.operation_condition.notify_all()
+                        writer.write(_canonical({"jsonrpc": value.get("jsonrpc", "2.0"), "id": request_id, "result": cleaned}) + b"\n")
+                        await writer.drain()
+                        pending_methods.pop(request_id, None)
+                        continue
+                    forwarded = dict(value)
+                    forwarded_params = dict(params)
+                    forwarded_params["arguments"] = arguments
+                    forwarded["params"] = forwarded_params
+                    line = _canonical(forwarded) + b"\n"
+                process.stdin.write(line)
+                await process.stdin.drain()
+
+        async def worker_to_client() -> None:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    return
+                if len(line) > MAX_LINE:
+                    raise BrokerError("MCP worker response exceeds hard limit")
+                value = json.loads(line)
+                if not isinstance(value, Mapping):
+                    raise BrokerError("MCP worker frame is not an object")
+                request_id = value.get("id")
+                method = pending_methods.pop(request_id, None) if request_id is not None else None
+                if method == "tools/list" and isinstance(value.get("result"), Mapping):
+                    assert self.bundle_root is not None
+                    catalogue = json.loads((self.bundle_root / "package" / "configs" / "bello-tool-schemas.json").read_bytes())
+                    result = dict(value["result"])
+                    existing = result.get("tools")
+                    descriptions = (
+                        {
+                            item.get("name"): item.get("description", "")
+                            for item in existing
+                            if isinstance(item, Mapping)
+                        }
+                        if isinstance(existing, list)
+                        else {}
+                    )
+                    result["tools"] = [
+                        {"name": name, "description": descriptions.get(name, "Bello offline Context Mode tool"), "inputSchema": catalogue[name]}
+                        for name in ALLOWED_TOOLS
+                    ]
+                    value = {**value, "result": result}
+                call = pending_calls.pop(request_id, None) if request_id is not None else None
+                if call is not None:
+                    try:
+                        if "result" in value:
+                            result = await self.complete_tool_call(request_id=request_id, raw_result=value["result"], **call)
+                            value = {**value, "result": result}
+                    finally:
+                        async with self.operation_condition:
+                            self.active_operations -= 1
+                            self.operation_condition.notify_all()
+                writer.write(_canonical(value) + b"\n")
+                await writer.drain()
+
+        pumps = [asyncio.create_task(client_to_worker()), asyncio.create_task(worker_to_client())]
+        self.worker_tasks.update(pumps)
+        try:
+            done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                exception = task.exception()
+                if exception is not None:
+                    raise exception
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            self.worker_tasks.difference_update(pumps)
+            await self.reap_worker(process)
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+            if pending_calls:
+                async with self.operation_condition:
+                    self.active_operations = max(0, self.active_operations - len(pending_calls))
+                    self.operation_condition.notify_all()
+
+    async def reap_worker(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+        self.workers.discard(process)
+
+    async def stop_workers(self) -> None:
+        for task in tuple(self.worker_tasks):
+            task.cancel()
+        if self.worker_tasks:
+            await asyncio.gather(*tuple(self.worker_tasks), return_exceptions=True)
+        for process in tuple(self.workers):
+            await self.reap_worker(process)
+
+
+async def _controller_main() -> int:
+    _secure_process()
+    broker = NativeBroker()
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(limit=MAX_LINE + 1)
+    protocol = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
+    request_tasks: set[asyncio.Task[Any]] = set()
+
+    async def handle(value: Any) -> None:
+        request_id: Any = None
+        try:
+            if not isinstance(value, Mapping) or set(value) != {"id", "method", "params"}:
+                raise BrokerError("controller request schema mismatch")
+            request_id = value.get("id")
+            if isinstance(request_id, bool) or not isinstance(request_id, int) or request_id < 1:
+                raise BrokerError("controller request id invalid")
+            method = value.get("method")
+            params = value.get("params")
+            if not isinstance(method, str) or not method or not isinstance(params, Mapping):
+                raise BrokerError("controller method/params invalid")
+            result = await broker.rpc(method, params)
+            await broker.emit({"id": request_id, "result": result})
+            if method == "runtime/stop":
+                broker.stop_event.set()
+        except BaseException as exc:
+            if isinstance(request_id, int) and not isinstance(request_id, bool):
+                await broker.emit({"id": request_id, "error": {"code": -32000, "message": str(exc)[:1024]}})
+
+    while not broker.stop_event.is_set():
+        read_task = asyncio.create_task(reader.readline())
+        stop_task = asyncio.create_task(broker.stop_event.wait())
+        done, pending = await asyncio.wait((read_task, stop_task), return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if stop_task in done and stop_task.result():
+            break
+        line = read_task.result()
+        if not line:
+            break
+        if len(line) > MAX_LINE:
+            raise BrokerError("controller line exceeds hard limit")
+        try:
+            value = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise BrokerError("controller line is invalid JSON") from exc
+        task = asyncio.create_task(handle(value))
+        request_tasks.add(task)
+        task.add_done_callback(request_tasks.discard)
+    if request_tasks:
+        await asyncio.gather(*tuple(request_tasks), return_exceptions=True)
+    await broker.stop_workers()
+    if broker.server is not None:
+        broker.server.close()
+        await broker.server.wait_closed()
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--verify-sandbox-backend", action="store_true")
+    mode.add_argument("--controller-stdio", action="store_true")
+    parser.add_argument("--protocol", required=True)
+    arguments = parser.parse_args()
+    if arguments.protocol != CONTROLLER_PROTOCOL:
+        raise BrokerError("controller protocol mismatch")
+    if platform.system() != "Linux":
+        raise BrokerError("this authority executable supports Linux only")
+    if arguments.verify_sandbox_backend:
+        report = _probe_backend()
+        sys.stdout.buffer.write(_canonical(report) + b"\n")
+        sys.stdout.buffer.flush()
+        return 0
+    return asyncio.run(_controller_main())
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as error:
+        sys.stderr.write(f"bello-context-broker: {error}\n")
+        raise SystemExit(1)
