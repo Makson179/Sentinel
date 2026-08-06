@@ -46,7 +46,12 @@ def test_dynamic_specs_are_mode_scoped_and_context_independent() -> None:
     }
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in preview["tools"])
     assert code_context_prompt_guidance("off") == ""
-    assert "never writes" in code_context_prompt_guidance("preview")
+    guidance = code_context_prompt_guidance("preview")
+    assert "MUST use code_context as the first choice" in guidance
+    assert "read_raw instead of cat, sed, head, tail" in guidance
+    assert "Do not page through supported source files with shell reads" in guidance
+    assert "state the concrete fallback reason" in guidance
+    assert "never writes" in guidance
 
 
 @pytest.mark.asyncio

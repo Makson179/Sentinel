@@ -198,18 +198,27 @@ def code_context_prompt_guidance(mode: str) -> str:
     if normalized == "off":
         return ""
     edit_sentence = (
-        " In preview mode, prepare_symbol_edit never writes; it only returns a syntax-checked patch preview. "
-        "apply any accepted patch with the native file-edit tool."
+        " In preview mode, use prepare_symbol_edit before changing an existing symbol when "
+        "a symbol-scoped edit fits. It never writes: review the syntax-checked preview, then "
+        "apply an accepted patch with the native file-edit tool."
         if normalized == "preview"
         else ""
     )
     return (
-        "Bello provides controller-owned code_context tools, separate from Context Mode. "
-        "When a path and qualified symbol name are known, call read_symbol directly; use "
-        "list_symbols only for discovery. Use read_raw when a "
-        "parser is unsupported, ambiguous, or surrounding invariants matter. "
-        "find_references is syntactic evidence, not a semantic call graph; inspect its "
-        "scan_incomplete flag before relying on a negative result."
+        "Code Context tool-use policy (controller-owned and separate from Context Mode): "
+        "for repository inspection, you MUST use code_context as the first choice. Use "
+        "read_raw instead of cat, sed, head, tail, or ad-hoc Python file-reading snippets "
+        "when you need repository file text. For supported source files, use list_symbols "
+        "for discovery, then read_symbol for the exact definitions you need; when a path "
+        "and qualified symbol name are already known, call read_symbol directly. Use "
+        "find_references instead of grep/rg when locating code-symbol references. Do not "
+        "page through supported source files with shell reads. Native shell/file reads are "
+        "allowed only when code_context reports an unsupported, ambiguous, truncated, or "
+        "error result, or when the needed information is not repository file content "
+        "(for example directory listings, Git state, command execution, or generated "
+        "program output); state the concrete fallback reason. find_references is syntactic "
+        "evidence, not a semantic call graph, so inspect scan_incomplete before relying on "
+        "a negative result."
         + edit_sentence
     )
 
