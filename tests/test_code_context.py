@@ -50,6 +50,11 @@ def test_dynamic_specs_are_mode_scoped_and_context_independent() -> None:
     assert "MUST use code_context as the first choice" in guidance
     assert "read_raw instead of cat, sed, head, tail" in guidance
     assert "Do not page through supported source files with shell reads" in guidance
+    assert "follow cursors until the needed page is returned" in guidance
+    assert "resolve an ambiguous symbol with list_symbols" in guidance
+    assert "Repo-wide free-text search" in guidance
+    assert "command execution" in guidance
+    assert "generated program output" in guidance
     assert "state the concrete fallback reason" in guidance
     assert "never writes" in guidance
 
