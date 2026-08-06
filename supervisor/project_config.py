@@ -21,6 +21,7 @@ DEFAULT_INTELLIGENCE = "xhigh"
 BASE_INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
 INTELLIGENCE_CHOICES = (*BASE_INTELLIGENCE_CHOICES, "max", "ultra")
 SPEED_CHOICES = ("usual", "fast")
+STRUCTURED_CODE_TOOL_CHOICES = ("off", "read", "preview")
 RUNTIME_SYNC_FIELDS = (
     "task",
     "coder_mod",
@@ -33,6 +34,7 @@ RUNTIME_SYNC_FIELDS = (
     "adversary_intelligence",
     "speed",
     "cheap_runtime",
+    "structured_code_tools",
     "start_over",
     "completion_review",
     "adversary",
@@ -62,6 +64,7 @@ class ProjectConfig:
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
     cheap_runtime: bool = True
+    structured_code_tools: str = "off"
     start_over: bool = True
     completion_review: bool = False
     adversary: bool = False
@@ -94,6 +97,7 @@ class ProjectConfig:
             "adversary_intelligence": self.adversary_intelligence,
             "speed": self.speed,
             "cheap_runtime": self.cheap_runtime,
+            "structured_code_tools": self.structured_code_tools,
             "start_over": self.start_over,
             "completion_review": self.completion_review,
             "adversary": self.adversary,
@@ -276,6 +280,12 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         cheap_runtime=_bool(
             _first_present(payload, ("cheap_runtime", "cheap_runtime_enabled"), default.cheap_runtime),
             "cheap_runtime",
+            path=path,
+        ),
+        structured_code_tools=_choice(
+            payload.get("structured_code_tools", default.structured_code_tools),
+            "structured_code_tools",
+            STRUCTURED_CODE_TOOL_CHOICES,
             path=path,
         ),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
@@ -487,6 +497,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["fast"] = config.fast
     if "cheap_runtime" in selected:
         updates["cheap_runtime"] = config.cheap_runtime
+    if "structured_code_tools" in selected:
+        updates["structured_code_tools"] = config.structured_code_tools
     if "start_over" in selected:
         updates["start_over"] = config.start_over
     if "clean" in selected:

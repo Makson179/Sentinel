@@ -162,6 +162,7 @@ class BelloConfig(BaseModel):
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
     cheap_runtime: bool = True
+    structured_code_tools: Literal["off", "read", "preview"] = "off"
     adversary_run_count: int = 0
     completion_return_count: int = 0
     completion_returns_since_adversary: int = 0

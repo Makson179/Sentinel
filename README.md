@@ -394,6 +394,7 @@ runtime and review budgets, are changed through `bello config`.
 | `adversary-intelligence` | `xhigh` | Adversary reasoning effort. Visible only when the adversary is enabled. |
 | `speed` | `usual` | `fast` uses the Codex Fast service tier for coder, runtime-supervisor, and completion-review turns. Adversary turns are unchanged. |
 | `cheap-runtime` | `true` | Let Luna dismiss routine runtime checks before invoking the full runtime supervisor. Human messages, approvals, and mandatory checks bypass triage. |
+| `structured-code-tools` | `off` | `off` exposes no structured code tools. `read` exposes `list_symbols`, `read_symbol`, `find_references`, and `read_raw`. `preview` exposes those reads plus `prepare_symbol_edit`, which validates and returns a patch preview but never writes. This setting can be used together with Context Mode; the two tool surfaces remain independent. |
 | `start-over` | `true` | `true` removes prior Bello logs, archived runs, and recovery data; `false` preserves them. Both start fresh active state and leave project files unchanged. |
 | `context-mode` | `false` | Opt in to the bundled coder-only offline Context Mode beta. Startup fails closed when its platform bundle or security gates are unavailable. |
 | `completion-review` | `false` | `false` is Everyday. `true` enables the independent completion-review loop and reveals its settings. |
@@ -403,6 +404,10 @@ runtime and review budgets, are changed through `bello config`.
 | `max-reviews-after-adversary` | `2` | Maximum completion-review returns after each adversary pass. At the limit Bello starts the next pass or completes after the final one; `0` is unlimited. |
 | `clean` | `false` | **Warning:** deletes **everything** in the folder except the task file and configured protected paths before starting. Only for disposable folders where you want a from-scratch build. |
 | `protected-path` | absent | Paths the coder must never write to, such as golden tests, fixtures, or production configs. They are also preserved by `clean`. |
+
+Structured-code failures are aggregated in `.supervisor/runtime_metrics.json` by
+allowlisted error code, machine reason, and tool. The diagnostics never retain
+arguments, paths, source content, cursors, hashes, or human-readable error text.
 
 ## Command reference
 
@@ -431,6 +436,7 @@ Run flags (each overrides the saved config for one run):
 | `--adversary-intelligence V` | Adversarial tester reasoning effort. |
 | <code>--fast[=true&#124;false]</code> | Codex Fast service tier. |
 | <code>--start-over[=true&#124;false]</code> | Fresh `.supervisor/` state. |
+| `--structured-code-tools off\|read\|preview` | Override the structured code tool surface for one run. `preview` only previews symbol edits; it never applies them. |
 | `--context-mode` / `--no-context-mode` | Enable the coder-only offline beta or force the emergency fallback off. |
 | `--keep-context-mode-data` | Retain external run-local Context Mode state after shutdown for diagnostics. |
 | `--context-mode-debug` | Emit bounded, redacted Context Mode lifecycle diagnostics. |

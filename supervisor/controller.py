@@ -34,11 +34,20 @@ from supervisor.appserver import (
     require_json_rpc_id,
 )
 from supervisor.approvals import (
+    DYNAMIC_TOOL_CALL_METHOD,
     MCP_ELICITATION_METHOD,
     MCP_TOOL_APPROVAL_KIND,
     MCP_TOOL_APPROVAL_KIND_KEY,
     ApprovalManager,
     normalize_approval_request,
+)
+from supervisor.code_context import (
+    CODE_CONTEXT_ERROR_CODES,
+    CODE_CONTEXT_ERROR_REASONS,
+    CODE_CONTEXT_NAMESPACE,
+    CODE_CONTEXT_TOOL_NAMES,
+    CodeContextService,
+    normalize_structured_code_tools,
 )
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -376,6 +385,7 @@ class BelloController:
         completion_review: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
+        structured_code_tools: str | None = None,
         context_mode_enabled: bool | None = None,
         keep_context_mode_data: bool = False,
         context_mode_debug: bool = False,
@@ -432,6 +442,14 @@ class BelloController:
         # rewrites the persisted project config, matching the other run settings.
         self.completion_review = completion_review
         self.project_config = project_config
+        configured_structured_code_tools = (
+            project_config.structured_code_tools if project_config is not None else "off"
+        )
+        self.structured_code_tools = normalize_structured_code_tools(
+            configured_structured_code_tools
+            if structured_code_tools is None
+            else structured_code_tools
+        )
         configured_context_mode = project_config.context_mode if project_config is not None else False
         self.context_mode_enabled = configured_context_mode if context_mode_enabled is None else context_mode_enabled
         self.keep_context_mode_data = keep_context_mode_data
@@ -445,6 +463,8 @@ class BelloController:
         )
         self.context_toolchain_roots = tuple(Path(path).resolve(strict=False) for path in context_toolchain_roots)
         self.context_runtime: PreparedContextMode | None = None
+        self.code_context_service: CodeContextService | None = None
+        self._code_context_tasks: set[asyncio.Task[None]] = set()
         self.context_binding_store = None
         self.context_capability_store = None
         self.provider_token_gauges = ProviderTokenGaugeBook()
@@ -571,6 +591,7 @@ class BelloController:
             # before either app-server can discover project/user extensions.
             self._prepare_run_layout()
             self._prepare_coder_workspace()
+            self._prepare_code_context_service()
             self._bind_role_client_paths()
             await self._prepare_role_homes_and_context()
             await self._start_role_clients()
@@ -624,6 +645,7 @@ class BelloController:
                 model=self._coder_model(),
                 fast=self._fast_mode(),
                 intelligence=self._coder_intelligence(),
+                structured_code_tools=self._structured_code_tools_mode(),
                 context_binding=self._active_coder_binding_snapshot(),
                 thread_id=getattr(self, "_preflight_coder_thread_id", None),
                 on_thread_start=self._mark_coder_thread_started,
@@ -660,6 +682,7 @@ class BelloController:
                         error=exc,
                     )
             await self.tui.stop()
+            await self._stop_code_context_service()
             # Snapshot preservation is a read of mutable run data.  Stop the
             # coder, native Context tree and supervisor first, even when normal
             # terminal cleanup was interrupted midway.
@@ -1223,6 +1246,7 @@ class BelloController:
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=project_config.cheap_runtime,
+            structured_code_tools=self._structured_code_tools_mode(),
             context_mode_enabled=self.context_mode_enabled,
             context_mode_keep_data=self.keep_context_mode_data,
             context_mode_debug=self.context_mode_debug,
@@ -1363,6 +1387,40 @@ class BelloController:
             }
         )
 
+    def _prepare_code_context_service(self) -> None:
+        """Bind optimization 5 to the disposable coder workspace only."""
+
+        if self._structured_code_tools_mode() == "off":
+            self.code_context_service = None
+            return
+        if self.code_context_service is not None:
+            return
+        workspace = self._active_workspace_root()
+        denied_roots: list[Path] = list(self._immutable_approval_paths())
+        for raw_root in self.declared_grading_roots:
+            root = Path(raw_root).expanduser()
+            denied_roots.append(root if root.is_absolute() else workspace / root)
+        self.code_context_service = CodeContextService(
+            workspace,
+            denied_roots=tuple(denied_roots),
+            mode=self._structured_code_tools_mode(),
+        )
+
+    async def _stop_code_context_service(self) -> None:
+        await self._cancel_code_context_calls()
+        service = getattr(self, "code_context_service", None)
+        if service is not None:
+            service.close()
+            self.code_context_service = None
+
+    async def _cancel_code_context_calls(self) -> None:
+        tasks = list(getattr(self, "_code_context_tasks", ()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        getattr(self, "_code_context_tasks", set()).clear()
+
     def _coder_model(self) -> str | None:
         return getattr(self, "coder_model", getattr(self, "model", DEFAULT_MODEL))
 
@@ -1433,6 +1491,7 @@ class BelloController:
             completion_intelligence=self._completion_intelligence() or DEFAULT_INTELLIGENCE,
             adversary_intelligence=self._adversary_intelligence() or DEFAULT_INTELLIGENCE,
             speed="fast" if self._fast_mode() else "usual",
+            structured_code_tools=self._structured_code_tools_mode(),
             start_over=self.overwrite_state,
             adversary=self._adversary_enabled_for_config(),
             clean=self.clean_workspace,
@@ -1464,12 +1523,18 @@ class BelloController:
             f"clean={_format_bool(self.clean_workspace)} "
             f"completion-review={_format_bool(self._effective_completion_review())} "
             f"adversary={_format_bool(self._adversary_enabled_for_config() and self._effective_completion_review())} "
+            f"structured-code-tools={self._structured_code_tools_mode()} "
             f"context-mode={_format_bool(self.context_mode_enabled)} "
             f"protected-path={protected_paths}"
         )
 
     def _coder_intelligence(self) -> str | None:
         return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)
+
+    def _structured_code_tools_mode(self) -> str:
+        return normalize_structured_code_tools(
+            getattr(self, "structured_code_tools", "off")
+        )
 
     def _runtime_intelligence(self) -> str | None:
         return getattr(self, "runtime_intelligence", getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE))
@@ -1563,7 +1628,12 @@ class BelloController:
             await self.coder_client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
         thread = await self.coder_client.thread_start(
-            coder_thread_params(self._active_workspace_root(), model=self._coder_model(), fast=self._fast_mode())
+            coder_thread_params(
+                self._active_workspace_root(),
+                model=self._coder_model(),
+                fast=self._fast_mode(),
+                structured_code_tools=self._structured_code_tools_mode(),
+            )
         )
         approval_policy = thread.get("approvalPolicy")
         sandbox = thread.get("sandbox")
@@ -2014,6 +2084,12 @@ class BelloController:
         role: ClientRole | None = None,
     ) -> None:
         origin_role = role or message.role or ClientRole.CODER
+        if (
+            message.method == DYNAMIC_TOOL_CALL_METHOD
+            and message.params.get("namespace") == CODE_CONTEXT_NAMESPACE
+        ):
+            self._schedule_code_context_call(message, origin_role=origin_role)
+            return
         origin_epoch = message.process_epoch
         request_id = message.request_id
         if request_id is None:
@@ -2252,6 +2328,302 @@ class BelloController:
                         "started a new coder turn with the denial reason.\n",
                     )
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
+
+    def _schedule_code_context_call(
+        self,
+        message: AppServerMessage,
+        *,
+        origin_role: ClientRole,
+    ) -> None:
+        """Run a controller-owned code read without blocking the event queue.
+
+        These requests are not approvals and never enter the supervisor LLM
+        path.  The service itself is bounded and executes parser work in its
+        own worker pool; keeping this wrapper in a task also lets ordinary
+        app-server notifications continue while a repository scan is active.
+        """
+
+        task = asyncio.create_task(
+            self._handle_code_context_call(message, origin_role=origin_role)
+        )
+        tasks = getattr(self, "_code_context_tasks", None)
+        if tasks is None:
+            tasks = self._code_context_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(self._code_context_task_done)
+
+    def _code_context_task_done(self, task: asyncio.Task[None]) -> None:
+        getattr(self, "_code_context_tasks", set()).discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            self._append_code_context_log_best_effort(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "structured_code_background_error",
+                    "error_type": error.__class__.__name__,
+                }
+            )
+
+    async def _handle_code_context_call(
+        self,
+        message: AppServerMessage,
+        *,
+        origin_role: ClientRole,
+    ) -> None:
+        started = time.monotonic()
+        tool = message.params.get("tool")
+        tool_name = tool if isinstance(tool, str) else "invalid"
+        response: dict[str, Any]
+        service_metrics: dict[str, int] | None = None
+        try:
+            issue = self._code_context_call_issue(message, origin_role=origin_role)
+            if issue is not None:
+                response = _code_context_error_response(*issue)
+            else:
+                service = getattr(self, "code_context_service", None)
+                if service is None:
+                    response = _code_context_error_response(
+                        "service_unavailable",
+                        "structured code service is not active",
+                    )
+                else:
+                    arguments = message.params["arguments"]
+                    assert isinstance(arguments, dict)
+                    response = await service.call(tool_name, arguments)
+                    snapshot_metrics = getattr(service, "metrics_snapshot", None)
+                    if callable(snapshot_metrics):
+                        candidate_metrics = snapshot_metrics()
+                        if isinstance(candidate_metrics, dict):
+                            service_metrics = candidate_metrics
+                    if not _valid_dynamic_tool_response(response):
+                        response = _code_context_error_response(
+                            "invalid_service_response",
+                            "structured code service returned an invalid response",
+                        )
+                    else:
+                        # A logical generation restart keeps the same process
+                        # epoch, so transport identity alone cannot reject a
+                        # late result.  Re-bind immediately before responding.
+                        stale_issue = self._code_context_call_issue(
+                            message,
+                            origin_role=origin_role,
+                        )
+                        if stale_issue is not None:
+                            response = _code_context_error_response(*stale_issue)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            response = _code_context_error_response(
+                "internal_error",
+                f"structured code request failed ({exc.__class__.__name__})",
+            )
+
+        try:
+            await self._respond_to_origin(message, response, role=origin_role)
+        except Exception as exc:
+            origin_event = ControllerEvent(
+                kind="transport_error",
+                role=origin_role,
+                process_epoch=message.process_epoch,
+                app_server_instance_id=message.app_server_instance_id,
+                message=message,
+                error=exc,
+                error_message=str(exc),
+            )
+            origin_is_current = (
+                not getattr(self, "_terminal_cleanup_started", False)
+                and self._event_origin_is_current(origin_event)
+            )
+            self._append_code_context_log_best_effort(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": (
+                        "structured_code_response_transport_error"
+                        if origin_is_current
+                        else "structured_code_response_origin_rejected"
+                    ),
+                    "tool": tool_name,
+                    "error_type": exc.__class__.__name__,
+                }
+            )
+            if origin_is_current:
+                # A failed write to the still-current coder transport leaves
+                # its dynamic request unresolved.  Route it through the normal
+                # recovery path; only stale/recycled origins are safe to drop.
+                await self.event_queue.put(origin_event)
+        try:
+            self._record_code_context_metric(
+                tool=tool_name,
+                success=response.get("success") is True,
+                duration_ms=max(0, round((time.monotonic() - started) * 1000)),
+                output_bytes=_dynamic_tool_response_bytes(response),
+                service_metrics=service_metrics,
+                error_diagnostic=_code_context_error_diagnostic(response),
+            )
+        except Exception as exc:
+            # Telemetry is never on the response-critical path.
+            self._append_code_context_log_best_effort(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "structured_code_metric_error",
+                    "tool": tool_name,
+                    "error_type": exc.__class__.__name__,
+                }
+            )
+
+    def _append_code_context_log_best_effort(self, entry: dict[str, Any]) -> None:
+        try:
+            self.store.append_raw_log(entry)
+        except Exception:
+            pass
+
+    def _code_context_call_issue(
+        self,
+        message: AppServerMessage,
+        *,
+        origin_role: ClientRole,
+    ) -> tuple[str, str] | None:
+        params = message.params
+        required_fields = {"arguments", "callId", "namespace", "threadId", "tool", "turnId"}
+        if set(params) != required_fields:
+            return "invalid_request", "dynamic tool request fields do not match the pinned schema"
+        if origin_role is not ClientRole.CODER:
+            return "wrong_role", "structured code tools are coder-only"
+        origin_event = ControllerEvent(
+            kind="server_request",
+            role=origin_role,
+            process_epoch=message.process_epoch,
+            app_server_instance_id=message.app_server_instance_id,
+            message=message,
+        )
+        if not self._event_origin_is_current(origin_event):
+            return "stale_origin", "tool call belongs to a stale app-server process"
+        if getattr(self, "_terminal_cleanup_started", False):
+            return "terminal_state", "run is shutting down"
+        mode = self._structured_code_tools_mode()
+        tool = params.get("tool")
+        if mode == "off":
+            return "disabled", "structured code tools are disabled"
+        if not isinstance(tool, str) or tool not in CODE_CONTEXT_TOOL_NAMES:
+            return "unknown_tool", "unknown structured code tool"
+        if mode == "read" and tool == "prepare_symbol_edit":
+            return "tool_not_enabled", "symbol edit previews require preview mode"
+        arguments = params.get("arguments")
+        if not isinstance(arguments, dict):
+            return "invalid_arguments", "tool arguments must be an object"
+        try:
+            arguments_size = len(
+                json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, UnicodeError):
+            return "invalid_arguments", "tool arguments must be bounded JSON"
+        if arguments_size > 64 * 1024:
+            return "arguments_too_large", "tool arguments exceed 64 KiB"
+        for field in ("callId", "threadId", "turnId"):
+            value = params.get(field)
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
+                return "invalid_request", f"{field} must be a bounded non-empty string"
+        cfg = self.store.get_bello_config()
+        if params.get("threadId") != cfg.coder_thread_id:
+            return "stale_thread", "tool call does not belong to the active coder thread"
+        if params.get("turnId") != cfg.active_coder_turn_id:
+            return "stale_turn", "tool call does not belong to the active coder turn"
+        return None
+
+    def _record_code_context_metric(
+        self,
+        *,
+        tool: str,
+        success: bool,
+        duration_ms: int,
+        output_bytes: int,
+        service_metrics: Mapping[str, int] | None,
+        error_diagnostic: tuple[str, str] | None,
+    ) -> None:
+        safe_tool = tool if tool in CODE_CONTEXT_TOOL_NAMES else "invalid"
+
+        def patch(current: dict[str, Any]) -> dict[str, Any]:
+            current["structured_code_calls_total"] = int(
+                current.get("structured_code_calls_total") or 0
+            ) + 1
+            outcome = "success" if success else "error"
+            outcome_key = f"structured_code_calls_{outcome}_total"
+            current[outcome_key] = int(current.get(outcome_key) or 0) + 1
+            counts = _filtered_code_context_metric_counts(
+                current.get("structured_code_tool_counts"),
+                allowed=_CODE_CONTEXT_METRIC_TOOL_LABELS,
+            )
+            _increment_code_context_metric_count(counts, safe_tool)
+            current["structured_code_tool_counts"] = counts
+            current["structured_code_duration_ms_total"] = int(
+                current.get("structured_code_duration_ms_total") or 0
+            ) + duration_ms
+            current["structured_code_output_bytes_total"] = int(
+                current.get("structured_code_output_bytes_total") or 0
+            ) + output_bytes
+            if not success:
+                error_code, error_detail = error_diagnostic or (
+                    _CODE_CONTEXT_MALFORMED_ERROR_LABEL,
+                    _CODE_CONTEXT_MALFORMED_ERROR_LABEL,
+                )
+                code_counts = _filtered_code_context_metric_counts(
+                    current.get("structured_code_error_code_counts"),
+                    allowed=_CODE_CONTEXT_METRIC_CODE_LABELS,
+                )
+                _increment_code_context_metric_count(code_counts, error_code)
+                current["structured_code_error_code_counts"] = code_counts
+
+                detail_counts = _filtered_code_context_metric_counts(
+                    current.get("structured_code_error_detail_counts"),
+                    allowed=_CODE_CONTEXT_METRIC_DETAIL_LABELS,
+                )
+                _increment_code_context_metric_count(detail_counts, error_detail)
+                current["structured_code_error_detail_counts"] = detail_counts
+
+                raw_tool_error_counts = current.get("structured_code_tool_error_counts")
+                tool_error_counts: dict[str, dict[str, int]] = {}
+                if isinstance(raw_tool_error_counts, dict):
+                    for metric_tool in _CODE_CONTEXT_METRIC_TOOL_LABELS:
+                        per_tool_counts = _filtered_code_context_metric_counts(
+                            raw_tool_error_counts.get(metric_tool),
+                            allowed=_CODE_CONTEXT_METRIC_DETAIL_LABELS,
+                        )
+                        if per_tool_counts:
+                            tool_error_counts[metric_tool] = per_tool_counts
+                per_tool = tool_error_counts.setdefault(safe_tool, {})
+                _increment_code_context_metric_count(per_tool, error_detail)
+                current["structured_code_tool_error_counts"] = tool_error_counts
+            if service_metrics is not None:
+                prior_service_metrics = _filtered_code_context_metric_counts(
+                    current.get("structured_code_service_metrics"),
+                    allowed=_CODE_CONTEXT_SERVICE_METRIC_NAMES,
+                )
+                for name, value in service_metrics.items():
+                    if (
+                        name not in _CODE_CONTEXT_SERVICE_METRIC_NAMES
+                        or not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        continue
+                    prior_service_metrics[name] = min(
+                        _CODE_CONTEXT_METRIC_COUNT_MAX,
+                        max(int(prior_service_metrics.get(name) or 0), value),
+                    )
+                current["structured_code_service_metrics"] = prior_service_metrics
+            return current
+
+        self.store.update_runtime_metrics(patch)
 
     def _active_context_approval_binding(
         self,
@@ -2893,6 +3265,18 @@ class BelloController:
             return
         if method == "item/completed" and thread_id == cfg.coder_thread_id:
             summary = _item_summary(params.get("item"))
+            if _is_code_context_dynamic_item(item):
+                # The controller already executed and bounded this read-only
+                # call.  Do not rescan the whole Git workspace or wake a
+                # supervisor merely to account for its completion.
+                self._current_turn_action_count = getattr(
+                    self,
+                    "_current_turn_action_count",
+                    0,
+                ) + 1
+                self.store.append_recent_action(summary)
+                self.tui.render("TOOL", summary)
+                return
             if isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                 text = item["text"].strip()
                 if text:
@@ -3545,6 +3929,7 @@ class BelloController:
                 raise
             except Exception:
                 pass
+        await self._cancel_code_context_calls()
         await self._resolve_pending_approvals("paused")
         self.tui.status("paused")
 
@@ -3688,6 +4073,7 @@ class BelloController:
                         await old_coder.interrupt()
                     except Exception:
                         pass
+                await self._cancel_code_context_calls()
                 await self._resolve_pending_approvals(
                     f"coder process {'controlled recycle' if controlled else 'recovery'}: {reason}",
                     best_effort=not rotate_context_state_epoch,
@@ -3845,6 +4231,7 @@ class BelloController:
                             model=self._coder_model(),
                             fast=self._fast_mode(),
                             intelligence=self._coder_intelligence(),
+                            structured_code_tools=self._structured_code_tools_mode(),
                             context_binding=CoderContextBindingSnapshot.from_context_binding(current_binding),
                             on_thread_start=self._mark_coder_thread_started,
                         )
@@ -3860,6 +4247,7 @@ class BelloController:
                         model=self._coder_model(),
                         fast=self._fast_mode(),
                         intelligence=self._coder_intelligence(),
+                        structured_code_tools=self._structured_code_tools_mode(),
                         on_thread_start=self._mark_coder_thread_started,
                     )
                     await self.coder.start_thread()
@@ -3868,7 +4256,7 @@ class BelloController:
                         f"generation change. Previous provider thread: {old_thread_id or 'none'}. Reason: {reason}. "
                         "Re-read HANDOFF.md if present, verify current workspace state, and continue."
                     )
-                    await self.coder.start_turn(recovery_context[:4096])
+                    await self.coder.start_unbound_recovery_turn(recovery_context[:4096])
                 self.store.update_runtime_metrics(
                     lambda current: {**current, metric: int(current.get(metric) or 0) + 1}
                 )
@@ -3934,6 +4322,7 @@ class BelloController:
             except Exception:
                 if runtime is not None:
                     raise
+        await self._cancel_code_context_calls()
         await self._resolve_pending_approvals("restart")
         if runtime is not None and self.coder is not None:
             # Successful archive is the provider-side terminal barrier for the
@@ -4029,6 +4418,7 @@ class BelloController:
             model=self._coder_model(),
             fast=self._fast_mode(),
             intelligence=self._coder_intelligence(),
+            structured_code_tools=self._structured_code_tools_mode(),
             context_binding=(
                 CoderContextBindingSnapshot.from_context_binding(next_context_binding)
                 if next_context_binding is not None
@@ -4545,7 +4935,9 @@ class BelloController:
         validation_trigger_reasons: tuple[str, ...] = (),
     ) -> RuntimeTriggerDecision:
         reasons: list[str] = list(validation_trigger_reasons)
-        read_only_action = bool(action.command and _is_read_only_inspection_command(action.command))
+        read_only_action = action.kind == "codeContextInspection" or bool(
+            action.command and _is_read_only_inspection_command(action.command)
+        )
         if (
             action.exit_code is not None
             and action.exit_code != 0
@@ -4867,6 +5259,8 @@ class BelloController:
         if runtime is None or coder is None or not coder.thread_id:
             return False
         if getattr(self, "pending_approvals", None):
+            return False
+        if any(not task.done() for task in getattr(self, "_code_context_tasks", ())):
             return False
         if coder.active_turn_id:
             await self._interrupt_coder_for_context_compaction()
@@ -7555,7 +7949,11 @@ def _restart_rejection_steering(handoff: RestartHandoff | None) -> str:
 def _triggering_action_from_item(item: Any, *, item_id: str | None, summary: str) -> TriggeringAction:
     if not isinstance(item, dict):
         return TriggeringAction(item_id=item_id, kind="item", status="completed", summary=summary)
-    kind = str(item.get("type") or "item")
+    kind = (
+        "codeContextInspection"
+        if _is_code_context_dynamic_item(item)
+        else str(item.get("type") or "item")
+    )
     exit_code = item.get("exitCode")
     return TriggeringAction(
         item_id=item_id,
@@ -11660,7 +12058,9 @@ def _item_summary(item: Any) -> str:
     if item_type == "mcpToolCall":
         return f"mcp tool completed: {item.get('server')}/{item.get('tool')}"
     if item_type == "dynamicToolCall":
-        return f"dynamic tool completed: {item.get('tool')}"
+        namespace = item.get("namespace")
+        prefix = f"{namespace}/" if isinstance(namespace, str) and namespace else ""
+        return f"dynamic tool completed: {prefix}{item.get('tool')}"
     if item_type == "agentMessage":
         return "agent message completed"
     return f"{item_type} completed"
@@ -11684,11 +12084,210 @@ def _item_may_mutate_workspace(item: Any) -> bool:
         return False
     if _is_bello_context_mode_item(item):
         return item.get("tool") in EXECUTION_TOOLS
+    if _is_code_context_dynamic_item(item):
+        return False
     return item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
 
 
 def _action_may_mutate_workspace(action: TriggeringAction) -> bool:
     return action.kind in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
+
+
+def _is_code_context_dynamic_item(item: Any) -> bool:
+    """Recognize only Bello's controller-owned, non-writing dynamic tools."""
+
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "dynamicToolCall"
+        and item.get("namespace") == CODE_CONTEXT_NAMESPACE
+        and item.get("tool") in CODE_CONTEXT_TOOL_NAMES
+    )
+
+
+_CONTROLLER_CODE_CONTEXT_ERROR_CODES = frozenset(
+    {
+        "arguments_too_large",
+        "disabled",
+        "invalid_request",
+        "invalid_service_response",
+        "service_unavailable",
+        "stale_origin",
+        "stale_thread",
+        "stale_turn",
+        "terminal_state",
+        "wrong_role",
+    }
+)
+_CODE_CONTEXT_METRIC_ERROR_CODES = (
+    CODE_CONTEXT_ERROR_CODES | _CONTROLLER_CODE_CONTEXT_ERROR_CODES
+)
+_CODE_CONTEXT_METRIC_ERROR_REASONS = (
+    CODE_CONTEXT_ERROR_REASONS | _CONTROLLER_CODE_CONTEXT_ERROR_CODES
+)
+_CODE_CONTEXT_SPECIAL_ERROR_REASONS = (
+    CODE_CONTEXT_ERROR_REASONS - CODE_CONTEXT_ERROR_CODES
+)
+_CODE_CONTEXT_MALFORMED_ERROR_LABEL = "malformed_error_payload"
+_CODE_CONTEXT_UNKNOWN_ERROR_LABEL = "unknown_error_code"
+_CODE_CONTEXT_DIAGNOSTIC_PAYLOAD_BYTES = 4096
+_CODE_CONTEXT_METRIC_COUNT_MAX = (1 << 63) - 1
+_CODE_CONTEXT_METRIC_TOOL_LABELS = frozenset({*CODE_CONTEXT_TOOL_NAMES, "invalid"})
+_CODE_CONTEXT_SERVICE_METRIC_NAMES = frozenset(
+    {
+        "cache_hits_total",
+        "cache_misses_total",
+        "calls_total",
+        "errors_total",
+        "internal_errors_total",
+        "parse_file_too_large_total",
+        "raw_fallbacks_total",
+        "success_total",
+        "timeouts_total",
+        *(f"calls_{tool}_total" for tool in CODE_CONTEXT_TOOL_NAMES),
+    }
+)
+_CODE_CONTEXT_METRIC_CODE_LABELS = frozenset(
+    {
+        *_CODE_CONTEXT_METRIC_ERROR_CODES,
+        _CODE_CONTEXT_MALFORMED_ERROR_LABEL,
+        _CODE_CONTEXT_UNKNOWN_ERROR_LABEL,
+    }
+)
+_CODE_CONTEXT_METRIC_DETAIL_LABELS = frozenset(
+    {
+        *_CODE_CONTEXT_METRIC_ERROR_CODES,
+        *(f"invalid_arguments:{reason}" for reason in _CODE_CONTEXT_SPECIAL_ERROR_REASONS),
+        *(f"{code}:unclassified" for code in _CODE_CONTEXT_METRIC_ERROR_CODES),
+        _CODE_CONTEXT_MALFORMED_ERROR_LABEL,
+        f"{_CODE_CONTEXT_UNKNOWN_ERROR_LABEL}:unclassified",
+    }
+)
+
+
+def _code_context_error_diagnostic(
+    response: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Return bounded metric labels without retaining response or request text."""
+
+    if response.get("success") is not False:
+        return None
+    malformed = (
+        _CODE_CONTEXT_MALFORMED_ERROR_LABEL,
+        _CODE_CONTEXT_MALFORMED_ERROR_LABEL,
+    )
+    content_items = response.get("contentItems")
+    if not isinstance(content_items, list) or len(content_items) != 1:
+        return malformed
+    item = content_items[0]
+    if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+        return malformed
+    text = item["text"]
+    try:
+        if len(text.encode("utf-8")) > _CODE_CONTEXT_DIAGNOSTIC_PAYLOAD_BYTES:
+            return malformed
+        payload = json.loads(text)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return malformed
+    if not isinstance(payload, dict) or payload.get("ok") is not False:
+        return malformed
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return malformed
+    raw_code = error.get("code")
+    raw_reason = error.get("reason")
+    if not isinstance(raw_code, str) or not isinstance(raw_reason, str):
+        return malformed
+    if raw_code not in _CODE_CONTEXT_METRIC_ERROR_CODES:
+        return (
+            _CODE_CONTEXT_UNKNOWN_ERROR_LABEL,
+            f"{_CODE_CONTEXT_UNKNOWN_ERROR_LABEL}:unclassified",
+        )
+    if raw_reason not in _CODE_CONTEXT_METRIC_ERROR_REASONS:
+        return raw_code, f"{raw_code}:unclassified"
+    if raw_reason == raw_code:
+        return raw_code, raw_code
+    if raw_code != "invalid_arguments" or raw_reason not in _CODE_CONTEXT_SPECIAL_ERROR_REASONS:
+        return raw_code, f"{raw_code}:unclassified"
+    detail = f"{raw_code}:{raw_reason}"
+    return raw_code, detail
+
+
+def _filtered_code_context_metric_counts(
+    value: Any,
+    *,
+    allowed: frozenset[str],
+) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: min(count, _CODE_CONTEXT_METRIC_COUNT_MAX)
+        for key, count in value.items()
+        if key in allowed
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+    }
+
+
+def _increment_code_context_metric_count(counts: dict[str, int], key: str) -> None:
+    counts[key] = min(
+        _CODE_CONTEXT_METRIC_COUNT_MAX,
+        int(counts.get(key) or 0) + 1,
+    )
+
+
+def _code_context_error_response(
+    code: str,
+    message: str,
+    *,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    text = json.dumps(
+        {
+            "ok": False,
+            "error": {
+                "code": code,
+                "message": message,
+                "reason": reason or code,
+            },
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "contentItems": [{"type": "inputText", "text": text}],
+        "success": False,
+    }
+
+
+def _valid_dynamic_tool_response(response: Any) -> bool:
+    if not isinstance(response, dict) or set(response) != {"contentItems", "success"}:
+        return False
+    if not isinstance(response.get("success"), bool):
+        return False
+    content_items = response.get("contentItems")
+    if not isinstance(content_items, list) or len(content_items) != 1:
+        return False
+    item = content_items[0]
+    return (
+        isinstance(item, dict)
+        and set(item) == {"type", "text"}
+        and item.get("type") == "inputText"
+        and isinstance(item.get("text"), str)
+        and len(item["text"].encode("utf-8")) <= 128 * 1024
+    )
+
+
+def _dynamic_tool_response_bytes(response: Mapping[str, Any]) -> int:
+    items = response.get("contentItems")
+    if not isinstance(items, list):
+        return 0
+    return sum(
+        len(item.get("text", "").encode("utf-8"))
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("text"), str)
+    )
 
 
 def _adversary_enabled_from_env() -> bool | None:

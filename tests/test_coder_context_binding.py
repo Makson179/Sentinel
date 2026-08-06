@@ -13,7 +13,9 @@ from supervisor.coder import (
     CoderLifecycleTransition,
     CoderRecoveryContext,
     CoderSession,
+    coder_thread_params,
 )
+from supervisor.code_context import code_context_prompt_guidance, dynamic_tool_specs
 from supervisor.schemas import BelloConfig
 from supervisor.state import StateStore
 
@@ -83,6 +85,94 @@ async def test_coder_thread_start_reports_provider_thread_for_telemetry(tmp_path
 
     assert await session.start_thread() == "new-thread-1"
     assert started_threads == ["new-thread-1"]
+
+
+def test_coder_thread_params_add_structured_tools_only_when_enabled(tmp_path: Path) -> None:
+    assert "dynamicTools" not in coder_thread_params(tmp_path)
+    assert coder_thread_params(tmp_path, structured_code_tools="read")["dynamicTools"] == (
+        dynamic_tool_specs("read")
+    )
+
+
+async def test_coder_session_propagates_structured_tools_to_new_thread(tmp_path: Path) -> None:
+    store, task = _store(tmp_path, thread_id=None)
+    client = _CoderClient()
+    session = CoderSession(
+        client,  # type: ignore[arg-type]
+        store,
+        tmp_path,
+        task,
+        structured_code_tools="read",
+    )
+
+    await session.start_thread()
+
+    event, params = client.events[0]
+    assert event == "thread_start"
+    assert isinstance(params, dict)
+    assert params["dynamicTools"] == dynamic_tool_specs("read")
+
+
+async def test_structured_tool_guidance_is_lifecycle_only_and_recovery_json_stays_last(
+    tmp_path: Path,
+) -> None:
+    store, task = _store(tmp_path)
+    client = _CoderClient()
+    session = CoderSession(
+        client,  # type: ignore[arg-type]
+        store,
+        tmp_path,
+        task,
+        thread_id="old-thread",
+        context_binding=_binding(),
+        structured_code_tools="read",
+    )
+    guidance = code_context_prompt_guidance("read")
+    assert guidance
+
+    await session.start_initial_turn()
+    await session.start_turn("ordinary follow-up")
+    await session.start_restart_turn()
+    await session.start_recovery_turn(
+        CoderRecoveryContext.from_payload("checkpoint-guidance", {"summary": "resume"}),
+        reason="transport recovery",
+    )
+
+    prompts = [
+        params["input"][0]["text"]  # type: ignore[index]
+        for event, params in client.events
+        if event == "turn_start" and isinstance(params, dict)
+    ]
+    assert len(prompts) == 4
+    assert prompts[0].count(guidance) == 1
+    assert prompts[1] == "ordinary follow-up"
+    assert prompts[2].count(guidance) == 1
+    assert prompts[3].count(guidance) == 1
+    recovery_envelope = json.loads(prompts[3].rsplit("\n", 1)[-1])
+    assert recovery_envelope["recovery"]["checkpoint_id"] == "checkpoint-guidance"
+
+
+async def test_unbound_recovery_turn_adds_structured_guidance_once(tmp_path: Path) -> None:
+    store, task = _store(tmp_path)
+    client = _CoderClient()
+    session = CoderSession(
+        client,  # type: ignore[arg-type]
+        store,
+        tmp_path,
+        task,
+        thread_id="old-thread",
+        structured_code_tools="read",
+    )
+    guidance = code_context_prompt_guidance("read")
+
+    await session.start_unbound_recovery_turn("Recover the provider transport and continue.")
+
+    event, params = client.events[0]
+    assert event == "turn_start"
+    assert isinstance(params, dict)
+    prompt = params["input"][0]["text"]  # type: ignore[index]
+    assert prompt.startswith("Recover the provider transport and continue.")
+    assert prompt.count(guidance) == 1
 
 
 def test_binding_snapshot_is_frozen_and_rejects_invalid_lifecycle_values() -> None:

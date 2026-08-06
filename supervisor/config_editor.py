@@ -24,6 +24,7 @@ from supervisor.project_config import (
     MODEL_GPT_5_6_SOL,
     MODEL_GPT_5_6_TERRA,
     SPEED_CHOICES,
+    STRUCTURED_CODE_TOOL_CHOICES,
     SUPPORTED_MODEL_CHOICES,
     ProjectConfig,
     changed_project_config_fields,
@@ -539,6 +540,20 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             help_text=(
                 "true lets cheap triage (Luna by default) dismiss routine runtime checks. Human messages, "
                 "approvals, and mandatory checks bypass it. false uses the full runtime supervisor for every check."
+            ),
+        ),
+        EditorParameter(
+            "structured_code_tools",
+            "structured-code-tools",
+            config.structured_code_tools,
+            tuple(
+                EditorOption(value, "structured_code_tools", value)
+                for value in STRUCTURED_CODE_TOOL_CHOICES
+            ),
+            help_text=(
+                "off exposes no structured code tools. read exposes read-only symbol, reference, and raw-range "
+                "tools. preview adds prepare_symbol_edit, which validates and returns a patch preview but never "
+                "writes the workspace. This setting is independent of Context Mode."
             ),
         ),
         EditorParameter(
@@ -1722,6 +1737,7 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
             "adversary_intelligence": "I",
             "speed": "F",
             "cheap_runtime": "L",
+            "structured_code_tools": "S",
             "start_over": "R",
             "completion_review": "V",
             "adversary": "A",
@@ -1747,6 +1763,7 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         "adversary_intelligence": "✾",
         "speed": "⚡",
         "cheap_runtime": "☆",
+        "structured_code_tools": "⌘",
         "start_over": "↻",
         "completion_review": "✓",
         "adversary": "◈",
@@ -1803,6 +1820,7 @@ def _icon_style_key(parameter_key: str) -> str:
         "adversary_intelligence": "cyan",
         "speed": "yellow",
         "cheap_runtime": "magenta",
+        "structured_code_tools": "cyan",
         "start_over": "magenta",
         "completion_review": "green",
         "adversary": "green",

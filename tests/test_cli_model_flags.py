@@ -19,6 +19,7 @@ from supervisor.project_config import (
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
     ProjectConfig,
+    STRUCTURED_CODE_TOOL_CHOICES,
     project_config_path,
 )
 
@@ -31,6 +32,7 @@ def test_role_models_default_to_gpt_56_sol() -> None:
     assert settings.runtime_model == MODEL_GPT_5_6_SOL
     assert settings.completion_model == MODEL_GPT_5_6_SOL
     assert settings.adversary_model == MODEL_GPT_5_6_SOL
+    assert settings.structured_code_tools == "off"
 
 
 def test_shared_model_flag_is_not_registered() -> None:
@@ -54,8 +56,64 @@ def test_four_role_flags_are_registered() -> None:
         "--runtime-intelligence",
         "--completion-intelligence",
         "--adversary-intelligence",
+        "--structured-code-tools",
     ):
         assert option in result.output
+
+
+def test_structured_code_tools_cli_override_reaches_runner_with_context_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    captured = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
+
+    async def fake_run_bello(settings):
+        captured.append(settings)
+        return 0
+
+    def fake_run_async_cleanly(coro):
+        assert asyncio.run(coro) == 0
+
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run_bello)
+    monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--task",
+            str(task),
+            "--structured-code-tools",
+            "preview",
+            "--context-mode",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    assert captured[0].structured_code_tools == "preview"
+    assert captured[0].context_mode is True
+
+
+def test_structured_code_tools_modes_and_override_resolution() -> None:
+    for mode in STRUCTURED_CODE_TOOL_CHOICES:
+        settings = _resolve_run_settings(
+            project_config=ProjectConfig(structured_code_tools="read", context_mode=True),
+            structured_code_tools=mode,
+        )
+        assert settings.structured_code_tools == mode
+        assert settings.context_mode is True
+
+
+def test_structured_code_tools_rejects_invalid_programmatic_override() -> None:
+    with pytest.raises(RuntimeError, match="structured code tools mode"):
+        _resolve_run_settings(
+            project_config=ProjectConfig(),
+            structured_code_tools="write",
+        )
 
 
 def test_context_toolchain_roots_env_is_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -386,6 +444,7 @@ def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_
         "clean=false "
         "completion-review=true "
         "adversary=false "
+        "structured-code-tools=off "
         "context-mode=false "
         "protected-path=hidden"
     )

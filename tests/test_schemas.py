@@ -16,6 +16,7 @@ from supervisor.prompts import (
 )
 from supervisor.schemas.models import (
     ApprovalWakeContext,
+    BelloConfig,
     HumanMessage,
     CompletionDecisionArtifact,
     CompletionReviewDecision,
@@ -36,6 +37,16 @@ def _walk_schema(node: Any) -> Iterator[dict[str, Any]]:
     elif isinstance(node, list):
         for item in node:
             yield from _walk_schema(item)
+
+
+def test_bello_config_structured_code_tools_modes_are_strict() -> None:
+    base = {"project_root": "/workspace", "task_path": "TASK.md"}
+
+    assert BelloConfig(**base).structured_code_tools == "off"
+    assert BelloConfig(**base, structured_code_tools="read").structured_code_tools == "read"
+    assert BelloConfig(**base, structured_code_tools="preview").structured_code_tools == "preview"
+    with pytest.raises(ValueError, match="structured_code_tools"):
+        BelloConfig(**base, structured_code_tools="write")
 
 
 def test_supervisor_decision_schema_is_strict() -> None:

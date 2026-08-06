@@ -18,6 +18,7 @@ from supervisor.appserver import (
     AppServerMessage,
     text_input,
 )
+from supervisor.code_context import code_context_prompt_guidance, dynamic_tool_specs
 from supervisor.prompts import build_coder_prompt, build_restart_prompt
 from supervisor.state import StateStore
 
@@ -278,7 +279,13 @@ def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict
     return params
 
 
-def coder_thread_params(project_root: Path, *, model: str | None = None, fast: bool = False) -> dict[str, Any]:
+def coder_thread_params(
+    project_root: Path,
+    *,
+    model: str | None = None,
+    fast: bool = False,
+    structured_code_tools: str = "off",
+) -> dict[str, Any]:
     params: dict[str, Any] = {
         "cwd": str(project_root),
         "runtimeWorkspaceRoots": [str(project_root)],
@@ -292,6 +299,9 @@ def coder_thread_params(project_root: Path, *, model: str | None = None, fast: b
     }
     if model:
         params["model"] = model
+    tools = dynamic_tool_specs(structured_code_tools)
+    if tools:
+        params["dynamicTools"] = tools
     return params
 
 
@@ -358,6 +368,7 @@ class CoderSession:
     context_binding: CoderContextBindingSnapshot | None = None
     lifecycle_checkpoint: LifecycleCheckpointHandler | None = None
     on_thread_start: Callable[[str], None] | None = None
+    structured_code_tools: str = "off"
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root)
@@ -389,7 +400,12 @@ class CoderSession:
     async def start_thread(self) -> str:
         self._validate_active_binding()
         response = await self.coder_client.thread_start(
-            coder_thread_params(self.project_root, model=self.model, fast=self.fast),
+            coder_thread_params(
+                self.project_root,
+                model=self.model,
+                fast=self.fast,
+                structured_code_tools=self.structured_code_tools,
+            ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
         )
         thread_id = self._response_thread_id(response, operation="thread/start")
@@ -400,10 +416,19 @@ class CoderSession:
         return thread_id
 
     async def start_initial_turn(self) -> str:
-        return await self.start_turn(build_coder_prompt(self.task_path))
+        return await self.start_turn(
+            self._with_code_context_guidance(build_coder_prompt(self.task_path))
+        )
 
     async def start_restart_turn(self) -> str:
-        return await self.start_turn(build_restart_prompt(self.task_path))
+        return await self.start_turn(
+            self._with_code_context_guidance(build_restart_prompt(self.task_path))
+        )
+
+    async def start_unbound_recovery_turn(self, message: str) -> str:
+        """Start a non-Context recovery turn with the lifecycle-only tool guidance."""
+
+        return await self.start_turn(self._with_code_context_guidance(message))
 
     async def start_recovery_turn(
         self,
@@ -801,8 +826,11 @@ class CoderSession:
             "recovery": recovery_context.to_dict(),
         }
         encoded = json.dumps(envelope, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        restart_prompt = self._with_code_context_guidance(
+            build_restart_prompt(self.task_path)
+        )
         prompt = (
-            f"{build_restart_prompt(self.task_path)}\n\n"
+            f"{restart_prompt}\n\n"
             "Bello lifecycle recovery context (controller-bounded JSON):\n"
             f"{encoded}"
         )
@@ -811,3 +839,11 @@ class CoderSession:
                 f"coder recovery prompt exceeds its {MAX_CODER_RECOVERY_PROMPT_BYTES}-byte limit"
             )
         return prompt
+
+    def _with_code_context_guidance(self, prompt: str) -> str:
+        """Add the optional code-navigation contract to lifecycle prompts only."""
+
+        guidance = code_context_prompt_guidance(self.structured_code_tools)
+        if not guidance:
+            return prompt
+        return f"{prompt}\n\n{guidance}"

@@ -15,6 +15,7 @@ from supervisor import doctor, update_check
 from supervisor.controller import BelloController
 from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
+    STRUCTURED_CODE_TOOL_CHOICES,
     ProjectConfig,
     ProjectConfigError,
     intelligence_choices_for_model,
@@ -142,6 +143,15 @@ class BelloClickGroup(click.Group):
     help="Maximum adversarial tester passes before final completion (default 1; 0 disables).",
 )
 @click.option(
+    "--structured-code-tools",
+    type=click.Choice(STRUCTURED_CODE_TOOL_CHOICES),
+    default=None,
+    help=(
+        "Structured code tools for the coder: off disables them; read exposes read-only "
+        "symbol/reference/raw reads; preview also exposes non-writing symbol edit previews."
+    ),
+)
+@click.option(
     "--context-mode/--no-context-mode",
     default=None,
     help="Enable or disable the bundled coder-only offline Context Mode runtime.",
@@ -187,6 +197,7 @@ def cli(
     completion_review: bool | None,
     adversary: bool | None,
     adversary_runs: int | None,
+    structured_code_tools: str | None,
     context_mode: bool | None,
     keep_context_mode_data: bool,
     context_mode_debug: bool,
@@ -216,6 +227,7 @@ def cli(
             completion_review=completion_review,
             adversary=adversary,
             adversary_runs=adversary_runs,
+            structured_code_tools=structured_code_tools,
             context_mode=context_mode,
             keep_context_mode_data=keep_context_mode_data,
             context_mode_debug=context_mode_debug,
@@ -306,6 +318,7 @@ def config_command() -> None:
     click.echo(f"completion-mod: {config.completion_mod}")
     click.echo(f"adversary-mod: {config.adversary_mod}")
     click.echo(f"cheap-runtime: {str(config.cheap_runtime).lower()}")
+    click.echo(f"structured-code-tools: {config.structured_code_tools}")
 
 
 def _version_callback(ctx: click.Context, value: bool) -> None:
@@ -434,6 +447,7 @@ async def _run_bello(settings: RunSettings) -> int:
         adversary_enabled=settings.adversary,
         adversary_runs=settings.adversary_runs,
         completion_review=settings.completion_review,
+        structured_code_tools=settings.structured_code_tools,
         project_config=load_project_config(Path.cwd(), create=False),
         context_mode_enabled=settings.context_mode,
         keep_context_mode_data=settings.keep_context_mode_data,
@@ -493,6 +507,7 @@ class RunSettings:
     completion_review: bool
     adversary: bool
     adversary_runs: int
+    structured_code_tools: str
     context_mode: bool
     keep_context_mode_data: bool
     context_mode_debug: bool
@@ -519,6 +534,7 @@ def _resolve_run_settings(
     completion_review: bool | None = None,
     adversary: bool | None = None,
     adversary_runs: int | None = None,
+    structured_code_tools: str | None = None,
     context_mode: bool | None = None,
     keep_context_mode_data: bool = False,
     context_mode_debug: bool = False,
@@ -544,6 +560,14 @@ def _resolve_run_settings(
     selected_runtime_intelligence = runtime_intelligence or project_config.runtime_intelligence
     selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
     selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
+    selected_structured_code_tools = (
+        project_config.structured_code_tools
+        if structured_code_tools is None
+        else structured_code_tools
+    )
+    if selected_structured_code_tools not in STRUCTURED_CODE_TOOL_CHOICES:
+        choices = ", ".join(STRUCTURED_CODE_TOOL_CHOICES)
+        raise RuntimeError(f"structured code tools mode must be one of: {choices}")
     _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
     _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
     _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
@@ -572,6 +596,7 @@ def _resolve_run_settings(
             else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
         ),
         adversary_runs=project_config.adversary_runs if adversary_runs is None else adversary_runs,
+        structured_code_tools=selected_structured_code_tools,
         context_mode=project_config.context_mode if context_mode is None else context_mode,
         keep_context_mode_data=keep_context_mode_data,
         context_mode_debug=context_mode_debug,

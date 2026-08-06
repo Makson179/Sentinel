@@ -17,6 +17,7 @@ from supervisor.project_config import (
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
     MODEL_GPT_5_6_TERRA,
+    STRUCTURED_CODE_TOOL_CHOICES,
     ProjectConfig,
     ProjectConfigError,
     changed_project_config_fields,
@@ -49,6 +50,7 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.completion_returns_before_adversary == 4
     assert config.completion_returns_after_adversary == 2
     assert config.cheap_runtime is True
+    assert config.structured_code_tools == "off"
     assert config.clean is False
     assert config.task is None
     assert config.protected_path == ()
@@ -110,6 +112,7 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["max_completion_returns_before_adversary"] == 4
     assert payload["max_completion_returns_after_adversary"] == 2
     assert payload["cheap_runtime"] is True
+    assert payload["structured_code_tools"] == "off"
     assert payload["runtime_mod"] == DEFAULT_MODEL
     assert payload["completion_mod"] == DEFAULT_MODEL
     assert payload["adversary_mod"] == DEFAULT_MODEL
@@ -272,6 +275,13 @@ def test_changed_project_config_fields_tracks_cheap_runtime() -> None:
     assert changed_project_config_fields(before, after) == ("cheap_runtime",)
 
 
+def test_changed_project_config_fields_tracks_structured_code_tools() -> None:
+    before = ProjectConfig(structured_code_tools="off")
+    after = ProjectConfig(structured_code_tools="preview")
+
+    assert changed_project_config_fields(before, after) == ("structured_code_tools",)
+
+
 def test_config_editor_state_expands_selects_and_advances() -> None:
     config = ProjectConfig()
     params = parameter_defs(config)
@@ -340,6 +350,23 @@ def test_config_editor_can_disable_cheap_runtime() -> None:
     assert action is None
     assert config.cheap_runtime is False
     assert state.parameter_index == runtime_index + 1
+
+
+def test_config_editor_can_select_structured_code_preview() -> None:
+    config = ProjectConfig()
+    params = parameter_defs(config)
+    tools_index = [param.key for param in params].index("structured_code_tools")
+    state = EditorState(
+        parameter_index=tools_index,
+        expanded_index=tools_index,
+        option_index=2,
+    )
+
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.structured_code_tools == "preview"
+    assert state.parameter_index == tools_index + 1
 
 
 def test_config_editor_inline_adversary_runs_updates_value() -> None:
@@ -592,6 +619,7 @@ def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert f"completion-mod: {DEFAULT_MODEL}" in result.output
     assert f"adversary-mod: {DEFAULT_MODEL}" in result.output
     assert "cheap-runtime: true" in result.output
+    assert "structured-code-tools: off" in result.output
 
 
 def _write_config_payload(tmp_path: Path, payload: str) -> None:
@@ -745,4 +773,52 @@ def test_cheap_runtime_syncs_to_runtime_config(tmp_path: Path) -> None:
 
     runtime_config = store.get_bello_config()
     assert runtime_config.cheap_runtime is False
+    assert runtime_config.coder_thread_id == "thread"
+
+
+@pytest.mark.parametrize("mode", STRUCTURED_CODE_TOOL_CHOICES)
+def test_structured_code_tools_round_trip_and_allow_context_mode(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps(
+            {
+                "structured_code_tools": mode,
+                "context_mode": {"enabled": True},
+            }
+        ),
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.structured_code_tools == mode
+    assert config.context_mode is True
+    assert config.to_json_data()["structured_code_tools"] == mode
+
+
+@pytest.mark.parametrize("value", ["write", True, None, 1])
+def test_structured_code_tools_reject_invalid_values(tmp_path: Path, value: object) -> None:
+    _write_config_payload(tmp_path, json.dumps({"structured_code_tools": value}))
+
+    with pytest.raises(ProjectConfigError, match="structured_code_tools"):
+        load_project_config(tmp_path, create=False)
+
+
+def test_structured_code_tools_syncs_to_runtime_config(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path="TASK.md", coder_thread_id="thread"),
+        overwrite=True,
+    )
+
+    sync_runtime_config_fields(
+        tmp_path,
+        ProjectConfig(structured_code_tools="preview"),
+        ("structured_code_tools",),
+    )
+
+    runtime_config = store.get_bello_config()
+    assert runtime_config.structured_code_tools == "preview"
     assert runtime_config.coder_thread_id == "thread"

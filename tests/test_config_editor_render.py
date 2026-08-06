@@ -135,6 +135,26 @@ def test_config_editor_render_shows_cheap_runtime_toggle() -> None:
     assert next(param for param in params if param.key == "cheap_runtime").value == "false"
 
 
+def test_config_editor_render_shows_structured_code_tool_modes() -> None:
+    config = ProjectConfig(structured_code_tools="preview", context_mode=True)
+    params = parameter_defs(config)
+    tools_index = [param.key for param in params].index("structured_code_tools")
+    parameter = params[tools_index]
+
+    output = _render(
+        config,
+        EditorState(parameter_index=tools_index, expanded_index=tools_index),
+        width=140,
+        height=24,
+    )
+
+    assert "structured-code-tools" in output
+    assert [option.label for option in parameter.options] == ["off", "read", "preview"]
+    assert parameter.value == "preview"
+    assert "never writes" in parameter.help_text
+    assert "independent of Context Mode" in parameter.help_text
+
+
 def test_config_editor_hides_completion_dependencies_when_review_is_disabled() -> None:
     config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(config)
@@ -570,7 +590,7 @@ def test_config_editor_default_design_matches_reference_structure() -> None:
         config,
         EditorState(parameter_index=speed_index),
         width=120,
-        height=20,
+        height=24,
     )
     assert re.search(r"⚡  speed\s+fast", lower_output)
     assert re.search(r"↻  start-over\s+false", lower_output)
