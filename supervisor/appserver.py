@@ -632,6 +632,18 @@ class AppServerClient:
     async def model_list(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
         return await self.request("model/list", {}, timeout=timeout)
 
+    async def hooks_list(
+        self,
+        cwds: list[Path],
+        *,
+        timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request(
+            "hooks/list",
+            {"cwds": [str(cwd) for cwd in cwds]},
+            timeout=timeout,
+        )
+
     async def thread_start(
         self,
         params: dict[str, Any],

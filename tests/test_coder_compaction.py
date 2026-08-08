@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from supervisor.appserver import AppServerClient, AppServerMessage, ClientRole
+from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage, ClientRole
 from supervisor.coder import CoderSession
+from supervisor.context_mode.config import REQUIRED_HOOKS, generate_coder_home
 from supervisor.context_mode.session import CheckpointRecoveryKind
+from supervisor.context_mode.startup import ContextModeStartupError
 from supervisor.controller import BelloController
 
 
@@ -40,6 +43,123 @@ async def test_appserver_compaction_rpc_uses_pinned_method() -> None:
     client.request = request  # type: ignore[method-assign]
     await client.thread_compact_start("thread-1", timeout=17.0)
     assert calls == [("thread/compact/start", {"threadId": "thread-1"}, 17.0)]
+
+
+@pytest.mark.asyncio
+async def test_appserver_hooks_list_uses_pinned_method(tmp_path: Path) -> None:
+    client = AppServerClient(command=["codex"], role=ClientRole.CODER)
+    calls: list[tuple[str, dict[str, object] | None, float]] = []
+
+    async def request(method, params=None, *, timeout):
+        calls.append((method, params, timeout))
+        return {"data": []}
+
+    client.request = request  # type: ignore[method-assign]
+    assert await client.hooks_list([tmp_path], timeout=17.0) == {"data": []}
+    assert calls == [("hooks/list", {"cwds": [str(tmp_path)]}, 17.0)]
+
+
+@pytest.mark.asyncio
+async def test_context_hook_preflight_matches_codex_0146_inventory(tmp_path: Path) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    generated = generate_coder_home(
+        tmp_path / "coder-home",
+        launcher_path=Path("/bin/true"),
+        mcp_bootstrap_path=tmp_path / "mcp.json",
+        workspace=workspace,
+        hook_bootstraps={event: tmp_path / f"{event}.json" for event in REQUIRED_HOOKS},
+    )
+    manifest = json.loads((generated.root / "hooks.json").read_text(encoding="utf-8"))
+    event_labels = {
+        "PreToolUse": "preToolUse",
+        "PostToolUse": "postToolUse",
+        "SessionStart": "sessionStart",
+        "PreCompact": "preCompact",
+        "UserPromptSubmit": "userPromptSubmit",
+        "Stop": "stop",
+    }
+    source_path = str((generated.root / "hooks.json").resolve())
+    hooks: list[dict[str, object]] = []
+    for event in REQUIRED_HOOKS:
+        for group in manifest["hooks"][event]:
+            for handler in group["hooks"]:
+                hooks.append(
+                    {
+                        "eventName": event_labels[event],
+                        "handlerType": "command",
+                        "matcher": group.get("matcher"),
+                        "command": handler["command"],
+                        "sourcePath": source_path,
+                        "source": "user",
+                        "pluginId": None,
+                        "isManaged": False,
+                        "enabled": True,
+                        "trustStatus": "untrusted",
+                    }
+                )
+    response = {
+        "data": [
+            {
+                "cwd": str(workspace),
+                "hooks": hooks,
+                "warnings": [],
+                "errors": [],
+            }
+        ]
+    }
+    client = AppServerClient(
+        command=["codex"],
+        role=ClientRole.CODER,
+        codex_home=generated.root,
+    )
+
+    async def hooks_list(cwds, *, timeout=30.0):
+        assert cwds == [workspace]
+        return response
+
+    client.hooks_list = hooks_list  # type: ignore[method-assign]
+    controller = object.__new__(BelloController)
+    controller.project_root = workspace
+    controller.workspace_root = workspace
+    controller.coder_client = client
+
+    await controller._preflight_discovered_coder_hooks()
+    hooks[0]["eventName"] = "pre_tool_use"
+    with pytest.raises(ContextModeStartupError, match="catalogue mismatch"):
+        await controller._preflight_discovered_coder_hooks()
+
+
+@pytest.mark.asyncio
+async def test_coder_steer_race_starts_fresh_turn(tmp_path: Path) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.steered: list[tuple[str, str, str]] = []
+            self.started: list[dict[str, object]] = []
+
+        async def turn_steer(self, thread_id, turn_id, message, *, timeout):
+            self.steered.append((thread_id, turn_id, message))
+            raise AppServerError("{'code': -32600, 'message': 'no active turn to steer'}")
+
+        async def turn_start(self, params, *, timeout):
+            self.started.append(params)
+            return {"turn": {"id": "fresh-turn"}}
+
+    client = Client()
+    coder = CoderSession(
+        client,  # type: ignore[arg-type]
+        _Store(),  # type: ignore[arg-type]
+        tmp_path,
+        tmp_path / "TASK.md",
+        thread_id="thread-1",
+        active_turn_id="stale-turn",
+    )
+
+    assert await coder.steer_or_start("continue") == "fresh-turn"
+    assert client.steered == [("thread-1", "stale-turn", "continue")]
+    assert len(client.started) == 1
+    assert client.started[0]["threadId"] == "thread-1"
+    assert coder.active_turn_id == "fresh-turn"
 
 
 @pytest.mark.asyncio
@@ -101,6 +221,101 @@ async def test_coder_compaction_registers_waiter_before_rpc(tmp_path: Path) -> N
         thread_id="thread-1",
     )
     assert await coder.compact_thread() == terminal
+
+
+@pytest.mark.asyncio
+async def test_coder_compaction_barrier_waits_for_matching_completed_turn(tmp_path: Path) -> None:
+    terminal = AppServerMessage(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "barrier-turn",
+                "turn": {"id": "barrier-turn", "status": "completed"},
+            },
+        },
+        role=ClientRole.CODER,
+    )
+
+    class Client:
+        role = ClientRole.CODER
+        process_epoch = 0
+
+        def __init__(self) -> None:
+            self.waiter_registered = asyncio.Event()
+            self.rpc_called = False
+            self.started: list[dict[str, object]] = []
+
+        async def wait_for_notification(self, predicate, *, timeout):
+            assert predicate(terminal)
+            self.waiter_registered.set()
+            while not self.rpc_called:
+                await asyncio.sleep(0)
+            return terminal
+
+        async def turn_start(self, params, *, timeout):
+            assert self.waiter_registered.is_set()
+            self.started.append(params)
+            self.rpc_called = True
+            return {"turn": {"id": "barrier-turn"}}
+
+    client = Client()
+    coder = CoderSession(
+        client,  # type: ignore[arg-type]
+        _Store(),  # type: ignore[arg-type]
+        tmp_path,
+        tmp_path / "task.md",
+        thread_id="thread-1",
+    )
+
+    assert await coder.run_compaction_recovery_barrier("barrier") == terminal
+    assert client.started[0]["threadId"] == "thread-1"
+    assert coder.active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_barrier_terminal_is_not_treated_as_a_coder_work_turn() -> None:
+    class Store(_Store):
+        def get_bello_config(self):
+            return SimpleNamespace(coder_thread_id="thread-1")
+
+    class Coder:
+        def __init__(self) -> None:
+            self.completed: list[str] = []
+
+        def mark_turn_completed(self, turn_id):
+            self.completed.append(turn_id)
+
+    controller = object.__new__(BelloController)
+    controller.store = Store()  # type: ignore[assignment]
+    controller.coder = Coder()  # type: ignore[assignment]
+    controller.pending_approvals = {}
+    controller._terminal_cleanup_started = False
+    controller._coder_context_compaction_interrupt_turn_id = None
+    controller._coder_context_compaction_turn_ids = {"barrier-turn"}
+    controller._append_event = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    async def unexpected_work_turn(*, item_id):
+        raise AssertionError("barrier terminal reached normal coder completion handling")
+
+    controller._handle_coder_turn_completed = unexpected_work_turn  # type: ignore[method-assign]
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "barrier-turn",
+                    "turn": {"id": "barrier-turn", "status": "completed"},
+                },
+            },
+            role=ClientRole.CODER,
+        )
+    )
+
+    assert controller.coder.completed == ["barrier-turn"]
+    assert controller._coder_context_compaction_turn_ids == set()
+    assert controller.store.logs[-1]["type"] == "coder_context_compaction_turn_completed"
 
 
 def _policy_controller() -> BelloController:
@@ -210,6 +425,19 @@ async def test_compaction_precompact_checkpoint_precedes_rpc_and_verified_recove
                 }
             )
 
+        async def run_compaction_recovery_barrier(self, message):
+            calls.append(("barrier", message))
+            return AppServerMessage(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "barrier-turn",
+                        "turn": {"id": "barrier-turn", "status": "completed"},
+                    },
+                }
+            )
+
     async def checkpoint(**kwargs):
         calls.append(("checkpoint", kwargs))
         return SimpleNamespace(checkpoint_id="checkpoint-1")
@@ -235,6 +463,10 @@ async def test_compaction_precompact_checkpoint_precedes_rpc_and_verified_recove
         ),
         "compact",
         (
+            "barrier",
+            "Bello internal compaction recovery barrier. Do not perform task work.",
+        ),
+        (
             "recover",
             {
                 "checkpoint_id": "checkpoint-1",
@@ -245,6 +477,7 @@ async def test_compaction_precompact_checkpoint_precedes_rpc_and_verified_recove
     assert controller._coder_context_compactions_completed == 1
     assert controller._coder_context_awaiting_post_compaction_sample
     assert "compact-turn" in controller._coder_context_compaction_turn_ids
+    assert "barrier-turn" in controller._coder_context_compaction_turn_ids
 
 
 @pytest.mark.asyncio

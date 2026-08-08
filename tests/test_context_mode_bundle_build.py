@@ -4,7 +4,10 @@ import hashlib
 import inspect
 import json
 import os
+import platform
 import re
+import subprocess
+import sys
 import tarfile
 import tomllib
 from pathlib import Path
@@ -28,10 +31,97 @@ def test_offline_worker_result_budget_leaves_signed_envelope_headroom() -> None:
     text_budget = int(match.group(1)) * 1024
     conservative_result_budget = MAX_MODEL_RESULT_ESTIMATED_TOKENS * 4
 
-    assert text_budget + 4 * 1024 <= conservative_result_budget
-    assert (
-        "utf8Prefix(value.content[0].text, RESULT_TEXT_BUDGET)" in source
+    assert 2 * text_budget + 4 * 1024 <= conservative_result_budget
+    assert "modelText: bounded" in source
+    assert "setResultText(value, fitted)" in source
+
+
+@pytest.mark.skipif(
+    not (
+        sys.platform.startswith("linux")
+        and platform.machine().lower() in {"amd64", "x86_64"}
+    ),
+    reason="the checked-in runtime fixture is linux-x86_64",
+)
+def test_packaged_worker_mirrors_visible_text_and_resolves_shell_from_path(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    release_worker = repository / "release/context_mode_offline_fork/build/worker.mjs"
+    release_executor = repository / "release/context_mode_offline_fork/build/executor.mjs"
+    runtime_root = repository / "supervisor/_vendor/context_mode/linux-x86_64"
+    packaged_worker = runtime_root / "package/build/worker.mjs"
+    packaged_executor = runtime_root / "package/build/executor.mjs"
+    server_entrypoint = runtime_root / "package/server.bundle.mjs"
+    node = runtime_root / "node/bin/node"
+    assert release_worker.read_bytes() == packaged_worker.read_bytes()
+    assert release_executor.read_bytes() == packaged_executor.read_bytes()
+    executor_source = release_executor.read_text(encoding="utf-8")
+    assert 'return { executable: "sh", args:' in executor_source
+    assert 'executable: "/bin/sh"' not in executor_source
+
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "worker-result-test", "version": "1"},
+        },
+    }
+    call = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "ctx_execute",
+            "arguments": {
+                "language": "shell",
+                # Quotes double their JSON wire cost and force the serialized-size
+                # fitting path even though the source stays below the auto-index cap.
+                "code": "python3 -c 'import sys;sys.stdout.write(chr(34) * 8191)'",
+            },
+        },
+    }
+    worker_input = "\n".join(
+        json.dumps(message, separators=(",", ":")) for message in (initialize, call)
+    ) + "\n"
+    environment = {
+        **os.environ,
+        "BELLO_OFFLINE": "1",
+        "CONTEXT_MODE_DIR": str(tmp_path / "state"),
+        "PATH": "/usr/bin",
+    }
+    completed = subprocess.run(
+        [str(node), str(server_entrypoint)],
+        cwd=tmp_path,
+        env=environment,
+        input=worker_input,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
     )
+    responses = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [response["id"] for response in responses] == [1, 2]
+    result = responses[1]["result"]
+    model_text = result["structuredContent"]["modelText"]
+    content_text = result["content"][0]["text"]
+    worker_metadata = result["structuredContent"]["_belloWorker"]
+    encoded_result = json.dumps(
+        result,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert model_text == content_text
+    assert worker_metadata["returned_bytes"] == len(model_text.encode("utf-8"))
+    assert worker_metadata["source_bytes"] == 8191
+    assert len(encoded_result) + 4 * 1024 <= MAX_MODEL_RESULT_ESTIMATED_TOKENS * 4
+    assert len(model_text.encode("utf-8")) < worker_metadata["source_bytes"]
 
 
 def _write(path: Path, content: str | bytes, *, executable: bool = False) -> None:

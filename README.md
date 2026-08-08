@@ -238,6 +238,21 @@ The coder receives exactly eight Context Mode tools:
 - `ctx_stats` and `ctx_doctor` for bounded status and health checks.
 - `ctx_purge` for an explicitly approved state reset.
 
+Before the coder's first turn, Bello installs a sticky routing policy and a
+SessionStart reminder. The policy requires `ctx_index` as the first tool call
+of every new coder thread under a controller-derived, generation-unique source
+label and makes `ctx_*` the default for repository reads, searches, derivations,
+and command/test execution whenever that preserves correctness. Every
+`ctx_search` must filter to the exact current source; changed files are
+refreshed under new collision-resistant labels before later indexed searches.
+Native shell execution remains a documented capability-boundary fallback;
+Bello does not mechanically block it.
+
+The generated coder home intentionally contains no discoverable skill. The
+sticky developer policy is available before the first model turn and avoids a
+skill loader trying to read generated control files outside the Context Mode
+workspace sandbox.
+
 The currently provisioned target is Linux x86-64. Its bundle contains pinned
 Node.js 22.5.0, the Bello offline worker and dependencies, and an
 Ed25519-signed broker/launcher authority. The Linux bundle and authority are

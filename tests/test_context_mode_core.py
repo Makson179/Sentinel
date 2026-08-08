@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from supervisor.coder import CoderBindingError, coder_thread_params
 from supervisor.context_mode._util import ContextModeDataError, canonical_json_bytes
 from supervisor.context_mode.approvals import (
     CapabilityError,
@@ -18,6 +21,7 @@ from supervisor.context_mode.approvals import (
 )
 from supervisor.context_mode.config import (
     ALLOWED_TOOLS,
+    COMPACTION_SESSION_GUARD_COMMAND,
     FORBIDDEN_TOOL_NAMES,
     REQUIRED_HOOKS,
     ConfigError,
@@ -27,6 +31,13 @@ from supervisor.context_mode.config import (
     validate_exact_tool_catalogue,
 )
 from supervisor.context_mode.health import check_generated_role_home
+from supervisor.context_mode.routing import (
+    CONTEXT_MODE_ROUTING_TEXT,
+    CONTEXT_MODE_SESSION_REMINDER,
+    SESSION_START_ROUTING_COMMAND,
+    derive_context_index_source,
+    render_context_mode_routing_text,
+)
 from supervisor.context_mode import packaging as runtime_packaging
 from supervisor.context_mode.packaging import (
     PINNED_CONTEXT_MODE_COMMIT,
@@ -357,9 +368,192 @@ def test_generated_role_homes_do_not_cross_contaminate(tmp_path: Path) -> None:
     assert all(tool in coder_config for tool in FORBIDDEN_TOOL_NAMES)
     assert "bello_context_mode" not in supervisor_config
     assert not (supervisor.root / "hooks.json").exists()
-    assert (coder.root / "skills" / "bello-context-mode" / "SKILL.md").is_file()
+    assert not (coder.root / "skills").exists()
+    assert not (coder.root / "plugins").exists()
+    assert (coder.root / "context-mode-routing.md").read_text(encoding="utf-8") == CONTEXT_MODE_ROUTING_TEXT
     assert check_generated_role_home(coder.root, expected_role=Role.CODER).passed
     assert check_generated_role_home(supervisor.root, expected_role=Role.SUPERVISOR).passed
+
+
+def test_context_mode_routing_is_sticky_developer_policy(tmp_path: Path) -> None:
+    plain = coder_thread_params(tmp_path)
+    source = derive_context_index_source("generation-lease-1")
+    context = coder_thread_params(
+        tmp_path,
+        context_mode_enabled=True,
+        context_index_source=source,
+    )
+
+    assert "developerInstructions" not in plain
+    routing = context["developerInstructions"]
+    assert routing == render_context_mode_routing_text(source)
+    assert source in routing
+    assert "generation-lease-1" not in routing
+    assert "Your first tool call" in routing
+    assert "ctx_index" in routing
+    assert "path` set to `.`" in routing
+    assert "Use the `ctx_*` tools exclusively" in routing
+    assert "Native shell command execution is an exception" in routing
+    assert "refresh every changed file" in routing
+    assert "never issue an unfiltered `ctx_search`" in routing
+    assert all(name in routing for name in ALLOWED_TOOLS)
+
+
+def test_context_index_source_is_stable_per_generation_and_rotates() -> None:
+    first = derive_context_index_source("generation-lease-1")
+    same = derive_context_index_source("generation-lease-1")
+    second = derive_context_index_source("generation-lease-2")
+
+    assert first == same
+    assert first != second
+    assert first.startswith("workspace-")
+    assert "generation-lease-1" not in first
+    assert len(first) == len("workspace-") + 64
+    with pytest.raises(ValueError, match="non-empty"):
+        derive_context_index_source("")
+
+
+def test_context_thread_requires_controller_derived_index_source(tmp_path: Path) -> None:
+    with pytest.raises(CoderBindingError, match="active index source"):
+        coder_thread_params(tmp_path, context_mode_enabled=True)
+    with pytest.raises(CoderBindingError, match="plain coder thread"):
+        coder_thread_params(
+            tmp_path,
+            context_index_source=derive_context_index_source("unexpected"),
+        )
+
+
+def test_generated_home_rejects_noncanonical_context_routing(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    generated_root = tmp_path / "coder-home"
+    with pytest.raises(ConfigError, match="canonical Context Mode policy"):
+        generate_coder_home(
+            generated_root,
+            launcher_path=tmp_path / "launcher",
+            mcp_bootstrap_path=tmp_path / "mcp.json",
+            workspace=workspace,
+            hook_bootstraps={event: tmp_path / f"{event}.json" for event in REQUIRED_HOOKS},
+            routing_text="Context Mode is optional.\n",
+        )
+    assert not generated_root.exists()
+
+
+def test_generated_home_rejects_discoverable_context_skill(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    generated_root = tmp_path / "coder-home"
+    with pytest.raises(ConfigError, match="discoverable Context Mode skills are disabled"):
+        generate_coder_home(
+            generated_root,
+            launcher_path=tmp_path / "launcher",
+            mcp_bootstrap_path=tmp_path / "mcp.json",
+            workspace=workspace,
+            hook_bootstraps={event: tmp_path / f"{event}.json" for event in REQUIRED_HOOKS},
+            skill_text="Install a discoverable Context Mode skill.\n",
+        )
+    assert not generated_root.exists()
+
+
+def test_generated_hooks_match_pinned_codex_schema_and_recovery_barrier(tmp_path: Path) -> None:
+    """Codex 0.146 must discover every native hook and the compact-only stop guard."""
+
+    workspace = tmp_path / "workspace with spaces"
+    workspace.mkdir()
+    launcher = tmp_path / "bin with spaces" / "bello-context-launcher"
+    mcp_bootstrap = tmp_path / "bootstrap" / "mcp.json"
+    hook_bootstraps = {
+        event: tmp_path / "bootstrap" / f"hook {event}.json"
+        for event in REQUIRED_HOOKS
+    }
+    generated = generate_coder_home(
+        tmp_path / "coder-home",
+        launcher_path=launcher,
+        mcp_bootstrap_path=mcp_bootstrap,
+        workspace=workspace,
+        hook_bootstraps=hook_bootstraps,
+    )
+
+    manifest = json.loads((generated.root / "hooks.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {"hooks"}
+    assert isinstance(manifest["hooks"], dict)
+    assert set(manifest["hooks"]) == set(REQUIRED_HOOKS)
+
+    for event in REQUIRED_HOOKS:
+        handlers = [
+            {
+                "type": "command",
+                "command": shlex.join(
+                    [
+                        str(launcher),
+                        "hook",
+                        "--event",
+                        event,
+                        "--bootstrap",
+                        str(hook_bootstraps[event]),
+                    ]
+                ),
+            }
+        ]
+        if event == "SessionStart":
+            handlers.append(
+                {
+                    "type": "command",
+                    "command": SESSION_START_ROUTING_COMMAND,
+                }
+            )
+        groups = [{"hooks": handlers}]
+        if event == "SessionStart":
+            groups.append(
+                {
+                    "matcher": "compact",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": COMPACTION_SESSION_GUARD_COMMAND,
+                        }
+                    ],
+                }
+            )
+        assert manifest["hooks"][event] == groups
+
+    # CODEX_HOME/hooks.json is a User hook source in Codex 0.146. Without this
+    # isolated-home per-thread override hooks/list reports the entries as
+    # untrusted and the runtime excludes them from the executable handler set.
+    assert coder_thread_params(
+        workspace,
+        bypass_hook_trust=True,
+    )["config"] == {"bypass_hook_trust": True}
+
+    guard = subprocess.run(
+        ["/bin/sh", "-c", COMPACTION_SESSION_GUARD_COMMAND],
+        input=b"{}\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert guard.returncode == 0
+    assert guard.stderr == b""
+    assert json.loads(guard.stdout) == {
+        "continue": False,
+        "stopReason": "Bello verified compaction recovery barrier",
+    }
+
+    routing = subprocess.run(
+        ["/bin/sh", "-c", SESSION_START_ROUTING_COMMAND],
+        input=b"{}\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert routing.returncode == 0
+    assert routing.stderr == b""
+    assert json.loads(routing.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": CONTEXT_MODE_SESSION_REMINDER,
+        }
+    }
 
 
 def test_bundle_manifest_hashes_and_release_pins(tmp_path: Path) -> None:

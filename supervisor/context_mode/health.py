@@ -12,13 +12,13 @@ from typing import Any, Iterable, Mapping
 from ._util import ContextModeDataError, load_json_object, require_sha256
 from .config import (
     CONTEXT_SERVER_NAME,
-    CONTEXT_SKILL_NAME,
     FORBIDDEN_TOOL_NAMES,
     REQUIRED_HOOK_SET,
     Role,
     validate_exact_hook_catalogue,
     validate_exact_tool_catalogue,
 )
+from .routing import CONTEXT_MODE_ROUTING_TEXT
 from .packaging import VerifiedRuntimeBundle
 from .sandbox import ProfileKind, SandboxBackend, SandboxPolicy
 
@@ -98,15 +98,15 @@ def check_effective_catalogues(
             checks.append("coder_exact_hook_catalogue")
         except ContextModeDataError as exc:
             issues.append(HealthIssue("coder_hook_catalogue", str(exc)))
-        if plugin_names or frozenset(skill_names) != {CONTEXT_SKILL_NAME} or len(skill_names) != 1:
+        if plugin_names or skill_names:
             issues.append(
                 HealthIssue(
                     "coder_extensions",
-                    "coder requires exactly the Bello Context Mode skill and no plugins",
+                    "coder Context Mode uses sticky routing and permits no discoverable plugins/skills",
                 )
             )
         else:
-            checks.append("coder_exact_skill_catalogue")
+            checks.append("coder_extensions_empty")
     return HealthReport(not issues, tuple(checks), tuple(issues), {"role": role.value})
 
 
@@ -186,10 +186,11 @@ def check_generated_role_home(
             required = {
                 "hooks.json",
                 "context-mode-routing.md",
-                f"skills/{CONTEXT_SKILL_NAME}/SKILL.md",
             }
             if not required.issubset(files):
-                raise HealthCheckError("coder generated home lacks mandatory hooks/routing/skill")
+                raise HealthCheckError("coder generated home lacks mandatory hooks/routing")
+            if (root / "context-mode-routing.md").read_text(encoding="utf-8") != CONTEXT_MODE_ROUTING_TEXT:
+                raise HealthCheckError("coder generated home routing differs from Bello's canonical policy")
             if not all(forbidden in config_text for forbidden in FORBIDDEN_TOOL_NAMES):
                 raise HealthCheckError("coder config lacks explicit forbidden-tool defense")
         expected_paths = set(files) | {"bello-generated-home.json"}

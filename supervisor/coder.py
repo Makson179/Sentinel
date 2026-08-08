@@ -18,6 +18,10 @@ from supervisor.appserver import (
     AppServerMessage,
     text_input,
 )
+from supervisor.context_mode.routing import (
+    derive_context_index_source,
+    render_context_mode_routing_text,
+)
 from supervisor.prompts import build_coder_prompt, build_restart_prompt
 from supervisor.state import StateStore
 
@@ -31,6 +35,12 @@ DEFAULT_INTELLIGENCE = "xhigh"
 MAX_CODER_RECOVERY_CONTEXT_BYTES = 48 * 1024
 MAX_CODER_RECOVERY_PROMPT_BYTES = 64 * 1024
 MAX_CODER_LIFECYCLE_REASON_BYTES = 2 * 1024
+
+
+def _is_no_active_turn_to_steer_error(exc: AppServerError) -> bool:
+    """Recognize the benign race where a provider turn ends before steer arrives."""
+
+    return "no active turn to steer" in str(exc).lower()
 
 
 class CoderBindingError(RuntimeError):
@@ -278,7 +288,15 @@ def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict
     return params
 
 
-def coder_thread_params(project_root: Path, *, model: str | None = None, fast: bool = False) -> dict[str, Any]:
+def coder_thread_params(
+    project_root: Path,
+    *,
+    model: str | None = None,
+    fast: bool = False,
+    bypass_hook_trust: bool = False,
+    context_mode_enabled: bool = False,
+    context_index_source: str | None = None,
+) -> dict[str, Any]:
     params: dict[str, Any] = {
         "cwd": str(project_root),
         "runtimeWorkspaceRoots": [str(project_root)],
@@ -292,6 +310,18 @@ def coder_thread_params(project_root: Path, *, model: str | None = None, fast: b
     }
     if model:
         params["model"] = model
+    if context_mode_enabled:
+        if context_index_source is None:
+            raise CoderBindingError("Context Mode thread requires an active index source")
+        params["developerInstructions"] = render_context_mode_routing_text(context_index_source)
+    elif context_index_source is not None:
+        raise CoderBindingError("plain coder thread cannot receive a Context Mode index source")
+    if bypass_hook_trust:
+        # Context Mode creates a private, run-owned CODEX_HOME whose complete
+        # contents are hash-manifested before app-server starts.  Codex still
+        # classifies those generated hooks as an unmanaged User source, so the
+        # per-thread override is required to make the attested hooks runnable.
+        params["config"] = {"bypass_hook_trust": True}
     return params
 
 
@@ -301,6 +331,9 @@ def coder_thread_resume_params(
     *,
     model: str | None = None,
     fast: bool = False,
+    bypass_hook_trust: bool = False,
+    context_mode_enabled: bool = False,
+    context_index_source: str | None = None,
 ) -> dict[str, Any]:
     """Build an explicit resume request for the current coder transport."""
 
@@ -316,6 +349,14 @@ def coder_thread_resume_params(
     }
     if model:
         params["model"] = model
+    if context_mode_enabled:
+        if context_index_source is None:
+            raise CoderBindingError("Context Mode resume requires an active index source")
+        params["developerInstructions"] = render_context_mode_routing_text(context_index_source)
+    elif context_index_source is not None:
+        raise CoderBindingError("plain coder resume cannot receive a Context Mode index source")
+    if bypass_hook_trust:
+        params["config"] = {"bypass_hook_trust": True}
     return params
 
 
@@ -388,8 +429,20 @@ class CoderSession:
 
     async def start_thread(self) -> str:
         self._validate_active_binding()
+        context_index_source = (
+            derive_context_index_source(self.context_binding.generation_lease_id)
+            if self.context_binding is not None
+            else None
+        )
         response = await self.coder_client.thread_start(
-            coder_thread_params(self.project_root, model=self.model, fast=self.fast),
+            coder_thread_params(
+                self.project_root,
+                model=self.model,
+                fast=self.fast,
+                bypass_hook_trust=self.context_binding is not None,
+                context_mode_enabled=self.context_binding is not None,
+                context_index_source=context_index_source,
+            ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
         )
         thread_id = self._response_thread_id(response, operation="thread/start")
@@ -456,8 +509,17 @@ class CoderSession:
                     timeout=self.coder_rpc_timeout_seconds,
                 )
                 return self.active_turn_id
-            except AppServerError:
-                raise
+            except AppServerError as exc:
+                if not _is_no_active_turn_to_steer_error(exc):
+                    raise
+                # A turn/completed notification may race a queued runtime
+                # intervention or a logical restart handoff.  The provider is
+                # authoritative: clear the stale local turn id and continue by
+                # starting a fresh turn on the same live thread.
+                self.active_turn_id = None
+                self.store.update_bello_config(
+                    lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None})
+                )
             except Exception:
                 self.active_turn_id = None
                 self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
@@ -550,6 +612,74 @@ class CoderSession:
             item_waiter.cancel()
             turn_waiter.cancel()
             await asyncio.gather(item_waiter, turn_waiter, return_exceptions=True)
+            raise
+
+    async def run_compaction_recovery_barrier(self, message: str) -> AppServerMessage:
+        """Run the deferred compact SessionStart hooks without model sampling.
+
+        Codex 0.146 queues ``SessionStart(source=compact)`` until the next turn.
+        The generated compact-only guard ends this dedicated turn before its
+        first model request, after the native hook records recovery evidence.
+        """
+
+        self._validate_active_binding()
+        thread_id = self.thread_id
+        if not thread_id:
+            raise CoderBindingError("cannot run a compaction barrier without a provider thread")
+        if self.active_turn_id:
+            raise CoderBindingError("cannot run a compaction barrier with an active turn")
+
+        def turn_completed(notification: AppServerMessage) -> bool:
+            return (
+                notification.method == "turn/completed"
+                and notification.params.get("threadId") == thread_id
+            )
+
+        terminal_waiter = asyncio.create_task(
+            self.coder_client.wait_for_notification(
+                turn_completed,
+                timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+            )
+        )
+        # The stop guard can complete the turn immediately, so install the
+        # notification waiter before issuing turn/start.
+        await asyncio.sleep(0)
+        barrier_turn_id: str | None = None
+        try:
+            response = await self.coder_client.turn_start(
+                coder_turn_params(
+                    thread_id,
+                    message,
+                    self.project_root,
+                    model=self.model,
+                    fast=self.fast,
+                    intelligence=self.intelligence,
+                ),
+                timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+            )
+            barrier_turn_id = self._response_turn_id(response, operation="turn/start")
+            self.active_turn_id = barrier_turn_id
+            self._persist_thread_state(
+                thread_id=thread_id,
+                active_turn_id=barrier_turn_id,
+            )
+            terminal = await terminal_waiter
+            terminal_turn_id = self._notification_turn_id(
+                terminal,
+                operation="compaction recovery barrier",
+            )
+            if terminal_turn_id != barrier_turn_id:
+                raise CoderBindingError(
+                    "compaction recovery barrier terminal turn identity does not match turn/start"
+                )
+            turn = terminal.params.get("turn")
+            if not isinstance(turn, Mapping) or turn.get("status") != "completed":
+                raise CoderBindingError("compaction recovery barrier did not complete successfully")
+            self.mark_turn_completed(barrier_turn_id)
+            return terminal
+        except BaseException:
+            terminal_waiter.cancel()
+            await asyncio.gather(terminal_waiter, return_exceptions=True)
             raise
 
     async def checkpoint_lifecycle(
@@ -684,12 +814,18 @@ class CoderSession:
         self._persist_thread_state(thread_id=old_thread_id, active_turn_id=None)
         if resume_thread:
             assert old_thread_id is not None
+            context_index_source = derive_context_index_source(
+                self.context_binding.generation_lease_id
+            )
             response = await self.coder_client.thread_resume(
                 coder_thread_resume_params(
                     old_thread_id,
                     self.project_root,
                     model=self.model,
                     fast=self.fast,
+                    bypass_hook_trust=self.context_binding is not None,
+                    context_mode_enabled=self.context_binding is not None,
+                    context_index_source=context_index_source,
                 ),
                 timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
             )
@@ -772,6 +908,25 @@ class CoderSession:
         if not isinstance(thread_id, str) or not thread_id:
             raise RuntimeError(f"app-server {operation} did not return a thread id")
         return thread_id
+
+    @staticmethod
+    def _response_turn_id(response: Mapping[str, Any], *, operation: str) -> str:
+        turn = response.get("turn", {})
+        turn_id = turn.get("id") if isinstance(turn, Mapping) else None
+        if not isinstance(turn_id, str) or not turn_id:
+            raise RuntimeError(f"app-server {operation} did not return a turn id")
+        return turn_id
+
+    @staticmethod
+    def _notification_turn_id(message: AppServerMessage, *, operation: str) -> str:
+        params = message.params
+        turn_id = params.get("turnId")
+        if not isinstance(turn_id, str):
+            turn = params.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, Mapping) else None
+        if not isinstance(turn_id, str) or not turn_id:
+            raise CoderBindingError(f"{operation} notification did not identify its turn")
+        return turn_id
 
     def _persist_thread_state(self, *, thread_id: str | None, active_turn_id: str | None) -> None:
         self.store.update_bello_config(

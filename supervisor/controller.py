@@ -92,6 +92,7 @@ from supervisor.context_mode.integration import (
     ContextOutcomeStatus,
 )
 from supervisor.context_mode.provenance import RedactedSummary
+from supervisor.context_mode.routing import derive_context_index_source
 from supervisor.context_mode.sandbox import SandboxBackend, detect_sandbox_backend
 from supervisor.context_mode.runtime import ExclusiveWorkspaceLease, RuntimeState
 from supervisor.context_mode.session import (
@@ -193,6 +194,17 @@ POST_COMPACTION_CONTINUE_NUDGE = (
     "Context compaction completed and its checkpoint was recovered. Continue the current task "
     "from the verified workspace state. Re-check any operation that may have been interrupted, "
     "and do not declare readiness until validation is complete."
+)
+CONTEXT_NATIVE_VALIDATION_NUDGE = (
+    "The post-edit Context Mode execution is operation-trusted but supplied no broker-attested "
+    "per-command evidence, so Bello cannot record it as fresh behavioral validation. This is the "
+    "concrete incomplete-Context boundary explicitly allowed by your developer routing policy. "
+    "Immediately run the required behavior test (and any required compile/test checks) once through "
+    "native shell with unmasked exit statuses. Do not retry the same ctx_* validation, do not refuse "
+    "the native fallback, and do not mark ready until that native validation passes."
+)
+COMPACTION_RECOVERY_BARRIER_PROMPT = (
+    "Bello internal compaction recovery barrier. Do not perform task work."
 )
 ACCEPT_GATE_REVIEWER_INCOMPLETE = "reviewer-incomplete"
 ACCEPT_GATE_CODER_CORRECTABLE = "coder-correctable"
@@ -553,6 +565,8 @@ class BelloController:
         self._pending_completion_gate_rejection: dict[str, Any] | None = None
         self._current_accept_gate_rejection: dict[str, Any] | None = None
         self._terminal_cleanup_started = False
+        self._terminal_cleanup_task: asyncio.Task[Any] | None = None
+        self._latest_context_execution_without_command_evidence_sequence: int | None = None
         self._last_controller_activity_monotonic = time.monotonic()
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
@@ -638,6 +652,13 @@ class BelloController:
             self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
             self.tui.status("supervised coder started")
             await self.event_loop()
+            # Completion review runs in ``_supervisor_task``.  Its accepted
+            # path performs terminal snapshot patch-back and report writing
+            # after setting ``running`` false.  A final app-server event can
+            # therefore wake/finish the main loop while that work is still in
+            # flight.  Join the task that owns terminal cleanup before the
+            # generic finally block is allowed to cancel supervisor work.
+            await self._await_terminal_cleanup_task()
         except (AppServerError, SupervisorAgentError) as exc:
             await self.fail_provider(f"app-server RPC failed: {exc}")
         except (WorkspaceSnapshotError, ContextModeDataError, OSError, RuntimeError) as exc:
@@ -1562,8 +1583,23 @@ class BelloController:
         if self.coder_client is not self.supervisor_client:
             await self.coder_client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
+        context_binding = self._active_coder_binding_snapshot()
+        if self.context_mode_enabled and context_binding is None:
+            raise ContextModeStartupError("Context Mode preflight has no active coder binding")
+        context_index_source = (
+            derive_context_index_source(context_binding.generation_lease_id)
+            if context_binding is not None
+            else None
+        )
         thread = await self.coder_client.thread_start(
-            coder_thread_params(self._active_workspace_root(), model=self._coder_model(), fast=self._fast_mode())
+            coder_thread_params(
+                self._active_workspace_root(),
+                model=self._coder_model(),
+                fast=self._fast_mode(),
+                bypass_hook_trust=self.context_mode_enabled,
+                context_mode_enabled=self.context_mode_enabled,
+                context_index_source=context_index_source,
+            )
         )
         approval_policy = thread.get("approvalPolicy")
         sandbox = thread.get("sandbox")
@@ -1686,6 +1722,11 @@ class BelloController:
             expected_hook_attestations,
         ):
             reject("native coder hook launcher/bootstrap attestations do not match generated files")
+        try:
+            await self._preflight_discovered_coder_hooks()
+        except BaseException:
+            runtime.coordinator.mark_failed()
+            raise
         if not _strict_json_equal(
             report.get("unmanifested_extensions"),
             {"coder": [], "supervisor": []},
@@ -1729,6 +1770,102 @@ class BelloController:
             raise
         runtime.purge_protocol_attested = True
         runtime.checkpoint_protocol_attested = True
+
+    async def _preflight_discovered_coder_hooks(self) -> None:
+        """Require Codex itself to parse the exact generated hook inventory."""
+
+        # Context Mode production setup always uses an AppServerClient.  Unit
+        # tests may inject a native-boundary double that cannot expose Codex's
+        # catalogue RPC; the production branch remains mandatory and fail-closed.
+        if not isinstance(self.coder_client, AppServerClient):
+            return
+        codex_home = self.coder_client.codex_home
+        if codex_home is None:
+            raise ContextModeStartupError("coder app-server has no generated CODEX_HOME")
+        hook_path = (Path(codex_home) / "hooks.json").resolve(strict=True)
+        try:
+            manifest = json.loads(hook_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ContextModeStartupError("generated coder hooks manifest is unreadable") from exc
+        hooks_by_event = manifest.get("hooks") if isinstance(manifest, dict) else None
+        if not isinstance(hooks_by_event, dict) or frozenset(hooks_by_event) != frozenset(REQUIRED_HOOKS):
+            raise ContextModeStartupError("generated coder hooks manifest schema mismatch")
+
+        event_labels = {
+            "PreToolUse": "preToolUse",
+            "PostToolUse": "postToolUse",
+            "SessionStart": "sessionStart",
+            "PreCompact": "preCompact",
+            "UserPromptSubmit": "userPromptSubmit",
+            "Stop": "stop",
+        }
+        expected: list[tuple[str, str | None, str]] = []
+        for event in REQUIRED_HOOKS:
+            groups = hooks_by_event.get(event)
+            if not isinstance(groups, list):
+                raise ContextModeStartupError("generated coder hook matcher groups are invalid")
+            for group in groups:
+                if not isinstance(group, dict):
+                    raise ContextModeStartupError("generated coder hook matcher group is invalid")
+                matcher = group.get("matcher")
+                if matcher is not None and not isinstance(matcher, str):
+                    raise ContextModeStartupError("generated coder hook matcher is invalid")
+                handlers = group.get("hooks")
+                if not isinstance(handlers, list):
+                    raise ContextModeStartupError("generated coder hook handlers are invalid")
+                for handler in handlers:
+                    if (
+                        not isinstance(handler, dict)
+                        or handler.get("type") != "command"
+                        or not isinstance(handler.get("command"), str)
+                    ):
+                        raise ContextModeStartupError("generated coder hook handler is invalid")
+                    expected.append((event_labels[event], matcher, handler["command"]))
+        # One lifecycle handler per event, one model-facing SessionStart
+        # routing handler, and one compact-only recovery barrier.
+        if len(expected) != len(REQUIRED_HOOKS) + 2:
+            raise ContextModeStartupError("generated coder hook handler count mismatch")
+
+        response = await self.coder_client.hooks_list([self._active_workspace_root()])
+        if not isinstance(response, dict) or frozenset(response) != {"data"}:
+            raise ContextModeStartupError("Codex hooks/list response schema mismatch")
+        data = response.get("data")
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            raise ContextModeStartupError("Codex hooks/list returned no unique workspace entry")
+        entry = data[0]
+        if entry.get("cwd") != str(self._active_workspace_root()):
+            raise ContextModeStartupError("Codex hooks/list returned a different workspace")
+        if entry.get("warnings") != [] or entry.get("errors") != []:
+            raise ContextModeStartupError("Codex rejected or warned on generated coder hooks")
+        discovered = entry.get("hooks")
+        if not isinstance(discovered, list):
+            raise ContextModeStartupError("Codex hooks/list returned no hook catalogue")
+
+        actual: list[tuple[str, str | None, str]] = []
+        for hook in discovered:
+            if not isinstance(hook, dict):
+                raise ContextModeStartupError("Codex hooks/list returned an invalid hook")
+            matcher = hook.get("matcher")
+            command = hook.get("command")
+            if (
+                hook.get("handlerType") != "command"
+                or not isinstance(hook.get("eventName"), str)
+                or (matcher is not None and not isinstance(matcher, str))
+                or not isinstance(command, str)
+                or hook.get("sourcePath") != str(hook_path)
+                or hook.get("source") != "user"
+                or hook.get("pluginId") is not None
+                or hook.get("isManaged") is not False
+                or hook.get("enabled") is not True
+                or hook.get("trustStatus") != "untrusted"
+            ):
+                raise ContextModeStartupError("Codex hooks/list metadata does not match generated hooks")
+            actual.append((hook["eventName"], matcher, command))
+        def inventory_key(item: tuple[str, str | None, str]) -> tuple[str, str, str]:
+            return (item[0], item[1] or "", item[2])
+
+        if sorted(actual, key=inventory_key) != sorted(expected, key=inventory_key):
+            raise ContextModeStartupError("Codex discovered hook catalogue mismatch")
 
     async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
         result = _selected_model_availability(
@@ -2945,6 +3082,11 @@ class BelloController:
                 context_validations: list[ValidationRun] = []
                 if context_outcome is not None:
                     context_validations = self._validations_from_context_outcome(context_outcome)
+                    if (
+                        context_outcome.classification is ContextCallClassification.EXECUTION
+                        and not context_outcome.evidence
+                    ):
+                        self._latest_context_execution_without_command_evidence_sequence = self._sequence
                     if context_validations:
                         validation = context_validations[-1]
                     context_inspection = self._inspection_from_context_outcome(context_outcome)
@@ -3403,6 +3545,24 @@ class BelloController:
                             reasons=("done_without_fresh_validation",),
                         ),
                     )
+                    cfg = self.store.get_bello_config()
+                    incomplete_context_sequence = getattr(
+                        self,
+                        "_latest_context_execution_without_command_evidence_sequence",
+                        None,
+                    )
+                    if (
+                        isinstance(incomplete_context_sequence, int)
+                        and cfg.last_relevant_edit_sequence is not None
+                        and incomplete_context_sequence > cfg.last_relevant_edit_sequence
+                    ):
+                        await self._steer_for_marker(
+                            done_gap
+                            + "; post-edit Context execution had no broker-attested per-command evidence",
+                            sequence=message.sequence,
+                            message=CONTEXT_NATIVE_VALIDATION_NUDGE,
+                        )
+                        return
                     self._schedule_supervisor_check(
                         f"Runtime trigger (done_without_fresh_validation): {done_gap}",
                         triggering_item_id=item_id,
@@ -4082,6 +4242,8 @@ class BelloController:
     ) -> None:
         # Arm the terminal gate before any quiesce/diff/report work so late
         # notifications and approvals cannot enter a snapshot being finalized.
+        if getattr(self, "_terminal_cleanup_task", None) is None:
+            self._terminal_cleanup_task = asyncio.current_task()
         self._terminal_cleanup_started = True
         self.running = False
         self._reconcile_intervention_accounting()
@@ -4151,6 +4313,12 @@ class BelloController:
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
         self.running = False
         self._wake_event_loop_for_shutdown()
+        if getattr(self, "_terminal_cleanup_task", None) is asyncio.current_task():
+            # A caller outside the main run task may await ``finalize`` and
+            # continue doing unrelated work.  Once the durable terminal state
+            # is written, that caller must no longer look like cleanup that
+            # the run loop itself needs to join.
+            self._terminal_cleanup_task = None
 
     async def _quiesce_coder_before_snapshot(self, reason: str) -> None:
         """Stop every potential coder/context writer before diff or patch-back."""
@@ -4920,6 +5088,15 @@ class BelloController:
                 compact_turn_id = _turn_id_from_params(completed.params)
                 if isinstance(compact_turn_id, str):
                     self._coder_context_compaction_turn_ids.add(compact_turn_id)
+                barrier = await coder.run_compaction_recovery_barrier(
+                    COMPACTION_RECOVERY_BARRIER_PROMPT
+                )
+                barrier_turn_id = _turn_id_from_params(barrier.params)
+                if not isinstance(barrier_turn_id, str):
+                    raise ContextModeStartupError(
+                        "compaction recovery barrier terminal did not identify its turn"
+                    )
+                self._coder_context_compaction_turn_ids.add(barrier_turn_id)
                 await self._recover_context_checkpoint(
                     checkpoint_id=checkpoint_cursor.checkpoint_id,
                     recovery_kind=CheckpointRecoveryKind.COMPACTION,
@@ -4935,6 +5112,7 @@ class BelloController:
                         "type": "coder_context_compaction_recovered",
                         "thread_id": thread_id,
                         "turn_id": compact_turn_id,
+                        "barrier_turn_id": barrier_turn_id,
                         "checkpoint_id": checkpoint_cursor.checkpoint_id,
                         "input_tokens_before": input_tokens,
                     }
@@ -6757,6 +6935,21 @@ class BelloController:
             pass
         except Exception:
             pass
+
+    async def _await_terminal_cleanup_task(self) -> None:
+        """Join terminal finalization when it is owned by a background task.
+
+        Normal runtime checks are still cancelled by ``_stop_supervisor_task``.
+        Only the task that actually entered ``finalize`` is protected from the
+        main event loop's shutdown cleanup race.
+        """
+
+        if not getattr(self, "_terminal_cleanup_started", False):
+            return
+        task = getattr(self, "_terminal_cleanup_task", None)
+        if task is None or task is asyncio.current_task():
+            return
+        await asyncio.shield(task)
 
     async def diff_summary(self) -> str:
         if not self.use_git_diff:

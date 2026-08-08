@@ -14,6 +14,7 @@ import pytest
 from supervisor.approvals import ApprovalManager
 from supervisor.controller import (
     ADVERSARY_MODEL,
+    CONTEXT_NATIVE_VALIDATION_NUDGE,
     NO_MARKER_IDLE_NUDGE,
     POST_RESTART_CONTINUE_NUDGE,
     ControllerEvent,
@@ -2364,6 +2365,31 @@ async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_pa
 
     assert len(fake.runtime_packets) == 1
     assert fake.completion_packets == []
+    assert store.get_bello_config().last_relevant_edit_sequence == 2
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
+
+
+async def test_done_after_evidence_less_context_execution_requires_native_validation(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    coder = _GateFakeCoder()
+    controller.coder = coder
+    controller.last_coder_message = CoderMessage(
+        text="Summary\nValidation: ctx_batch_execute passed\nBELLO_READY_FOR_REVIEW",
+        sequence=5,
+    )
+    controller.observed_changed_files = {
+        "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=2)
+    }
+    controller._latest_context_execution_without_command_evidence_sequence = 4
+
+    await controller._handle_coder_turn_completed(item_id="done-context-1")
+
+    assert fake.runtime_packets == []
+    assert fake.completion_packets == []
+    assert coder.messages == [CONTEXT_NATIVE_VALIDATION_NUDGE]
     assert store.get_bello_config().last_relevant_edit_sequence == 2
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
@@ -5958,6 +5984,51 @@ async def test_finalize_arms_terminal_shutdown_before_reading_or_writing_report(
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "# Final Report" in report
     assert "task complete" in report
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert store.path(FINAL_REPORT).read_text(encoding="utf-8").strip()
+
+
+async def test_run_exit_joins_background_terminal_cleanup_before_supervisor_cancellation(
+    tmp_path: Path,
+) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.running = True
+    controller._shutdown_signal = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    allow_cleanup_to_finish = asyncio.Event()
+
+    async def background_terminal_cleanup() -> None:
+        controller._terminal_cleanup_task = asyncio.current_task()
+        controller._terminal_cleanup_started = True
+        controller.running = False
+        cleanup_entered.set()
+        controller.event_queue.put_nowait(ControllerEvent(kind="shutdown"))
+        await allow_cleanup_to_finish.wait()
+        store.write_text_locked(FINAL_REPORT, "# Final Report\n\ncomplete\n")
+        store.update_bello_config(
+            lambda cfg: cfg.model_copy(update={"status": BelloStatus.COMPLETE})
+        )
+
+    async def main_loop_and_generic_cleanup() -> None:
+        await controller.event_loop()
+        await controller._await_terminal_cleanup_task()
+        await controller._stop_supervisor_task()
+
+    run_exit_task = asyncio.create_task(main_loop_and_generic_cleanup())
+    await asyncio.sleep(0)
+    terminal_task = asyncio.create_task(background_terminal_cleanup())
+    controller._supervisor_task = terminal_task
+    await cleanup_entered.wait()
+
+    await asyncio.sleep(0)
+    assert not run_exit_task.done()
+    assert not terminal_task.cancelled()
+
+    allow_cleanup_to_finish.set()
+    await run_exit_task
+
+    assert terminal_task.done()
+    assert not terminal_task.cancelled()
     assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8").strip()
 

@@ -15,6 +15,10 @@ from supervisor.coder import (
     CoderSession,
 )
 from supervisor.schemas import BelloConfig
+from supervisor.context_mode.routing import (
+    derive_context_index_source,
+    render_context_mode_routing_text,
+)
 from supervisor.state import StateStore
 
 
@@ -83,6 +87,41 @@ async def test_coder_thread_start_reports_provider_thread_for_telemetry(tmp_path
 
     assert await session.start_thread() == "new-thread-1"
     assert started_threads == ["new-thread-1"]
+
+
+async def test_bound_coder_thread_gets_context_mode_before_first_turn(tmp_path: Path) -> None:
+    store, task = _store(tmp_path, thread_id=None)
+    client = _CoderClient()
+    session = CoderSession(
+        client,  # type: ignore[arg-type]
+        store,
+        tmp_path,
+        task,
+        context_binding=_binding(),
+    )
+
+    await session.start_thread()
+
+    assert [name for name, _ in client.events] == ["thread_start"]
+    params = client.events[0][1]
+    assert isinstance(params, dict)
+    source = derive_context_index_source(_binding().generation_lease_id)
+    assert params["developerInstructions"] == render_context_mode_routing_text(source)
+    assert source in params["developerInstructions"]
+    assert params["config"] == {"bypass_hook_trust": True}
+
+
+def test_context_mode_routing_states_search_limit_and_timeout_units() -> None:
+    source = derive_context_index_source("routing-limit-generation")
+    routing = render_context_mode_routing_text(source)
+
+    assert "Every `ctx_search` `limit` must be an integer from `1` through `10`" in routing
+    assert "never request a larger value such as `20`" in routing
+    assert "`timeout` field on all execution tools is measured in milliseconds" in routing
+    assert "120000 ms default" in routing
+    assert "never second-like values such as `30`, `60`, or `120`" in routing
+    assert "statement itself establishes the incomplete-Context boundary" in routing
+    assert "do not refuse the native fallback as conflicting with this policy" in routing
 
 
 def test_binding_snapshot_is_frozen_and_rejects_invalid_lifecycle_values() -> None:
@@ -219,6 +258,8 @@ async def test_transport_recovery_resumes_same_thread_without_generation_handoff
     resume_params = client.events[0][1]
     assert isinstance(resume_params, dict)
     assert resume_params["threadId"] == "old-thread"
+    source = derive_context_index_source(next_binding.generation_lease_id)
+    assert resume_params["developerInstructions"] == render_context_mode_routing_text(source)
     with pytest.raises(FrozenInstanceError):
         result.resumed = False  # type: ignore[misc]
 

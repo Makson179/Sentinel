@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import math
+import shlex
 import stat
 from dataclasses import dataclass
 from enum import Enum
@@ -22,10 +23,13 @@ from ._util import (
     ensure_private_directory,
     sha256_bytes,
 )
+from .routing import (
+    CONTEXT_MODE_ROUTING_TEXT,
+    SESSION_START_ROUTING_COMMAND,
+)
 
 
 CONTEXT_SERVER_NAME = "bello_context_mode"
-CONTEXT_SKILL_NAME = "bello-context-mode"
 CONTEXT_MODE_SCHEMA_VERSION = 1
 PINNED_CODEX_CLI_VERSION = "codex-cli 0.146.0"
 PINNED_CODEX_APP_SERVER_SCHEMA_SHA256 = (
@@ -79,6 +83,14 @@ REQUIRED_HOOKS: tuple[str, ...] = (
     "Stop",
 )
 REQUIRED_HOOK_SET = frozenset(REQUIRED_HOOKS)
+
+COMPACTION_SESSION_GUARD_COMMAND = shlex.join(
+    (
+        "printf",
+        "%s\\n",
+        '{"continue":false,"stopReason":"Bello verified compaction recovery barrier"}',
+    )
+)
 
 
 class ConfigError(ContextModeDataError):
@@ -274,6 +286,13 @@ def generate_role_home(
     role = Role(role)
     if auth_source is not None and auth_bytes is not None:
         raise ConfigError("provide auth_source or auth_bytes, not both")
+    if role is Role.CODER and context_mode_enabled:
+        if routing_text is not None and routing_text != CONTEXT_MODE_ROUTING_TEXT:
+            raise ConfigError("routing_text must match Bello's canonical Context Mode policy")
+        if skill_text is not None:
+            raise ConfigError(
+                "discoverable Context Mode skills are disabled; use sticky developer routing"
+            )
     root = ensure_private_directory(Path(root))
     if any(root.iterdir()):
         raise ConfigError("generated role home must be a new or empty directory")
@@ -321,33 +340,75 @@ def generate_role_home(
         provided_hooks = hook_bootstraps or {}
         validate_exact_hook_catalogue(provided_hooks)
         assert launcher_path is not None
+
+        def command_handler(arguments: list[str]) -> dict[str, str]:
+            return {
+                "type": "command",
+                "command": shlex.join(arguments),
+            }
+
         hook_manifest = {
-            "schema_version": CONTEXT_MODE_SCHEMA_VERSION,
-            "hooks": [
-                {
-                    "event": event,
-                    "command": os.fspath(_absolute_existing_or_planned(launcher_path, "launcher_path")),
-                    "args": [
-                        "hook",
-                        "--event",
-                        event,
-                        "--bootstrap",
-                        os.fspath(_absolute_existing_or_planned(provided_hooks[event], f"hook {event} bootstrap")),
-                    ],
-                }
+            "hooks": {
+                event: [
+                    {
+                        "hooks": [
+                            command_handler(
+                                [
+                                    os.fspath(
+                                        _absolute_existing_or_planned(
+                                            launcher_path,
+                                            "launcher_path",
+                                        )
+                                    ),
+                                    "hook",
+                                    "--event",
+                                    event,
+                                    "--bootstrap",
+                                    os.fspath(
+                                        _absolute_existing_or_planned(
+                                            provided_hooks[event],
+                                            f"hook {event} bootstrap",
+                                        )
+                                    ),
+                                ]
+                            ),
+                            *(
+                                [
+                                    {
+                                        "type": "command",
+                                        "command": SESSION_START_ROUTING_COMMAND,
+                                    }
+                                ]
+                                if event == "SessionStart"
+                                else []
+                            ),
+                        ]
+                    },
+                    *(
+                        [
+                            {
+                                "matcher": "compact",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": COMPACTION_SESSION_GUARD_COMMAND,
+                                    }
+                                ],
+                            }
+                        ]
+                        if event == "SessionStart"
+                        else []
+                    ),
+                ]
                 for event in REQUIRED_HOOKS
-            ],
+            },
         }
         hook_path = root / "hooks.json"
         hook_payload = canonical_json_bytes(hook_manifest) + b"\n"
         atomic_write_bytes(hook_path, hook_payload, mode=0o600)
         written[hook_path.name] = sha256_bytes(hook_payload)
 
-        routing = routing_text or (
-            "Bello Context Mode is offline. Use only the eight generated ctx_* tools for local "
-            "execution, indexing, retrieval, and recovery. Never fetch, upgrade, use hosted "
-            "services, or treat unverified command text as validation evidence.\n"
-        )
+        routing = CONTEXT_MODE_ROUTING_TEXT
         lowered = routing.lower()
         forbidden_fragments = ("ctx_fetch_and_index", "ctx_upgrade", "ctx_insight", "http://", "https://")
         if any(fragment in lowered for fragment in forbidden_fragments):
@@ -356,26 +417,6 @@ def generate_role_home(
         routing_payload = routing.encode("utf-8")
         atomic_write_bytes(routing_path, routing_payload, mode=0o600)
         written[routing_path.name] = sha256_bytes(routing_payload)
-
-        skill = skill_text or (
-            "---\n"
-            "name: bello-context-mode\n"
-            "description: Use Bello's verified offline local execution, indexing, retrieval, and compaction recovery.\n"
-            "---\n\n"
-            "Operate only through the generated Bello Context Mode catalogue and launcher. "
-            "Keep local command output bounded, prefer indexed retrieval for large data, and "
-            "treat validation as trusted only when Bello accepts broker provenance. Network, "
-            "hosted, update, and self-repair behavior is unavailable.\n"
-        )
-        skill_lowered = skill.lower()
-        if any(fragment in skill_lowered for fragment in forbidden_fragments):
-            raise ConfigError("skill text contains forbidden online/update functionality")
-        skills_root = ensure_private_directory(root / "skills")
-        skill_directory = ensure_private_directory(skills_root / CONTEXT_SKILL_NAME)
-        skill_path = skill_directory / "SKILL.md"
-        skill_payload = skill.encode("utf-8")
-        atomic_write_bytes(skill_path, skill_payload, mode=0o600)
-        written[f"skills/{CONTEXT_SKILL_NAME}/SKILL.md"] = sha256_bytes(skill_payload)
 
     manifest_path = root / "bello-generated-home.json"
     manifest = {

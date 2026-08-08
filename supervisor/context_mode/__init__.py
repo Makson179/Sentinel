@@ -37,7 +37,6 @@ from .config import (
     PINNED_CODEX_APP_SERVER_SCHEMA_SHA256,
     PINNED_CODEX_CLI_VERSION,
     REQUIRED_HOOKS,
-    CONTEXT_SKILL_NAME,
     Role,
     GeneratedRoleHome,
     generate_coder_home,
@@ -114,6 +113,13 @@ from .provenance import (
     ResultEnvelope,
     bounded_redacted_summary,
 )
+from .routing import (
+    CONTEXT_MODE_ROUTING_TEXT,
+    CONTEXT_MODE_SESSION_REMINDER,
+    SESSION_START_ROUTING_COMMAND,
+    derive_context_index_source,
+    render_context_mode_routing_text,
+)
 from .sandbox import (
     BackendStatus,
     SandboxBackend,
@@ -189,7 +195,6 @@ __all__ = [
     "CAPABILITY_REQUIRED_TOOLS",
     "CONTEXT_MODE_LICENSE",
     "CONTEXT_SERVER_NAME",
-    "CONTEXT_SKILL_NAME",
     "CapabilityError",
     "CapabilityExpectation",
     "CapabilityReplay",
@@ -206,6 +211,11 @@ __all__ = [
     "ContextBootstrapPaths",
     "ContextRuntimeCoordinator",
     "ContextEpochLayout",
+    "CONTEXT_MODE_ROUTING_TEXT",
+    "CONTEXT_MODE_SESSION_REMINDER",
+    "SESSION_START_ROUTING_COMMAND",
+    "derive_context_index_source",
+    "render_context_mode_routing_text",
     "ContextObservationKey",
     "EXECUTION_TOOLS",
     "EpochStateError",
