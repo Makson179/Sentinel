@@ -1141,6 +1141,12 @@ class ContextModeIntegration:
         elif not isinstance(result, Mapping):
             issues.append("missing_or_invalid_terminal_result")
         else:
+            if "isError" in result:
+                explicit_is_error = result["isError"]
+                if not isinstance(explicit_is_error, bool):
+                    issues.append("invalid_terminal_result_is_error")
+                elif explicit_is_error != failed:
+                    issues.append("terminal_result_error_status_mismatch")
             try:
                 encoded_result = canonical_json_bytes(dict(result))
                 validate_model_result_limits(

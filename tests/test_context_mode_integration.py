@@ -250,7 +250,8 @@ def _receipt_and_result(
     receipt_seq: int = 1,
     retrieval: tuple[RetrievalRecord, ...] = (),
     indexed_bytes: int | None = None,
-    broker_is_error: bool = False,
+    broker_is_error: bool | None = None,
+    public_is_error: bool | None = None,
 ) -> tuple[BrokerReceipt, dict[str, object]]:
     command = CommandRecord(
         runner_identity="bello-native-runner-v1",
@@ -275,8 +276,8 @@ def _receipt_and_result(
         "structuredContent": {"answer": "ok"},
     }
     broker_result = dict(bare_result)
-    if broker_is_error:
-        broker_result["isError"] = True
+    if broker_is_error is not None:
+        broker_result["isError"] = broker_is_error
     stable, lifecycle = binding.stable, binding.lifecycle
     receipt = BrokerReceipt(
         receipt_seq=receipt_seq,
@@ -326,6 +327,8 @@ def _receipt_and_result(
         sandbox_policy_digest=receipt.sandbox_policy_digest,
     )
     result = dict(bare_result)
+    if public_is_error is not None:
+        result["isError"] = public_is_error
     result["structuredContent"] = {
         **bare_result["structuredContent"],  # type: ignore[arg-type]
         "belloContextMode": envelope.to_dict(),
@@ -430,6 +433,55 @@ def test_execution_terminal_requires_out_of_band_receipt_for_evidence(tmp_path: 
     assert duplicate.trusted is True
     assert duplicate.action_counted is False
     assert "duplicate_logical_terminal" in duplicate.protocol_issues
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "explicit_is_error"),
+    (("failed", False), ("completed", True)),
+)
+def test_terminal_status_must_match_explicit_mcp_error_marker(
+    tmp_path: Path,
+    terminal_status: str,
+    explicit_is_error: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    arguments = {"query": "status consistency"}
+    receipt, result = _receipt_and_result(
+        binding,
+        tool="ctx_search",
+        arguments=arguments,
+        capability_id=None,
+        broker_is_error=explicit_is_error,
+        public_is_error=explicit_is_error,
+    )
+    integration = ContextModeIntegration(redaction_authority_key=b"k" * 32)
+    integration.normalize_notification(
+        method="item/started",
+        params=_params(tool="ctx_search", arguments=arguments),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+    integration.publish_receipt(receipt)
+
+    terminal = integration.normalize_notification(
+        method="item/completed",
+        params=_params(
+            tool="ctx_search",
+            arguments=arguments,
+            result=result,
+            status=terminal_status,
+        ),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+
+    assert terminal.trusted is False
+    assert terminal.evidence == ()
+    assert "terminal_result_error_status_mismatch" in terminal.protocol_issues
 
 
 @pytest.mark.asyncio
