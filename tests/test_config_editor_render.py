@@ -461,7 +461,7 @@ def test_config_editor_review_limit_tip_matches_adversary_mode() -> None:
     after_help = _side_panel_text(enabled, EditorState(parameter_index=after_index))
     assert "0 schedules none" in after_help
     assert "Unlimited removes the cap" in after_help
-    assert "candidate adversary finding is still adjudicated once" in after_help
+    assert "adv_report_controller pass still normalizes every" in after_help
 
 
 def test_config_editor_focused_icon_moves_without_shifting_the_field_name() -> None:

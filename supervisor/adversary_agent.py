@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from supervisor.appserver import (
     APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS,
@@ -14,6 +16,7 @@ from supervisor.appserver import (
     text_input,
 )
 from supervisor.coder import DEFAULT_INTELLIGENCE, apply_intelligence
+from supervisor.markdown_fences import unfenced_markdown_lines
 from supervisor.prompts import build_adversary_prompt
 from supervisor.schemas import SupervisorWakePacket
 
@@ -60,6 +63,9 @@ class AdversaryAgent:
         on_thread_start: Callable[[str], None] | None = None,
         on_thread_done: Callable[[str], None] | None = None,
         denied_probes: Callable[[], list[str]] | None = None,
+        configured_mcp_server_names: Iterable[str] | None = None,
+        configured_plugin_names: Iterable[str] | None = None,
+        disable_apps: bool = True,
     ):
         self.client = client
         self.project_root = project_root.resolve()
@@ -69,12 +75,19 @@ class AdversaryAgent:
         self.on_thread_start = on_thread_start
         self.on_thread_done = on_thread_done
         self.denied_probes = denied_probes
+        self.configured_mcp_server_names = _normalized_inventory_names(
+            configured_mcp_server_names
+        )
+        self.configured_plugin_names = _normalized_inventory_names(
+            configured_plugin_names
+        )
+        self.disable_apps = disable_apps
 
     async def run(
         self,
         packet: SupervisorWakePacket,
         *,
-        previous_adversary_report: dict[str, Any] | None = None,
+        previous_adversary_report: str | None = None,
     ) -> AdversaryRunResult:
         prompt = build_adversary_prompt(
             packet,
@@ -105,13 +118,18 @@ class AdversaryAgent:
         try:
             thread_response = await self._await_rpc(
                 "adversary thread/start response",
-                self.client.thread_start(self._thread_params(), timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS),
+                self.client.thread_start(
+                    self._thread_params(),
+                    timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+                ),
                 timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
             )
             thread = thread_response.get("thread", {})
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str):
-                raise AdversaryAgentError("adversary thread/start did not return thread id")
+                raise AdversaryAgentError(
+                    "adversary thread/start did not return thread id"
+                )
             if self.on_thread_start:
                 self.on_thread_start(thread_id)
 
@@ -130,14 +148,18 @@ class AdversaryAgent:
             turn_id = turn_id_value
             status = turn.get("status")
             if status in {"failed", "interrupted"}:
-                raise AdversaryAttemptError(_turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id))
+                raise AdversaryAttemptError(
+                    _turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id)
+                )
             if status != "completed":
                 try:
                     completed = await self.client.wait_for_notification(
-                        lambda message: message.method == "turn/completed"
-                        and message.params.get("threadId") == thread_id
-                        and isinstance(message.params.get("turn"), dict)
-                        and message.params["turn"].get("id") == turn_id,
+                        lambda message: (
+                            message.method == "turn/completed"
+                            and message.params.get("threadId") == thread_id
+                            and isinstance(message.params.get("turn"), dict)
+                            and message.params["turn"].get("id") == turn_id
+                        ),
                         timeout=self.timeout_seconds,
                     )
                 except (asyncio.TimeoutError, AppServerError) as exc:
@@ -147,7 +169,9 @@ class AdversaryAgent:
                     ) from exc
                 turn = completed.params.get("turn", {})
             if turn.get("status") != "completed":
-                raise AdversaryAttemptError(_turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id))
+                raise AdversaryAttemptError(
+                    _turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id)
+                )
 
             text = last_agent_message_text(turn)
             if text is None:
@@ -161,9 +185,13 @@ class AdversaryAgent:
                     ),
                     timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
                 )
-                text = _agent_message_text_from_turns(turns.get("data", []), turn_id=turn_id)
+                text = _agent_message_text_from_turns(
+                    turns.get("data", []), turn_id=turn_id
+                )
             if text is None or not text.strip():
-                raise AdversaryAttemptError("adversary did not produce an agent message")
+                raise AdversaryAttemptError(
+                    "adversary did not produce an agent message"
+                )
             report_text = text.strip()
             _validate_adversary_report(report_text)
             return AdversaryRunResult(
@@ -179,7 +207,9 @@ class AdversaryAgent:
         finally:
             if thread_id is not None:
                 try:
-                    await self.client.thread_archive(thread_id, timeout=APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS)
+                    await self.client.thread_archive(
+                        thread_id, timeout=APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS
+                    )
                 except Exception:
                     try:
                         await self.client.thread_unsubscribe(
@@ -192,6 +222,19 @@ class AdversaryAgent:
                     self.on_thread_done(thread_id)
 
     def _thread_params(self) -> dict[str, Any]:
+        thread_config: dict[str, Any] = {
+            "include_apps_instructions": False,
+        }
+        if self.configured_mcp_server_names:
+            thread_config["mcp_servers"] = {
+                name: {"enabled": False} for name in self.configured_mcp_server_names
+            }
+        if self.configured_plugin_names:
+            thread_config["plugins"] = {
+                name: {"enabled": False} for name in self.configured_plugin_names
+            }
+        if self.disable_apps:
+            thread_config["apps"] = {"_default": {"enabled": False}}
         params: dict[str, Any] = {
             "cwd": str(self.project_root),
             "runtimeWorkspaceRoots": [str(self.project_root)],
@@ -201,6 +244,9 @@ class AdversaryAgent:
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
+            "config": thread_config,
+            "dynamicTools": [],
+            "environments": [],
         }
         if self.model:
             params["model"] = self.model
@@ -232,7 +278,24 @@ class AdversaryAgent:
         except AdversaryAgentError:
             raise
         except Exception as exc:
-            raise AdversaryAgentError(f"{stage} failed with {exc.__class__.__name__}: {exc}") from exc
+            raise AdversaryAgentError(
+                f"{stage} failed with {exc.__class__.__name__}: {exc}"
+            ) from exc
+
+
+def _normalized_inventory_names(names: Iterable[str] | None) -> tuple[str, ...]:
+    if names is None:
+        return ()
+    if isinstance(names, str):
+        names = (names,)
+    normalized: set[str] = set()
+    for raw_name in names:
+        if not isinstance(raw_name, str):
+            raise TypeError("capability inventory names must be strings")
+        name = raw_name.strip()
+        if name:
+            normalized.add(name)
+    return tuple(sorted(normalized))
 
 
 def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | None:
@@ -271,27 +334,48 @@ def _turn_failure_message(turn: Any, *, thread_id: str, turn_id: str) -> str:
 
 
 def _validate_adversary_report(report_text: str) -> None:
-    lines = [line.strip() for line in report_text.splitlines() if line.strip()]
-    if not lines or lines[0].lower() not in {"candidate_finding: true", "candidate_finding: false"}:
+    lines = [line for line in unfenced_markdown_lines(report_text) if line.strip()]
+    if (
+        not lines
+        or lines[0] != lines[0].lstrip()
+        or lines[0].strip().lower()
+        not in {
+            "candidate_finding: true",
+            "candidate_finding: false",
+        }
+    ):
         raise AdversaryAttemptError(
             "adversary did not produce a complete report: missing the initial candidate_finding routing line"
         )
 
     sections: set[str] = set()
     for line in lines[1:]:
-        normalized = line.lower().lstrip("#*- ")
-        for section in ("attacked", "findings", "overall"):
+        if line != line.lstrip():
+            continue
+        normalized = re.sub(r"^#{1,6}\s*", "", line.strip().lower())
+        for section in (
+            "attacked",
+            "findings",
+            "observations",
+            "not_reached",
+            "overall",
+        ):
             if normalized.startswith(f"{section}:"):
                 sections.add(section)
-    missing = sorted({"attacked", "findings", "overall"} - sections)
+    missing = sorted(
+        {"attacked", "findings", "observations", "not_reached", "overall"} - sections
+    )
     if missing:
         raise AdversaryAttemptError(
-            "adversary did not produce a complete report: missing sections " + ", ".join(missing)
+            "adversary did not produce a complete report: missing sections "
+            + ", ".join(missing)
         )
 
 
 def _report_has_candidate_finding(report_text: str) -> bool:
-    lowered_lines = [line.strip().lower() for line in report_text.splitlines() if line.strip()]
+    lowered_lines = [
+        line.strip().lower() for line in report_text.splitlines() if line.strip()
+    ]
     for index, line in enumerate(lowered_lines):
         if line.startswith("candidate_finding:"):
             value = line.split(":", 1)[1].strip()
@@ -302,12 +386,26 @@ def _report_has_candidate_finding(report_text: str) -> bool:
         if line.startswith("findings:"):
             value = line.split(":", 1)[1].strip()
             if value:
-                return value not in {"none", "no", "no findings", "nothing", "n/a", "not found"}
+                return value not in {
+                    "none",
+                    "no",
+                    "no findings",
+                    "nothing",
+                    "n/a",
+                    "not found",
+                }
             for following in lowered_lines[index + 1 :]:
                 if _looks_like_report_section(following):
                     return False
                 normalized = following.lstrip("-*0123456789. )").strip()
-                if not normalized or normalized in {"none", "no", "no findings", "nothing", "n/a", "not found"}:
+                if not normalized or normalized in {
+                    "none",
+                    "no",
+                    "no findings",
+                    "nothing",
+                    "n/a",
+                    "not found",
+                }:
                     continue
                 return True
             return False

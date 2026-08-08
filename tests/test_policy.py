@@ -163,6 +163,217 @@ def test_apply_patch_supervisor_runtime_write_denies(workspace: Path) -> None:
     assert decision.reason == "writes to supervisor runtime/state files are denied"
 
 
+def test_exact_coder_checklist_read_write_and_patch_are_allowed(workspace: Path) -> None:
+    checklist = workspace / ".supervisor" / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("", encoding="utf-8")
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+    patch = """*** Begin Patch
+*** Update File: .supervisor/coder/CHECKLIST.md
+@@
++B-1 TODO parser boundary
+*** End Patch
+"""
+
+    structured_read = engine.evaluate({"tool_name": "Read", "path": ".supervisor/coder/CHECKLIST.md"})
+    command_read = engine.evaluate(
+        {"command": "sed -n '1,200p' .supervisor/coder/CHECKLIST.md", "cwd": str(workspace)}
+    )
+    touch = engine.evaluate(
+        {
+            "command": "/bin/bash -lc 'touch .supervisor/coder/CHECKLIST.md'",
+            "cwd": str(workspace),
+        }
+    )
+    mixed_touch = engine.evaluate(
+        {
+            "command": "/bin/bash -lc 'touch .supervisor/coder/CHECKLIST.md && touch .supervisor/HANDOFF.md'",
+            "cwd": str(workspace),
+        }
+    )
+    alternate_shell_touch = engine.evaluate(
+        {
+            "command": "/tmp/bash -lc 'touch .supervisor/coder/CHECKLIST.md'",
+            "cwd": str(workspace),
+        }
+    )
+    multiline_command = engine.evaluate(
+        {"command": "cat .supervisor/coder/CHECKLIST.md\npwd", "cwd": str(workspace)}
+    )
+    write = engine.evaluate(
+        {"tool_name": "Write", "path": ".supervisor/coder/CHECKLIST.md", "operation": "write"}
+    )
+    apply_patch = engine.evaluate({"tool_name": "apply_patch", "command": patch})
+
+    assert structured_read.kind == PolicyDecisionKind.ALLOW
+    assert command_read.kind == PolicyDecisionKind.ALLOW
+    assert touch.kind == PolicyDecisionKind.ALLOW
+    assert mixed_touch.kind == PolicyDecisionKind.DENY
+    assert alternate_shell_touch.kind == PolicyDecisionKind.DENY
+    assert multiline_command.kind != PolicyDecisionKind.ALLOW
+    assert write.kind == PolicyDecisionKind.ALLOW
+    assert apply_patch.kind == PolicyDecisionKind.ALLOW
+
+
+def test_coder_checklist_read_with_shell_current_directory_tilde_is_allowed(
+    workspace: Path,
+) -> None:
+    checklist = workspace / ".supervisor" / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("", encoding="utf-8")
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+
+    decision = engine.evaluate(
+        {
+            "command": "cat ~+/.supervisor/coder/CHECKLIST.md",
+            "cwd": str(workspace),
+        }
+    )
+
+    assert decision.kind == PolicyDecisionKind.ALLOW
+
+
+def test_coder_checklist_exception_does_not_open_other_runtime_paths(workspace: Path) -> None:
+    state = workspace / ".supervisor"
+    checklist = state / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("", encoding="utf-8")
+    (state / "HANDOFF.md").write_text("protected", encoding="utf-8")
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+    mixed_patch = """*** Begin Patch
+*** Update File: .supervisor/coder/CHECKLIST.md
+@@
++B-1 TODO parser boundary
+*** Update File: .supervisor/HANDOFF.md
+@@
+-protected
++forged
+*** End Patch
+"""
+
+    sibling = engine.evaluate(
+        {"tool_name": "Write", "path": ".supervisor/HANDOFF.md", "operation": "write"}
+    )
+    child = engine.evaluate_patch_paths([".supervisor/coder/CHECKLIST.md/child"])
+    mixed = engine.evaluate({"tool_name": "apply_patch", "command": mixed_patch})
+
+    assert sibling.kind == PolicyDecisionKind.DENY
+    assert child.kind == PolicyDecisionKind.DENY
+    assert mixed.kind == PolicyDecisionKind.DENY
+
+
+def test_replaced_coder_checklist_symlink_cannot_redirect_exception(workspace: Path) -> None:
+    state = workspace / ".supervisor"
+    checklist = state / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("", encoding="utf-8")
+    handoff = state / "HANDOFF.md"
+    handoff.write_text("protected", encoding="utf-8")
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+    checklist.unlink()
+    checklist.symlink_to(handoff)
+
+    decision = engine.evaluate(
+        {"tool_name": "Write", "path": ".supervisor/coder/CHECKLIST.md", "operation": "write"}
+    )
+
+    assert decision.kind != PolicyDecisionKind.ALLOW
+
+
+def test_replaced_coder_checklist_parent_symlink_cannot_redirect_exception(
+    workspace: Path,
+) -> None:
+    state = workspace / ".supervisor"
+    checklist_parent = state / "coder"
+    checklist = checklist_parent / "CHECKLIST.md"
+    checklist_parent.mkdir(parents=True)
+    checklist.write_text("map", encoding="utf-8")
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+    redirected_parent = state / "redirected-coder"
+    checklist_parent.rename(redirected_parent)
+    checklist_parent.symlink_to(redirected_parent, target_is_directory=True)
+
+    decision = engine.evaluate(
+        {
+            "command": "/bin/bash -lc 'touch .supervisor/coder/CHECKLIST.md'",
+            "cwd": str(workspace),
+        }
+    )
+
+    assert engine.coder_checklist_target_is_safe() is False
+    assert decision.kind == PolicyDecisionKind.DENY
+
+
+def test_coder_checklist_alias_and_hardlink_do_not_receive_exception(workspace: Path) -> None:
+    state = workspace / ".supervisor"
+    checklist = state / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("map", encoding="utf-8")
+    handoff = state / "HANDOFF.md"
+    handoff.write_text("protected", encoding="utf-8")
+    alias = workspace / "checklist-alias.md"
+    alias.symlink_to(checklist)
+    parent_alias = workspace / "coder-state-alias"
+    parent_alias.symlink_to(checklist.parent, target_is_directory=True)
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+
+    alias_decision = engine.evaluate({"tool_name": "Write", "path": str(alias), "operation": "write"})
+    parent_alias_decision = engine.evaluate(
+        {"tool_name": "Write", "path": str(parent_alias / "CHECKLIST.md"), "operation": "write"}
+    )
+    checklist.unlink()
+    os.link(handoff, checklist)
+    hardlink_decision = engine.evaluate(
+        {"tool_name": "Write", "path": ".supervisor/coder/CHECKLIST.md", "operation": "write"}
+    )
+
+    assert alias_decision.kind == PolicyDecisionKind.DENY
+    assert parent_alias_decision.kind == PolicyDecisionKind.DENY
+    assert hardlink_decision.kind == PolicyDecisionKind.DENY
+    assert "single-link" in hardlink_decision.reason
+
+
+def test_oversized_coder_checklist_remains_repairable(workspace: Path) -> None:
+    checklist = workspace / ".supervisor" / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_bytes(b"x" * (64 * 1024 + 1))
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+
+    decision = engine.evaluate(
+        {"tool_name": "Write", "path": ".supervisor/coder/CHECKLIST.md", "operation": "write"}
+    )
+
+    assert decision.kind == PolicyDecisionKind.ALLOW
+
+
+def test_missing_coder_checklist_can_be_recreated_but_unsafe_leaf_cannot(workspace: Path) -> None:
+    checklist = workspace / ".supervisor" / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("map", encoding="utf-8")
+    engine = PolicyEngine(workspace, coder_checklist_path=checklist)
+    delete_patch = """*** Begin Patch
+*** Delete File: .supervisor/coder/CHECKLIST.md
+*** End Patch
+"""
+    add_patch = """*** Begin Patch
+*** Add File: .supervisor/coder/CHECKLIST.md
++B-1 TODO parser
+*** End Patch
+"""
+
+    delete_decision = engine.evaluate({"tool_name": "apply_patch", "command": delete_patch})
+    checklist.unlink()
+    recreate_decision = engine.evaluate({"tool_name": "apply_patch", "command": add_patch})
+    checklist.mkdir()
+    unsafe_decision = engine.evaluate(
+        {"tool_name": "Write", "path": ".supervisor/coder/CHECKLIST.md", "operation": "write"}
+    )
+
+    assert delete_decision.kind == PolicyDecisionKind.ALLOW
+    assert recreate_decision.kind == PolicyDecisionKind.ALLOW
+    assert unsafe_decision.kind == PolicyDecisionKind.DENY
+
+
 def test_write_tool_supervisor_runtime_write_denies(workspace: Path) -> None:
     decision = PolicyEngine(workspace).evaluate(
         {"tool_name": "Write", "path": ".supervisor/config.json", "operation": "write"}

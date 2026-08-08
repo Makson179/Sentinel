@@ -1,6 +1,7 @@
 from supervisor.schemas.models import (
     AppEvent,
     AppEventSource,
+    AdvReportControllerDecision,
     AdversaryReport,
     ApprovalContext,
     ApprovalDecisionKind,
@@ -20,6 +21,7 @@ from supervisor.schemas.models import (
     CompletionReturnRecord,
     CompletionReviewDecision,
     CompletionReviewDecisionKind,
+    completion_review_accept_blocker_fields,
     FinalReport,
     HealthDelta,
     HealthState,
@@ -49,6 +51,7 @@ from supervisor.schemas.models import (
 __all__ = [
     "AppEvent",
     "AppEventSource",
+    "AdvReportControllerDecision",
     "AdversaryReport",
     "ApprovalContext",
     "ApprovalDecisionKind",
@@ -68,6 +71,7 @@ __all__ = [
     "CompletionReturnRecord",
     "CompletionReviewDecision",
     "CompletionReviewDecisionKind",
+    "completion_review_accept_blocker_fields",
     "FinalReport",
     "HealthDelta",
     "HealthState",

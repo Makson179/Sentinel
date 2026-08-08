@@ -266,6 +266,9 @@ class AppServerClient:
     async def config_requirements_read(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
         return await self.request("configRequirements/read", timeout=timeout)
 
+    async def config_read(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
+        return await self.request("config/read", {"includeLayers": False}, timeout=timeout)
+
     async def account_read(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
         return await self.request("account/read", {"refreshToken": False}, timeout=timeout)
 

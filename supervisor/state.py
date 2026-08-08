@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,6 +25,9 @@ LAST_ACTION = "LAST_ACTION.md"
 ACTION_HISTORY_LIMIT = 10
 HEALTH = "HEALTH.json"
 HANDOFF = "HANDOFF.md"
+CODER_STATE = "coder"
+CODER_CHECKLIST = f"{CODER_STATE}/CHECKLIST.md"
+CODER_CHECKLIST_MAX_BYTES = 64 * 1024
 FINAL_REPORT = "FINAL_REPORT.md"
 LOG = "log.jsonl"
 EVENTS = "events.jsonl"
@@ -155,6 +159,105 @@ class StateStore:
     def write_handoff(self, content: str) -> None:
         self.write_text_locked(HANDOFF, content)
 
+    def coder_checklist_path(self) -> Path:
+        # Keep the lexical final component so validation can reject a substituted
+        # symlink instead of resolving it into another supervisor state file.
+        return self.state_dir / CODER_STATE / "CHECKLIST.md"
+
+    def is_coder_checklist_path(self, raw: str | os.PathLike[str], *, cwd: Path | None = None) -> bool:
+        """Match only the canonical or active-workspace-visible checklist path lexically."""
+        candidate = Path(os.fspath(raw).strip().strip("'\"")).expanduser()
+        if not candidate.is_absolute():
+            candidate = (cwd or self.workspace) / candidate
+        target = self.coder_checklist_path()
+        try:
+            candidate = Path(os.path.abspath(os.path.normpath(os.fspath(candidate))))
+            canonical = Path(os.path.abspath(os.path.normpath(os.fspath(target))))
+            visible = Path(
+                os.path.abspath(os.path.normpath(os.fspath((cwd or self.workspace) / STATE_DIR_NAME / CODER_CHECKLIST)))
+            )
+            return candidate in {canonical, visible}
+        except OSError:
+            return False
+
+    def read_coder_checklist(self) -> str | None:
+        """Read a bounded, regular coder checklist without following a final symlink."""
+        path = self.coder_checklist_path()
+        try:
+            parent_metadata = os.lstat(path.parent)
+        except (FileNotFoundError, OSError):
+            return None
+        if not stat.S_ISDIR(parent_metadata.st_mode) or stat.S_ISLNK(parent_metadata.st_mode):
+            return None
+        try:
+            path_metadata = os.lstat(path)
+        except (FileNotFoundError, OSError):
+            return None
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or stat.S_ISLNK(path_metadata.st_mode)
+            or path_metadata.st_nlink != 1
+            or path_metadata.st_size > CODER_CHECKLIST_MAX_BYTES
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > CODER_CHECKLIST_MAX_BYTES
+                or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+            ):
+                return None
+            data = bytearray()
+            while len(data) <= CODER_CHECKLIST_MAX_BYTES:
+                chunk = os.read(descriptor, min(16 * 1024, CODER_CHECKLIST_MAX_BYTES + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if len(data) > CODER_CHECKLIST_MAX_BYTES:
+                return None
+            return bytes(data).decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        finally:
+            os.close(descriptor)
+
+    def ensure_coder_checklist(self, content: str | None = None) -> bool:
+        """Ensure the coder-owned checklist is a bounded regular file.
+
+        Returns true when the file had to be created or repaired. Existing valid
+        content is left untouched unless replacement content is supplied.
+        """
+        path = self.coder_checklist_path()
+        current = self.read_coder_checklist()
+        if content is None and current is not None:
+            return False
+        replacement = current if content is None else content
+        if replacement is None or len(replacement.encode("utf-8")) > CODER_CHECKLIST_MAX_BYTES:
+            replacement = ""
+        parent = path.parent
+        if parent.is_symlink() or parent.exists() and not parent.is_dir():
+            if parent.is_dir() and not parent.is_symlink():
+                shutil.rmtree(parent)
+            else:
+                parent.unlink(missing_ok=True)
+        parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+        if path.exists() or path.is_symlink():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        self.atomic_write_text(path, replacement)
+        os.chmod(path, 0o600)
+        return True
+
     def initialize_bello(
         self,
         config: BelloConfig,
@@ -163,6 +266,7 @@ class StateStore:
         mode: INITIALIZATION_MODES | None = None,
     ) -> None:
         mode = mode or ("fresh" if overwrite else "resume")
+        preserved_checklist = self._same_task_checklist(config) if mode == "resume" else None
         if mode == "fresh":
             self._clear_state_dir(preserve=set())
         elif mode == "resume":
@@ -171,7 +275,10 @@ class StateStore:
             raise ValueError(f"unknown bello initialization mode: {mode}")
 
         files = self._initial_state_files(config)
+        files[CODER_CHECKLIST] = preserved_checklist or ""
         for name, value in files.items():
+            if name == CODER_CHECKLIST:
+                continue
             path = self.path(name)
             if name in {EVENTS, LOG} and mode == "resume" and path.exists():
                 continue
@@ -179,7 +286,26 @@ class StateStore:
                 self.atomic_write_json(path, value)
             else:
                 self.atomic_write_text(path, value)
+        self.ensure_coder_checklist(files[CODER_CHECKLIST])
         self.ensure_previous_runs_dir()
+
+    def _same_task_checklist(self, config: BelloConfig) -> str | None:
+        try:
+            existing = self.read_json(CONFIG, {})
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(existing, dict):
+            return None
+        if _bello_task_location(existing) != _bello_task_location(config.model_dump()):
+            return None
+        old_hash = existing.get("task_hash")
+        new_hash = config.task_hash
+        if old_hash or new_hash:
+            if not isinstance(old_hash, str) or not isinstance(new_hash, str) or old_hash != new_hash:
+                return None
+        elif existing.get("task_path") != config.task_path:
+            return None
+        return self.read_coder_checklist()
 
     def _initial_state_files(self, config: BelloConfig) -> dict[str, Any]:
         return {
@@ -189,6 +315,7 @@ class StateStore:
             DECISIONS: "# Decisions\n\n",
             LAST_ACTION: "",
             HANDOFF: "",
+            CODER_CHECKLIST: "",
             FINAL_REPORT: "",
             LOG: "",
             EVENTS: "",
@@ -333,6 +460,14 @@ class StateStore:
                 lines.extend(["", "## Packet Or Access Limitations", *[f"- {item}" for item in report.packet_or_access_limitations]])
             if report.adversary_reports:
                 lines.extend(["", "## Adversary Reports", *[f"- {item}" for item in report.adversary_reports]])
+            if report.adversary_coverage_limitations:
+                lines.extend(
+                    [
+                        "",
+                        "## Adversary Coverage Limitations",
+                        *[f"- {item}" for item in report.adversary_coverage_limitations],
+                    ]
+                )
             if report.denied_actions:
                 lines.extend(["", "## Denied Actions", *[f"- {item}" for item in report.denied_actions]])
             if report.remaining_risks:
@@ -342,6 +477,21 @@ class StateStore:
             self.write_text_locked(FINAL_REPORT, "\n".join(lines).rstrip() + "\n")
         else:
             self.write_text_locked(FINAL_REPORT, report)
+
+
+def _bello_task_location(config: dict[str, Any]) -> tuple[Path, Path] | None:
+    raw_root = config.get("project_root")
+    raw_task = config.get("task_path") or config.get("task")
+    if not isinstance(raw_root, str) or not raw_root.strip() or not isinstance(raw_task, str) or not raw_task.strip():
+        return None
+    try:
+        root = Path(raw_root).expanduser().resolve(strict=False)
+        task = Path(raw_task).expanduser()
+        if not task.is_absolute():
+            task = root / task
+        return root, task.resolve(strict=False)
+    except OSError:
+        return None
 
 
 def _recent_action_lines(text: str, *, limit: int) -> list[str]:

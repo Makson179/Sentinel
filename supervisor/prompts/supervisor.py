@@ -15,11 +15,17 @@ PROMPTS_RESOURCE = "prompts.toml"
 
 
 def build_coder_prompt(task_path: Path) -> str:
-    return _template("coder_initial").replace("{task_path}", str(task_path.resolve()))
+    body = _template("coder_initial").replace(
+        "{task_path}", "the task path supplied in the final Task context below"
+    )
+    return f"{body}\n\nTask context:\n- task_path: {task_path.resolve()}"
 
 
 def build_restart_prompt(task_path: Path) -> str:
-    return _template("coder_restart").replace("{task_path}", str(task_path.resolve()))
+    body = _template("coder_restart").replace(
+        "{task_path}", "the task path supplied in the final Task context below"
+    )
+    return f"{body}\n\nTask context:\n- task_path: {task_path.resolve()}"
 
 
 def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
@@ -45,11 +51,11 @@ def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
         if name in raw_payload:
             payload[name] = raw_payload.pop(name)
     payload.update(raw_payload)
-    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
-    payload = packet.model_dump(
+    dynamic_payload = packet.model_dump(
         mode="json",
         exclude={
             "progress_path",
@@ -58,18 +64,45 @@ def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
             "decisions_path",
             "decisions_total_entries",
             "decisions_omitted_entries",
+            "adversary_report",
         },
     )
     section_names = _completion_review_section_names(packet)
-    payload["prompt_sections"] = section_names
-    payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
-    return json.dumps(payload, indent=2, sort_keys=True)
+    payload: dict[str, Any] = {
+        "instructions": [
+            _stateless_supervisor_section_text(name) for name in section_names
+        ],
+        "prompt_sections": section_names,
+    }
+    # Keep the large cross-round-stable task prefix ahead of wake/event state so
+    # provider prompt caching can reuse it on every completion review.
+    for name in ("task_path", "task_contents"):
+        if name in dynamic_payload:
+            payload[name] = dynamic_payload.pop(name)
+    payload.update(dynamic_payload)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_adv_report_controller_prompt(packet: SupervisorWakePacket) -> str:
+    report = packet.adversary_report
+    if report is None or not report.report_text.strip():
+        raise RuntimeError("adv_report_controller requires a non-empty adversary_report")
+    payload = {
+        "instructions": [_adv_report_controller_prompt_text()],
+        "task_path": packet.task_path,
+        "task_contents": packet.task_contents,
+        "current_workspace_summary": packet.current_summary,
+        "diff_summary": packet.diff_summary,
+        "changed_files": [changed.model_dump(mode="json") for changed in packet.changed_files],
+        "raw_adversary_report": report.report_text,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_adversary_prompt(
     packet: SupervisorWakePacket,
     *,
-    previous_adversary_report: dict[str, Any] | None = None,
+    previous_adversary_report: str | None = None,
 ) -> str:
     payload = {
         "instructions": [
@@ -86,25 +119,19 @@ def build_adversary_prompt(
                 "by the report_format."
             ),
         ],
-        "task_path": packet.task_path,
         "task_contents": packet.task_contents,
-        "current_workspace_summary": packet.current_summary,
-        "diff_summary": packet.diff_summary,
-        "changed_files": [changed.model_dump(mode="json") for changed in packet.changed_files],
-        "validation_freshness_summary": packet.validation_freshness_summary,
-        # The adversary's job is to read the submitted solution and find bugs independently.
-        # The validation ledger is intentionally NOT inlined: it is bloat the adversary's
-        # instructions never use, and it would anchor its search to what was already tested.
-        # It reads the code and runs its own probes in the snapshot.
+        # The adversary gets the target, not the development trail.  In particular,
+        # do not expose the canonical task path, changed-file manifest, diff hints,
+        # coder summary, or validation history: each can reveal the original workspace
+        # or anchor an otherwise blind review to the author's implementation path.
         "previous_adversary_report": previous_adversary_report,
     }
-    return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_cheap_runtime_prompt(packet: dict[str, Any]) -> str:
-    payload = dict(packet)
-    payload["instructions"] = [_cheap_runtime_prompt_text()]
-    return json.dumps(payload, indent=2, sort_keys=True)
+    payload = {"instructions": [_cheap_runtime_prompt_text()], **packet}
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def _load_prompt_config() -> dict[str, Any]:
@@ -144,6 +171,13 @@ def _adversary_prompt_text() -> str:
     value = _section("adversary").get("text")
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("[adversary] must define non-empty text")
+    return value.strip()
+
+
+def _adv_report_controller_prompt_text() -> str:
+    value = _section("adv_report_controller").get("text")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("[adv_report_controller] must define non-empty text")
     return value.strip()
 
 

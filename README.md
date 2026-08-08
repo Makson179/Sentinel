@@ -68,7 +68,7 @@ If a problem is found, the work returns to the developer. After the fix, a new f
 
 Once the solution has passed several development and review cycles, the **adversary** is launched. Its job is not to confirm the work, but to try to break it. It explores invalid inputs, unexpected action sequences, interactions between features, boundary states, and assumptions that the developer and reviewer may have overlooked.
 
-The adversary works independently of the solution's development history. It evaluates the final artifact, not how convincing the author's explanation is. If it finds a potential defect, the solution is sent back to completion review, which determines whether the observed behavior is a genuine violation of the requirements.
+The adversary works independently of the solution's development history. It evaluates the final artifact, not how convincing the author's explanation is. Its raw report then goes through a narrow report controller: supported findings are retained, unsupported ones are rejected or downgraded under a strict boundary, and all concrete observations are carried forward. Only normalized findings and observations reach the developer.
 
 Bello therefore implements the following cycle:
 
@@ -317,7 +317,11 @@ to the supervisor, not the coder:
 Everything the run does is written to inspectable files under `.supervisor/`
 in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
 decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
-stream), and `FINAL_REPORT.md` (the result).
+stream), `coder/CHECKLIST.md` (the coder's mutable behavior map), and
+`FINAL_REPORT.md` (the result). The checklist is coder-owned working memory;
+it is never part of the submitted product or treated by reviewers as proof.
+Completion review can read the other durable state but is sandbox-denied this
+single file; the adversary receives a snapshot with `.supervisor/` excluded.
 
 ## Run modes
 
@@ -357,10 +361,10 @@ The default Deep Work schedule is `C+A`:
 - No scheduled post-adversary review rounds.
 
 If completion review returns a defect, the coder fixes it before the adversary
-runs. If the adversary reports no candidate finding, the run completes. A
-candidate adversary finding always receives one independent completion-review
-adjudication so Bello can reject a false positive or return a real defect to
-the coder; this conditional integrity check is not a scheduled `+C` phase.
+runs. Every completed adversary report then receives one narrow
+`adv_report_controller` pass. That pass checks the report's findings, carries
+all observations forward, and sends only the normalized findings-and-observations
+report to the coder when anything remains. It is not a scheduled `+C` phase.
 
 To enable Deep Work, run `bello config`, set `completion-review` to `true`,
 then set `adversary` to `true`. The revealed schedule values default to `1`, `1`,
@@ -421,12 +425,12 @@ runtime and review budgets, are changed through `bello config`.
 | `adversary-intelligence` | `xhigh` | Adversary reasoning effort. Visible only when the adversary is enabled. |
 | `speed` | `usual` | `fast` uses the Codex Fast service tier for coder, runtime-supervisor, and completion-review turns. Adversary turns are unchanged. |
 | `cheap-runtime` | `true` | Let Luna dismiss routine runtime checks before invoking the full runtime supervisor. Human messages, approvals, and mandatory checks bypass triage. |
-| `start-over` | `true` | `true` removes prior Bello logs, archived runs, and recovery data; `false` preserves them. Both start fresh active state and leave project files unchanged. |
+| `start-over` | `true` | `true` removes prior Bello logs, archived runs, recovery data, and the coder checklist; `false` preserves history and a valid checklist for the same task. Both start fresh active state and leave project files unchanged. |
 | `completion-review` | `false` | `false` is Everyday. `true` enables the independent completion-review loop and reveals its settings. |
 | `adversary` | `false` | Enable the adversarial tester before completion. Requires completion review. |
 | `max-reviews` / `max-reviews-before-adversary` | `1` | Completion-return budget. Without an adversary it is shown as `max-reviews`; with an adversary it limits returns before the first pass. An earlier accept starts the adversary immediately. `0` skips these rounds; `Unlimited` removes the cap. |
 | `max-adversary-runs` | `1` | Maximum adversary passes in Deep Work. `0` disables the adversary. |
-| `max-reviews-after-adversary` | `0` | Maximum additional completion-review rounds after each adversary pass. At the limit Bello starts the next pass or completes after the final one. `0` schedules none; `Unlimited` removes the cap. A candidate adversary finding is still adjudicated once. |
+| `max-reviews-after-adversary` | `0` | Maximum additional completion-review rounds after each adversary pass. At the limit Bello starts the next pass or completes after the final one. `0` schedules none; `Unlimited` removes the cap. The narrow `adv_report_controller` pass runs independently of this completion-review budget. |
 | `clean` | `false` | **Warning:** deletes **everything** in the folder except the task file and configured protected paths before starting. Only for disposable folders where you want a from-scratch build. |
 | `protected-path` | absent | Paths the coder must never write to, such as golden tests, fixtures, or production configs. They are also preserved by `clean`. |
 

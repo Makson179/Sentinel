@@ -4,6 +4,7 @@ import fnmatch
 import os
 import re
 import shlex
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable
@@ -198,15 +199,45 @@ def is_protected_path(workspace: Path, path: Path) -> bool:
     return is_secret_path(path) or is_workspace_cheating_path(workspace, path)
 
 
+def _expand_shell_user_path(text: str, *, cwd: Path) -> Path | None:
+    """Expand user paths without treating zsh/bash `~+` as a username."""
+    if text == "~+":
+        return cwd
+    if text.startswith("~+/"):
+        return cwd / text[3:]
+    try:
+        return Path(text).expanduser()
+    except (OSError, RuntimeError):
+        return None
+
+
 def _resolve_outside_candidate(raw: str | os.PathLike[str], *, cwd: Path) -> Path | None:
     text = os.fspath(raw).strip().strip("'\"")
     if not text or text.startswith(("http://", "https://")):
         return None
-    path = Path(text).expanduser()
+    path = _expand_shell_user_path(text, cwd=cwd)
+    if path is None:
+        return None
     if not path.is_absolute():
         path = cwd / path
     try:
         return path.resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _lexical_absolute_candidate(raw: str | os.PathLike[str], *, cwd: Path) -> Path | None:
+    """Normalize an absolute path lexically without following any symlink."""
+    text = os.fspath(raw).strip().strip("'\"")
+    if not text or text.startswith(("http://", "https://")):
+        return None
+    path = _expand_shell_user_path(text, cwd=cwd)
+    if path is None:
+        return None
+    if not path.is_absolute():
+        path = cwd / path
+    try:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
     except OSError:
         return None
 
@@ -718,7 +749,9 @@ def _resolve_candidate_path(raw: str, *, cwd: Path) -> Path | None:
     text = raw.strip().strip("'\"")
     if not text:
         return None
-    path = Path(text).expanduser()
+    path = _expand_shell_user_path(text, cwd=cwd)
+    if path is None:
+        return None
     if not path.is_absolute():
         path = cwd / path
     try:
@@ -1006,8 +1039,19 @@ class PolicyEngine:
         *,
         declared_grading_roots: Iterable[str | os.PathLike[str]] | None = None,
         immutable_paths: Iterable[str | os.PathLike[str]] | None = None,
+        coder_checklist_path: str | os.PathLike[str] | None = None,
     ):
         self.workspace = workspace.resolve()
+        self.coder_checklist_path = (
+            _lexical_absolute_candidate(coder_checklist_path, cwd=self.workspace)
+            if coder_checklist_path is not None
+            else None
+        )
+        self.coder_checklist_visible_path = (
+            _lexical_absolute_candidate(self.workspace / ".supervisor" / "coder" / "CHECKLIST.md", cwd=self.workspace)
+            if self.coder_checklist_path is not None
+            else None
+        )
         roots: list[Path] = []
         for raw in declared_grading_roots or ():
             resolved = _resolve_outside_candidate(raw, cwd=self.workspace)
@@ -1030,14 +1074,19 @@ class PolicyEngine:
         cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
 
         raw_paths = extract_paths(payload)
-        immutable_hit = self._immutable_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
+        checklist_references = [raw for raw in raw_paths if self.references_coder_checklist(raw, cwd=cwd_path)]
+        if checklist_references and not self.coder_checklist_target_is_safe():
+            return PolicyDecision.deny("coder checklist must remain a regular single-link file")
+        checklist_paths = [raw for raw in raw_paths if self.matches_coder_checklist(raw, cwd=cwd_path)]
+        regular_paths = [raw for raw in raw_paths if raw not in checklist_paths]
+        immutable_hit = self._immutable_hit_for_raw_paths(regular_paths, cwd=cwd_path or self.workspace)
         if immutable_hit is not None and (operation == "write" or tool_name in WRITE_TOOLS):
             return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")
         grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
         if grading_hit is not None:
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
-        paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
-        if path_problem and raw_paths:
+        paths, path_problem = resolve_all_paths(self.workspace, regular_paths)
+        if path_problem and regular_paths:
             return PolicyDecision.route_llm(path_problem)
 
         if any(is_protected_path(self.workspace, path) for path in paths):
@@ -1063,20 +1112,88 @@ class PolicyEngine:
             if tool_name in WRITE_TOOLS:
                 if any(is_protected_path(self.workspace, path) for path in paths):
                     return PolicyDecision.deny("write to secret-pattern path")
-                if paths:
-                    return PolicyDecision.allow("workspace write tool inside workspace")
+                if paths or checklist_paths:
+                    reason = "coder checklist write" if checklist_paths and not paths else "workspace write tool inside workspace"
+                    return PolicyDecision.allow(reason)
                 return PolicyDecision.route_llm("write tool did not provide a workspace path")
             if tool_name in READ_ONLY_TOOLS and not path_problem:
-                return PolicyDecision.allow("read-only tool inside workspace")
+                reason = "coder checklist read" if checklist_paths and not paths else "read-only tool inside workspace"
+                return PolicyDecision.allow(reason)
             return PolicyDecision.route_llm("unknown tool requires LLM judgment")
 
         if operation == "read" and not path_problem:
-            return PolicyDecision.allow("read operation inside workspace")
+            return PolicyDecision.allow("coder checklist read" if checklist_paths and not paths else "read operation inside workspace")
+        if operation == "write" and checklist_paths and not path_problem:
+            return PolicyDecision.allow("coder checklist write")
         if operation == "write" and any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
         if operation == "write" and any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("write to secret-pattern path")
         return PolicyDecision.route_llm("unclassified event requires LLM judgment")
+
+    def matches_coder_checklist(self, raw: str | os.PathLike[str], *, cwd: Path | None = None) -> bool:
+        return self.references_coder_checklist(raw, cwd=cwd) and self.coder_checklist_target_is_safe()
+
+    def references_coder_checklist(self, raw: str | os.PathLike[str], *, cwd: Path | None = None) -> bool:
+        if self.coder_checklist_path is None:
+            return False
+        candidate = _lexical_absolute_candidate(raw, cwd=cwd or self.workspace)
+        return candidate is not None and candidate in {self.coder_checklist_path, self.coder_checklist_visible_path}
+
+    def coder_checklist_target_is_safe(self) -> bool:
+        if self.coder_checklist_path is None:
+            return False
+        try:
+            parent_metadata = os.lstat(self.coder_checklist_path.parent)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(parent_metadata.st_mode) or stat.S_ISLNK(
+            parent_metadata.st_mode
+        ):
+            return False
+        try:
+            metadata = os.lstat(self.coder_checklist_path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and metadata.st_nlink == 1
+        )
+
+    def _is_coder_checklist_read_command(self, command: str, *, cwd: str | None) -> bool:
+        if "\n" in command or "\r" in command:
+            return False
+        tokens, problem = parse_command(command)
+        if tokens is None or problem or tokens[0] not in READ_FILE_COMMANDS:
+            return False
+        raw_paths, read_problem = extract_read_command_paths(tokens, self.workspace)
+        if read_problem or not raw_paths:
+            return False
+        command_cwd = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        return all(self.matches_coder_checklist(raw, cwd=command_cwd) for raw in raw_paths)
+
+    def _is_coder_checklist_touch_command(self, command: str, *, cwd: str | None) -> bool:
+        """Allow only the exact, non-composed touch used to initialize the work map."""
+        if "\n" in command or "\r" in command:
+            return False
+        tokens, problem = parse_command(command)
+        if tokens is None or problem:
+            return False
+        if len(tokens) == 3 and tokens[:2] == ["/bin/bash", "-lc"]:
+            tokens, problem = parse_command(tokens[2])
+            if tokens is None or problem:
+                return False
+        if len(tokens) != 2 or tokens[0] != "touch":
+            return False
+        command_cwd = (
+            _resolve_outside_candidate(cwd, cwd=self.workspace)
+            if cwd
+            else self.workspace
+        )
+        return self.matches_coder_checklist(tokens[1], cwd=command_cwd)
 
     def _declared_grading_hit_for_raw_paths(self, raw_paths: Iterable[str], *, cwd: Path) -> str | None:
         for raw in raw_paths:
@@ -1114,7 +1231,9 @@ class PolicyEngine:
                 continue
             if token.startswith("-") or "=" in token and "/" not in token:
                 continue
-            token_path = Path(token.strip("'\"")).expanduser()
+            token_path = _expand_shell_user_path(token.strip("'\""), cwd=cwd_path)
+            if token_path is None:
+                continue
             roots = self.immutable_paths
             if not token_path.is_absolute():
                 roots = tuple(
@@ -1188,6 +1307,10 @@ class PolicyEngine:
             analysis.risk_tags.add(GRADING_PATH_RISK_TAG)
             payload["risk_tags"] = sorted(analysis.risk_tags)
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}", **payload)
+        if self._is_coder_checklist_read_command(command, cwd=cwd):
+            return PolicyDecision.allow("coder checklist read", **payload)
+        if self._is_coder_checklist_touch_command(command, cwd=cwd):
+            return PolicyDecision.allow("coder checklist write", **payload)
         immutable_hit = self._command_immutable_hit(analysis, cwd=cwd)
         if immutable_hit is not None:
             return PolicyDecision.deny(f"immutable path access escalation denied: {immutable_hit}", **payload)
@@ -1257,17 +1380,26 @@ class PolicyEngine:
     def _evaluate_patch_paths(self, raw_paths: list[str]) -> PolicyDecision:
         if not raw_paths:
             return PolicyDecision.route_llm("patch paths could not be determined")
-        immutable_hit = self._immutable_hit_for_raw_paths(raw_paths, cwd=self.workspace)
+        checklist_references = [raw for raw in raw_paths if self.references_coder_checklist(raw)]
+        if checklist_references and not self.coder_checklist_target_is_safe():
+            return PolicyDecision.deny("coder checklist must remain a regular single-link file")
+        checklist_paths = [raw for raw in raw_paths if self.matches_coder_checklist(raw)]
+        regular_paths = [raw for raw in raw_paths if raw not in checklist_paths]
+        if any(self._references_supervisor_runtime(raw, cwd=self.workspace) for raw in regular_paths):
+            return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
+        immutable_hit = self._immutable_hit_for_raw_paths(regular_paths, cwd=self.workspace)
         if immutable_hit is not None:
             return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")
         grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=self.workspace)
         if grading_hit is not None:
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
-        paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
+        paths, path_problem = resolve_all_paths(self.workspace, regular_paths)
         if path_problem:
             return PolicyDecision.route_llm(path_problem)
         if any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to secret-pattern paths are denied")
         if any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
+        if checklist_paths and not paths:
+            return PolicyDecision.allow("coder checklist patch")
         return PolicyDecision.allow("workspace patch inside workspace")

@@ -358,6 +358,77 @@ async def test_file_change_to_immutable_task_is_denied(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_file_change_allows_only_configured_coder_checklist_inside_runtime_state(tmp_path: Path) -> None:
+    checklist = tmp_path / ".supervisor" / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("", encoding="utf-8")
+    handoff = tmp_path / ".supervisor" / "HANDOFF.md"
+    handoff.write_text("protected", encoding="utf-8")
+    checklist_context = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            122,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": str(checklist),
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+    handoff_context = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            123,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": str(handoff),
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+    manager = ApprovalManager(tmp_path, coder_checklist_path=checklist)
+
+    checklist_decision = await manager.decide(checklist_context)
+    handoff_decision = await manager.decide(handoff_context)
+    checklist.unlink()
+    checklist.hardlink_to(handoff)
+    invalid_checklist_decision = await manager.decide(checklist_context)
+
+    assert checklist_decision.decision == "accept"
+    assert handoff_decision.decision in {"decline", "cancel"}
+    assert handoff_decision.reason == "writes to supervisor runtime/state files are denied"
+    assert invalid_checklist_decision.decision in {"decline", "cancel"}
+    assert "single-link" in invalid_checklist_decision.reason
+
+
+@pytest.mark.asyncio
+async def test_command_approval_allows_only_exact_coder_checklist_touch(
+    tmp_path: Path,
+) -> None:
+    checklist = tmp_path / ".supervisor" / "coder" / "CHECKLIST.md"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text("", encoding="utf-8")
+    manager = ApprovalManager(tmp_path, coder_checklist_path=checklist)
+
+    exact = await manager.decide(
+        command_context(
+            tmp_path,
+            "/bin/bash -lc 'touch .supervisor/coder/CHECKLIST.md'",
+        )
+    )
+    sibling = await manager.decide(
+        command_context(
+            tmp_path,
+            "/bin/bash -lc 'touch .supervisor/HANDOFF.md'",
+        )
+    )
+
+    assert exact.decision == "accept"
+    assert exact.reason == "coder checklist write"
+    assert sibling.decision in {"decline", "cancel"}
+
+
+@pytest.mark.asyncio
 async def test_file_change_does_not_emit_execpolicy_amendment(tmp_path: Path) -> None:
     class Reviewer:
         async def decide_approval(self, context, reason):

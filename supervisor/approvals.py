@@ -135,6 +135,7 @@ class ApprovalManager:
         supervisor: SupervisorApprovalReviewer | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         immutable_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
+        coder_checklist_path: str | Path | None = None,
         timeout_seconds: float = 360.0,
         adversary_mode: bool = False,
     ):
@@ -144,6 +145,7 @@ class ApprovalManager:
             self.workspace,
             declared_grading_roots=declared_grading_roots,
             immutable_paths=self.immutable_paths,
+            coder_checklist_path=coder_checklist_path,
         )
         self.supervisor = supervisor
         self.timeout_seconds = timeout_seconds
@@ -286,6 +288,11 @@ class ApprovalManager:
         if not raw_paths:
             return PolicyDecision.allow("app-server file-change approval without exposed paths treated as workspace edit")
         for raw in raw_paths:
+            checklist_cwd = Path(context.cwd) if context.cwd else self.workspace
+            if self.policy.references_coder_checklist(raw, cwd=checklist_cwd):
+                if not self.policy.matches_coder_checklist(raw, cwd=checklist_cwd):
+                    return PolicyDecision.deny("coder checklist must remain a regular single-link file")
+                continue
             immutable_hit = _immutable_path_hit(raw, cwd=context.cwd, workspace=self.workspace, roots=self.immutable_paths)
             if immutable_hit is not None:
                 return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")

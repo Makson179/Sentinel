@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import re
+from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from copy import deepcopy
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from supervisor.markdown_fences import advance_markdown_fence
 from supervisor.review_limits import (
     EXPLICIT_REVIEW_LIMIT_FORMAT,
     REVIEW_LIMIT_FIELDS,
@@ -303,7 +305,9 @@ class EvidenceItem(BaseModel):
     inspection_id: str | None = None
     command: str
     sequence: int | None = None
-    validation_type: Literal["static", "behavioral", "behavior_demo", "inspection", "unknown"]
+    validation_type: Literal[
+        "static", "behavioral", "behavior_demo", "inspection", "unknown"
+    ]
     outcome: Literal["pass", "fail", "unknown"]
     freshness: Literal["fresh", "stale", "unknown"]
     why_it_covers_behavior: str
@@ -373,19 +377,134 @@ class CompletionReviewDecision(BaseModel):
                 raise ValueError("accept must not set message_to_coder")
             if self.handoff is not None:
                 raise ValueError("accept must not set handoff")
+            blocker_fields = completion_review_accept_blocker_fields(self)
+            if blocker_fields:
+                raise ValueError(
+                    "accept must not contain actionable blockers or unclosed requirements: "
+                    + ", ".join(blocker_fields)
+                )
         elif self.decision == CompletionReviewDecisionKind.RETURN:
             if not self.message_to_coder or not self.message_to_coder.strip():
                 raise ValueError("return requires message_to_coder")
             if self.handoff is not None:
                 raise ValueError("return must not set handoff")
             if not _completion_review_has_return_issue(self):
-                raise ValueError("return requires an uncovered behavior, validation gap, mismatch, risk, or access limitation")
+                raise ValueError(
+                    "return requires an uncovered behavior, validation gap, mismatch, risk, or access limitation"
+                )
         elif self.decision == CompletionReviewDecisionKind.RESTART:
             if self.handoff is None:
                 raise ValueError("restart requires handoff")
             if self.message_to_coder is not None:
                 raise ValueError("restart must not set message_to_coder")
         return self
+
+
+class AdvReportControllerDecision(BaseModel):
+    """Normalized adversary report ready for routing back to the coder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    forward_to_coder: bool
+    reason: str
+    report_to_coder: str | None = None
+    material_coverage_limitations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_forward_shape(self) -> "AdvReportControllerDecision":
+        normalized_limitations: list[str] = []
+        seen_limitations: set[str] = set()
+        for raw_limitation in self.material_coverage_limitations:
+            limitation = raw_limitation.strip()
+            if not limitation or limitation in seen_limitations:
+                continue
+            seen_limitations.add(limitation)
+            normalized_limitations.append(limitation)
+        self.material_coverage_limitations = normalized_limitations
+
+        if self.forward_to_coder:
+            if not self.report_to_coder or not self.report_to_coder.strip():
+                raise ValueError("forward_to_coder=true requires report_to_coder")
+            _validate_adv_report_to_coder(self.report_to_coder)
+        elif self.report_to_coder is not None:
+            raise ValueError("forward_to_coder=false requires report_to_coder=null")
+        return self
+
+
+_ADV_CODER_REPORT_SECTIONS = {
+    "findings requiring correction",
+    "observations requiring investigation",
+}
+_ADV_CODER_REPORT_FORBIDDEN_LABELS = {
+    "attacked",
+    "previous_findings_checked",
+    "held",
+    "not_reached",
+    "material_coverage_limitations",
+    "overall",
+    "rejected_findings",
+    "adjudication_mechanics",
+    "patch_suggestions",
+}
+
+
+def _validate_adv_report_to_coder(report: str) -> None:
+    """Enforce the findings/observations-only routing boundary outside quoted evidence."""
+
+    seen_sections: set[str] = set()
+    fence_state = None
+    for raw_line in report.splitlines():
+        line = raw_line.strip()
+        before_fence = fence_state
+        fence_state, is_fence_marker = advance_markdown_fence(raw_line, fence_state)
+        if is_fence_marker:
+            continue
+        if before_fence is not None or not line:
+            continue
+
+        is_top_level = raw_line == raw_line.lstrip()
+        heading = (
+            re.fullmatch(r"(#{1,6})\s+(.+?)(?:\s+#+)?", line)
+            if is_top_level
+            else None
+        )
+        if heading is not None:
+            level = len(heading.group(1))
+            title = heading.group(2).strip().lower()
+            canonical_title = re.sub(r"[\s-]+", "_", title)
+            if canonical_title in _ADV_CODER_REPORT_FORBIDDEN_LABELS:
+                raise ValueError(
+                    f"report_to_coder contains forbidden section {title!r}"
+                )
+            if level <= 2 and title not in _ADV_CODER_REPORT_SECTIONS:
+                raise ValueError(
+                    f"report_to_coder contains unsupported top-level section {title!r}"
+                )
+            if title in _ADV_CODER_REPORT_SECTIONS:
+                if level != 2:
+                    raise ValueError(
+                        f"report_to_coder section {title!r} must use a level-2 heading"
+                    )
+                if title in seen_sections:
+                    raise ValueError(f"report_to_coder repeats section {title!r}")
+                seen_sections.add(title)
+            continue
+
+        if not is_top_level:
+            continue
+        label = re.match(r"^([a-z][a-z0-9_ -]*):", line, flags=re.IGNORECASE)
+        if label is not None:
+            canonical_label = re.sub(r"[\s-]+", "_", label.group(1).strip().lower())
+            if canonical_label in _ADV_CODER_REPORT_FORBIDDEN_LABELS:
+                raise ValueError(
+                    f"report_to_coder contains forbidden label {label.group(1)!r}"
+                )
+
+    if not seen_sections:
+        raise ValueError(
+            "report_to_coder requires a Findings requiring correction or "
+            "Observations requiring investigation section"
+        )
 
 
 def _completion_review_has_return_issue(decision: CompletionReviewDecision) -> bool:
@@ -398,6 +517,29 @@ def _completion_review_has_return_issue(decision: CompletionReviewDecision) -> b
     ):
         return True
     return False
+
+
+def completion_review_accept_blocker_fields(
+    decision: CompletionReviewDecision,
+) -> list[str]:
+    blockers: list[str] = []
+    artifact = decision.decision_artifact
+    if artifact is not None and artifact.actionable_gap_or_none is not None:
+        blockers.append("decision_artifact.actionable_gap_or_none")
+    if any(row.status != "covered" for row in decision.behavior_evidence_matrix):
+        blockers.append("behavior_evidence_matrix.status")
+    if any(row.gap is not None for row in decision.behavior_evidence_matrix):
+        blockers.append("behavior_evidence_matrix.gap")
+    for field_name in (
+        "uncovered_behaviors",
+        "validation_gaps",
+        "claim_evidence_mismatches",
+        "packet_or_access_limitations",
+        "changed_test_risks",
+    ):
+        if getattr(decision, field_name):
+            blockers.append(field_name)
+    return blockers
 
 
 class ApprovalWakeContext(BaseModel):
@@ -447,12 +589,18 @@ class ValidationRun(BaseModel):
     type: Literal["static", "behavioral", "behavior_demo"] = "behavioral"
     outcome: Literal["pass", "fail"] = "fail"
     passed: bool
-    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
+    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = (
+        "failed"
+    )
     masking_reason: str | None = None
     summary: str
     captured_output: str = ""
     captured_output_truncated: bool = False
     sequence: int
+    # Evidence-domain fingerprint: behavioral runs use the behavior-affecting
+    # state; static validations and direct demos use the full material state.
+    product_state_id: str | None = None
+    covers_same_action_mutations: bool = False
     was_filtered: bool = False
     raw_selector: str | None = None
     executed_test_names: list[str] = Field(default_factory=list)
@@ -486,7 +634,11 @@ class ValidationRun(BaseModel):
         if "shell_exit_code" not in data:
             data["shell_exit_code"] = data.get("exit_code")
         if "trusted_validation_outcome" not in data:
-            data["trusted_validation_outcome"] = "passed" if data.get("outcome") == "pass" and data.get("passed") else "failed"
+            data["trusted_validation_outcome"] = (
+                "passed"
+                if data.get("outcome") == "pass" and data.get("passed")
+                else "failed"
+            )
         if "validation_id" not in data:
             sequence = data.get("sequence")
             if isinstance(sequence, int) and isinstance(command, str):
@@ -508,6 +660,8 @@ class InspectionRun(BaseModel):
     captured_output: str = ""
     captured_output_truncated: bool = False
     sequence: int
+    # Inspections are always bound to the full material product state.
+    product_state_id: str | None = None
     inspected_paths: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -551,6 +705,9 @@ class PriorIntervention(BaseModel):
 
 
 class CompletionReturnRecord(BaseModel):
+    source: Literal[
+        "completion_review", "accept_gate", "adversary_report_controller"
+    ] = "completion_review"
     reason: str
     uncovered_behaviors: list[str] = Field(default_factory=list)
     validation_gaps: list[str] = Field(default_factory=list)
@@ -573,7 +730,7 @@ class ChangedFile(BaseModel):
 
 class ChangedFileDiff(BaseModel):
     path: str
-    file_kind: Literal["source", "test", "config", "docs", "unknown"]
+    file_kind: Literal["source", "test", "config", "docs", "artifact", "unknown"]
     change_kind: Literal["modified", "added", "deleted", "renamed", "unknown"]
     diff: str
     diff_truncated: bool = False
@@ -590,7 +747,9 @@ class ChangedTestsSummary(BaseModel):
     path: str
     added_or_modified_test_names: list[str] = Field(default_factory=list)
     changed_assertion_snippets: list[str] = Field(default_factory=list)
-    grep_or_test_selection_relevant_to_validations: list[str] = Field(default_factory=list)
+    grep_or_test_selection_relevant_to_validations: list[str] = Field(
+        default_factory=list
+    )
     summary_truncated: bool = False
 
 
@@ -605,7 +764,9 @@ class ValidationOutput(BaseModel):
     type: Literal["static", "behavioral", "behavior_demo"]
     outcome: Literal["pass", "fail"]
     passed: bool
-    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
+    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = (
+        "failed"
+    )
     masking_reason: str | None = None
     sequence: int
     stdout_or_summary: str
@@ -644,7 +805,9 @@ class ValidationProvenance(BaseModel):
     command: str
     type: Literal["static", "behavioral", "behavior_demo"]
     passed: bool
-    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = "failed"
+    trusted_validation_outcome: Literal["passed", "failed", "masked_or_unknown"] = (
+        "failed"
+    )
     sequence: int
     fresh_after_latest_relevant_change: bool | None = None
     captured_output_present: bool = False
@@ -711,7 +874,14 @@ class AdversaryReport(BaseModel):
     latest_relevant_change_sequence: int | None = None
     validation_sequence: int | None = None
     workspace_state_id: str | None = None
+    material_coverage_limitations: list[str] = Field(default_factory=list)
     created_at: str
+
+    @model_validator(mode="after")
+    def require_completed_workspace_binding(self) -> "AdversaryReport":
+        if self.status == "completed" and not (self.workspace_state_id or "").strip():
+            raise ValueError("completed adversary report requires workspace_state_id")
+        return self
 
 
 class SupervisorWakePacket(BaseModel):
@@ -751,7 +921,9 @@ class SupervisorWakePacket(BaseModel):
     patch_summary: str | None = None
     completion_attempt_count: int = 0
     completion_returns_this_generation: int = 0
-    previous_completion_returns: list[CompletionReturnRecord] = Field(default_factory=list)
+    previous_completion_returns: list[CompletionReturnRecord] = Field(
+        default_factory=list
+    )
     last_readiness_marker_sequence: int | None = None
     no_marker_idle_nudge_count: int = 0
     latest_relevant_change_sequence: int | None = None
@@ -792,6 +964,7 @@ class FinalReport(BaseModel):
     files_reviewed_summary: list[str] = Field(default_factory=list)
     packet_or_access_limitations: list[str] = Field(default_factory=list)
     adversary_reports: list[str] = Field(default_factory=list)
+    adversary_coverage_limitations: list[str] = Field(default_factory=list)
     diff_summary: str | None = None
 
 
@@ -853,6 +1026,14 @@ def json_schema_for_completion_review_decision() -> dict[str, Any]:
 
 def openai_strict_json_schema_for_completion_review_decision() -> dict[str, Any]:
     return openai_strict_json_schema(json_schema_for_completion_review_decision())
+
+
+def json_schema_for_adv_report_controller_decision() -> dict[str, Any]:
+    return AdvReportControllerDecision.model_json_schema()
+
+
+def openai_strict_json_schema_for_adv_report_controller_decision() -> dict[str, Any]:
+    return openai_strict_json_schema(json_schema_for_adv_report_controller_decision())
 
 
 def json_schema_for_cheap_runtime_decision() -> dict[str, Any]:

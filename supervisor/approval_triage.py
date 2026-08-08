@@ -371,11 +371,21 @@ class CheapRuntimeReviewer:
         *,
         model: str | None,
         timeout_seconds: float = DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS,
+        configured_mcp_server_names: tuple[str, ...] = (),
+        configured_plugin_names: tuple[str, ...] = (),
+        disable_apps: bool = True,
     ):
         self.client = client
         self.workspace = workspace.resolve()
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.configured_mcp_server_names = tuple(
+            sorted({name.strip() for name in configured_mcp_server_names if name.strip()})
+        )
+        self.configured_plugin_names = tuple(
+            sorted({name.strip() for name in configured_plugin_names if name.strip()})
+        )
+        self.disable_apps = disable_apps
 
     async def review(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision:
         if not self.model:
@@ -454,6 +464,17 @@ class CheapRuntimeReviewer:
                 await self._cleanup_thread(thread_id)
 
     def _thread_params(self) -> dict[str, Any]:
+        thread_config: dict[str, Any] = {"include_apps_instructions": False}
+        if self.configured_mcp_server_names:
+            thread_config["mcp_servers"] = {
+                name: {"enabled": False} for name in self.configured_mcp_server_names
+            }
+        if self.configured_plugin_names:
+            thread_config["plugins"] = {
+                name: {"enabled": False} for name in self.configured_plugin_names
+            }
+        if self.disable_apps:
+            thread_config["apps"] = {"_default": {"enabled": False}}
         return {
             "cwd": str(self.workspace),
             "runtimeWorkspaceRoots": [str(self.workspace)],
@@ -463,6 +484,9 @@ class CheapRuntimeReviewer:
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
+            "config": thread_config,
+            "dynamicTools": [],
+            "environments": [],
             "model": self.model,
         }
 

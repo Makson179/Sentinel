@@ -59,7 +59,8 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
                             "type": "agentMessage",
                             "text": (
                                 "candidate_finding: false\n"
-                                f"attacked: stack args\nfindings: none\noverall: held {turn_number}"
+                                f"attacked: stack args\nfindings: none\nobservations: none\n"
+                                f"not_reached: none\noverall: held {turn_number}"
                             ),
                         }
                     ],
@@ -84,7 +85,10 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     )
 
     first = await agent.run(_packet(tmp_path))
-    second = await agent.run(_packet(tmp_path))
+    previous_report = "candidate_finding: false\nfindings: none\nobservations: none"
+    second = await agent.run(
+        _packet(tmp_path), previous_adversary_report=previous_report
+    )
 
     assert first.thread_id == "adv-thread-1"
     assert second.thread_id == "adv-thread-2"
@@ -96,6 +100,12 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     assert client.thread_params[0]["sandbox"] == "workspace-write"
     assert client.thread_params[0]["model"] == "gpt-adversary"
     assert "effort" not in client.thread_params[0]
+    assert client.thread_params[0]["config"] == {
+        "apps": {"_default": {"enabled": False}},
+        "include_apps_instructions": False,
+    }
+    assert client.thread_params[0]["dynamicTools"] == []
+    assert client.thread_params[0]["environments"] == []
     assert client.turn_params[0]["model"] == "gpt-adversary"
     assert client.turn_params[0]["effort"] == "ultra"
     assert client.turn_params[0]["sandboxPolicy"] == {
@@ -105,11 +115,64 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     }
     prompt_payload = json.loads(client.turn_params[0]["input"][0]["text"])
     assert prompt_payload["task_contents"].startswith("# Task")
+    assert set(prompt_payload) == {
+        "instructions",
+        "task_contents",
+        "previous_adversary_report",
+    }
+    assert str(tmp_path.resolve()) not in json.dumps(prompt_payload)
+    assert "task_path" not in prompt_payload
+    assert "current_workspace_summary" not in prompt_payload
+    assert "diff_summary" not in prompt_payload
+    assert "changed_files" not in prompt_payload
+    assert "validation_freshness_summary" not in prompt_payload
+    second_prompt_payload = json.loads(client.turn_params[1]["input"][0]["text"])
+    assert second_prompt_payload["previous_adversary_report"] == previous_report
+    assert set(second_prompt_payload) == set(prompt_payload)
     assert "judged against the task" in prompt_payload["instructions"][1]
     assert "only when the task itself requires that access" in prompt_payload["instructions"][1]
     assert "disposable snapshot" in prompt_payload["instructions"][1]
     assert "accepted_completion_review" not in prompt_payload
     assert first.candidate_finding is False
+
+
+def test_adversary_thread_disables_configured_mcp_plugins_and_apps(tmp_path: Path) -> None:
+    agent = AdversaryAgent(
+        object(),  # type: ignore[arg-type]
+        tmp_path,
+        configured_mcp_server_names=["openaiDeveloperDocs", " node_repl ", "openaiDeveloperDocs"],
+        configured_plugin_names=["sites@openai-bundled", "browser@openai-bundled"],
+    )
+
+    params = agent._thread_params()
+
+    assert params["config"] == {
+        "apps": {"_default": {"enabled": False}},
+        "include_apps_instructions": False,
+        "mcp_servers": {
+            "node_repl": {"enabled": False},
+            "openaiDeveloperDocs": {"enabled": False},
+        },
+        "plugins": {
+            "browser@openai-bundled": {"enabled": False},
+            "sites@openai-bundled": {"enabled": False},
+        },
+    }
+    assert params["dynamicTools"] == []
+    assert params["environments"] == []
+
+
+def test_adversary_thread_can_skip_apps_override_without_enabling_app_instructions(tmp_path: Path) -> None:
+    agent = AdversaryAgent(
+        object(),  # type: ignore[arg-type]
+        tmp_path,
+        disable_apps=False,
+    )
+
+    params = agent._thread_params()
+
+    assert params["config"] == {"include_apps_instructions": False}
+    assert "apps" not in params["config"]
 
 
 async def test_adversary_agent_reads_completed_report_from_turns_list(tmp_path: Path) -> None:
@@ -137,7 +200,8 @@ async def test_adversary_agent_reads_completed_report_from_turns_list(tmp_path: 
                                 "type": "agentMessage",
                                 "text": (
                                     "candidate_finding: false\n"
-                                    "attacked: ephemeral-regression\nfindings: none\noverall: held"
+                                    "attacked: ephemeral-regression\nfindings: none\n"
+                                    "observations: none\nnot_reached: none\noverall: held"
                                 ),
                             }
                         ],
@@ -181,7 +245,10 @@ async def test_adversary_agent_retries_once_after_no_message(tmp_path: Path) -> 
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                            "text": (
+                                "candidate_finding: false\nattacked: retry\nfindings: none\n"
+                                "observations: none\nnot_reached: none\noverall: held"
+                            ),
                         }
                     ],
                 }
@@ -227,7 +294,10 @@ async def test_adversary_agent_retry_carries_denied_probes_note(tmp_path: Path) 
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                            "text": (
+                                "candidate_finding: false\nattacked: retry\nfindings: none\n"
+                                "observations: none\nnot_reached: none\noverall: held"
+                            ),
                         }
                     ],
                 }
@@ -275,7 +345,10 @@ async def test_adversary_agent_retries_failed_turn_instead_of_accepting_progress
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                            "text": (
+                                "candidate_finding: false\nattacked: retry\nfindings: none\n"
+                                "observations: none\nnot_reached: none\noverall: held"
+                            ),
                         }
                     ],
                 }
@@ -337,7 +410,13 @@ async def test_adversary_agent_retries_incomplete_completed_report(tmp_path: Pat
                         "items": [
                             {
                                 "type": "agentMessage",
-                                "text": "I am replaying the previous findings before probing new behavior.",
+                                "text": (
+                                    "candidate_finding: false\n"
+                                    "attacked: parser\n"
+                                    "findings: none\n"
+                                    "observations: none\n"
+                                    "overall: held"
+                                ),
                             }
                         ],
                     }
@@ -349,7 +428,11 @@ async def test_adversary_agent_retries_incomplete_completed_report(tmp_path: Pat
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": "candidate_finding: true\nattacked: parser\nfindings: malformed input accepted\noverall: defects remain",
+                            "text": (
+                                "candidate_finding: true\nattacked: parser\n"
+                                "findings: malformed input accepted\nobservations: none\n"
+                                "not_reached: none\noverall: defects remain"
+                            ),
                         }
                     ],
                 }

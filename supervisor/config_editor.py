@@ -501,8 +501,8 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                     edit_kind="review_limit",
                     help_text=(
                         "Maximum additional completion-review rounds after each adversary pass. 0 schedules none; "
-                        "Unlimited removes the cap. A candidate adversary finding is still adjudicated once before "
-                        "Bello accepts it or returns a real defect to the coder."
+                        "Unlimited removes the cap. The narrow adv_report_controller pass still normalizes every "
+                        "completed adversary report independently of this completion-review budget."
                     ),
                 )
             )

@@ -13,34 +13,55 @@ import pytest
 
 from supervisor.approvals import ApprovalManager
 from supervisor.controller import (
+    ACCEPT_GATE_REVIEWER_INCOMPLETE,
     ADVERSARY_MODEL,
     NO_MARKER_IDLE_NUDGE,
     POST_RESTART_CONTINUE_NUDGE,
     ControllerEvent,
+    CompletionReviewerEvidence,
     BelloController,
+    _adv_report_normalization_contract_issue,
+    _completion_reviewer_evidence_from_item,
     _ensure_internal_runtime_git_excluded,
     _has_malformed_readiness_marker,
     _has_passing_behavioral_validation,
     _has_readiness_marker,
     _git_status_entries_from_porcelain_v1_z,
+    _git_review_state_id,
     _inspection_from_action,
     _hash_file,
+    _material_static_review_files,
     _path_from_git_status_line,
     _read_workspace_file,
+    _review_behavioral_product_state_id,
+    _reviewer_evidence_covers_path,
+    _reviewer_evidence_covers_static_file,
     _runtime_restart_issue,
     _sandbox_matches_mode,
     _evidence_provenance_summary,
     _file_kind,
     _validation_from_action,
     _validation_freshness_summary,
+    _workspace_state_id,
 )
 from supervisor.adversary_agent import AdversaryAgentError
 from supervisor.approvals import normalize_approval_request
-from supervisor.appserver import APP_SERVER_CODER_RPC_TIMEOUT_SECONDS, AppServerError, AppServerMessage, AppServerTimeoutError
-from supervisor.coder import CODEX_FAST_SERVICE_TIER, CoderSession, coder_thread_params, coder_turn_params
+from supervisor.appserver import (
+    APP_SERVER_CODER_RPC_TIMEOUT_SECONDS,
+    AppServerError,
+    AppServerMessage,
+    AppServerTimeoutError,
+)
+from supervisor.coder import (
+    CODEX_FAST_SERVICE_TIER,
+    CoderSession,
+    coder_thread_params,
+    coder_turn_params,
+)
 from supervisor.main import _run_async_cleanly
 from supervisor.project_config import DEFAULT_MODEL, MODEL_GPT_5_5, MODEL_GPT_5_6_SOL
 from supervisor.schemas import (
+    AdvReportControllerDecision,
     AppEvent,
     AppEventSource,
     AdversaryReport,
@@ -50,8 +71,10 @@ from supervisor.schemas import (
     CheapRuntimeDecision,
     CoderMessage,
     CompletionReviewDecision,
+    CompletionReviewDecisionKind,
     FinalReport,
     PriorIntervention,
+    ReviewedFile,
     RestartHandoff,
     BelloConfig,
     BelloStatus,
@@ -62,6 +85,8 @@ from supervisor.schemas import (
     ValidationRun,
 )
 from supervisor.state import (
+    CODER_CHECKLIST,
+    CODER_CHECKLIST_MAX_BYTES,
     CONFIG,
     DECISIONS,
     EVENTS,
@@ -84,11 +109,243 @@ def test_bello_state_initializes_required_files(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     assert store.path(EVENTS).exists()
     assert store.path(FINAL_REPORT).exists()
+    assert store.path(CODER_CHECKLIST).is_file()
+    assert store.path(CODER_CHECKLIST).read_text(encoding="utf-8") == ""
     assert store.get_bello_config().task_path == str(task)
+
+
+def test_coder_checklist_lifecycle_resets_fresh_and_preserves_same_task_resume(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    config = BelloConfig(
+        project_root=str(tmp_path), task_path=str(task), task_hash="same-task"
+    )
+    store.initialize_bello(config, mode="fresh")
+    store.ensure_coder_checklist("B-1 VALIDATED parser boundary\n")
+
+    store.initialize_bello(config, mode="resume")
+
+    assert store.read_coder_checklist() == "B-1 VALIDATED parser boundary\n"
+
+    store.initialize_bello(config, mode="fresh")
+
+    assert store.read_coder_checklist() == ""
+
+
+def test_coder_checklist_resume_resets_when_task_identity_changes(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# First task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), task_hash="first"),
+        mode="fresh",
+    )
+    store.ensure_coder_checklist("stale checklist\n")
+
+    store.initialize_bello(
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), task_hash="second"
+        ),
+        mode="resume",
+    )
+
+    assert store.read_coder_checklist() == ""
+
+
+def test_coder_checklist_resume_does_not_cross_task_paths_with_same_hash(
+    tmp_path: Path,
+) -> None:
+    first_task = tmp_path / "FIRST.md"
+    second_task = tmp_path / "SECOND.md"
+    first_task.write_text("# Same contents", encoding="utf-8")
+    second_task.write_text("# Same contents", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(first_task), task_hash="same-hash"
+        ),
+        mode="fresh",
+    )
+    store.ensure_coder_checklist("belongs only to FIRST.md\n")
+
+    store.initialize_bello(
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(second_task),
+            task_hash="same-hash",
+        ),
+        mode="resume",
+    )
+
+    assert store.read_coder_checklist() == ""
+
+
+def test_coder_checklist_resume_resets_safely_when_prior_config_is_invalid(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    config = BelloConfig(
+        project_root=str(tmp_path), task_path=str(task), task_hash="same-task"
+    )
+    store.initialize_bello(config, mode="fresh")
+    store.ensure_coder_checklist("must not survive unknown task identity\n")
+    store.path(CONFIG).write_text("{not-json", encoding="utf-8")
+
+    store.initialize_bello(config, mode="resume")
+
+    assert store.read_coder_checklist() == ""
+    assert store.get_bello_config().task_hash == "same-task"
+
+
+def test_coder_checklist_repair_rejects_symlink_and_oversized_content(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
+    checklist = store.path(CODER_CHECKLIST)
+    progress = store.path(PROGRESS)
+    progress_before = progress.read_text(encoding="utf-8")
+    checklist.unlink()
+    checklist.symlink_to(progress)
+
+    assert store.ensure_coder_checklist() is True
+    assert checklist.is_file() and not checklist.is_symlink()
+    assert checklist.read_text(encoding="utf-8") == ""
+    assert progress.read_text(encoding="utf-8") == progress_before
+
+    checklist.write_bytes(b"x" * (CODER_CHECKLIST_MAX_BYTES + 1))
+
+    assert store.ensure_coder_checklist() is True
+    assert checklist.read_text(encoding="utf-8") == ""
+
+
+def test_coder_checklist_edit_is_not_recorded_as_product_change(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
+    controller = BelloController.__new__(BelloController)
+    controller.project_root = tmp_path
+    controller.workspace_root = tmp_path
+    controller.task_path = task
+    controller.workspace_task_path = task
+    controller.store = store
+    controller.observed_changed_files = {}
+    controller._sequence = 7
+
+    controller._record_changed_files(
+        TriggeringAction(
+            kind="fileChange",
+            paths=[str(store.coder_checklist_path())],
+            summary="file change completed: checklist",
+        )
+    )
+
+    assert controller.observed_changed_files == {}
+
+    store.coder_checklist_path().unlink()
+    controller._record_changed_files(
+        TriggeringAction(
+            kind="fileChange",
+            paths=[str(store.coder_checklist_path())],
+            summary="file change completed: deleted checklist",
+        )
+    )
+
+    assert store.read_coder_checklist() == ""
+    assert "reset an invalid or oversized coder checklist" in store.read_text(PROGRESS)
+
+
+def test_coder_checklist_symlink_cannot_hide_a_product_change(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    product = tmp_path / "src.py"
+    product.write_text("value = 1\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
+    checklist = store.coder_checklist_path()
+    checklist.unlink()
+    checklist.symlink_to(product)
+    controller = BelloController.__new__(BelloController)
+    controller.project_root = tmp_path
+    controller.workspace_root = tmp_path
+    controller.task_path = task
+    controller.workspace_task_path = task
+    controller.store = store
+    controller.observed_changed_files = {}
+    controller._sequence = 8
+
+    controller._record_changed_files(
+        TriggeringAction(
+            kind="fileChange",
+            paths=[str(product)],
+            summary="file change completed: product",
+        )
+    )
+
+    assert set(controller.observed_changed_files) == {"src.py"}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_checklist_alias_is_approved_as_exact_state_file(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        visible_checklist = snapshot.snapshot_root / ".supervisor" / CODER_CHECKLIST
+        context = normalize_approval_request(
+            AppServerMessage(
+                {
+                    "id": 901,
+                    "method": "item/fileChange/requestApproval",
+                    "params": {
+                        "cwd": str(snapshot.snapshot_root),
+                        "grantRoot": str(visible_checklist),
+                        "availableDecisions": ["accept", "decline"],
+                    },
+                }
+            )
+        )
+        manager = ApprovalManager(
+            snapshot.snapshot_root,
+            immutable_paths=(tmp_path, task),
+            coder_checklist_path=store.coder_checklist_path(),
+        )
+
+        decision = await manager.decide(context)
+        visible_checklist.write_text("B-1 TODO snapshot path\n", encoding="utf-8")
+
+        assert decision.decision == "accept"
+        assert store.read_coder_checklist() == "B-1 TODO snapshot path\n"
+    finally:
+        snapshot.cleanup()
 
 
 def test_internal_supervisor_dir_is_added_to_git_info_exclude(tmp_path: Path) -> None:
@@ -105,21 +362,42 @@ def test_internal_supervisor_dir_is_added_to_git_info_exclude(tmp_path: Path) ->
     assert lines.count(".supervisor") == 1
 
 
-async def test_git_init_log_is_filtered_from_changed_files_source(tmp_path: Path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+async def test_git_init_log_is_filtered_from_changed_files_source(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True
+    )
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     (tmp_path / ".git-init.log").write_text("initial\n", encoding="utf-8")
     (tmp_path / "src.c").write_text("int value(void) { return 1; }\n", encoding="utf-8")
-    subprocess.run(["git", "add", "TASK.md", ".git-init.log", "src.c"], cwd=tmp_path, check=True, capture_output=True, text=True)
     subprocess.run(
-        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+        ["git", "add", "TASK.md", ".git-init.log", "src.c"],
         cwd=tmp_path,
         check=True,
         capture_output=True,
         text=True,
     )
-    (tmp_path / ".git-init.log").write_text("initial\nmore git init output\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / ".git-init.log").write_text(
+        "initial\nmore git init output\n", encoding="utf-8"
+    )
     (tmp_path / "src.c").write_text("int value(void) { return 2; }\n", encoding="utf-8")
 
     controller = BelloController.__new__(BelloController)
@@ -136,21 +414,44 @@ async def test_git_init_log_is_filtered_from_changed_files_source(tmp_path: Path
     assert ".git-init.log" not in diff_summary
 
 
-async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(tmp_path: Path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True
+    )
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.c").write_text("int main(void) { return 1; }\n", encoding="utf-8")
-    subprocess.run(["git", "add", "TASK.md", "src/app.c"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "src" / "app.c").write_text(
+        "int main(void) { return 1; }\n", encoding="utf-8"
+    )
     subprocess.run(
-        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+        ["git", "add", "TASK.md", "src/app.c"],
         cwd=tmp_path,
         check=True,
         capture_output=True,
         text=True,
     )
-    (tmp_path / "src" / "app.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "src" / "app.c").write_text(
+        "int main(void) { return 0; }\n", encoding="utf-8"
+    )
     (tmp_path / "src" / "app.o").write_bytes(b"\x7fELF\0object")
     (tmp_path / "__pycache__").mkdir()
     (tmp_path / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"\0\0\0pyc")
@@ -196,13 +497,32 @@ async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(
     assert observed_paths == {"src/app.c", "src/app.o", "compiler"}
 
 
-async def test_greenfield_untracked_files_keep_sequences_for_validation_freshness(tmp_path: Path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+async def test_greenfield_untracked_files_keep_sequences_for_validation_freshness(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True
+    )
     task = tmp_path / "TASK.md"
     task.write_text("# Build a Python CLI", encoding="utf-8")
-    subprocess.run(["git", "add", "TASK.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
     subprocess.run(
-        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+        ["git", "add", "TASK.md"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -217,16 +537,24 @@ async def test_greenfield_untracked_files_keep_sequences_for_validation_freshnes
     test_file.write_text("def test_main():\n    assert True\n", encoding="utf-8")
 
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
     controller.use_git_diff = True
     controller.observed_changed_files = {
-        "src/new module.py": ChangedFile(path="src/new module.py", status="modified", sequence=7),
-        "tests/test_cli.py": ChangedFile(path="tests/test_cli.py", status="modified", sequence=8),
-        "src/no-longer-changed.py": ChangedFile(path="src/no-longer-changed.py", status="modified", sequence=99),
+        "src/new module.py": ChangedFile(
+            path="src/new module.py", status="modified", sequence=7
+        ),
+        "tests/test_cli.py": ChangedFile(
+            path="tests/test_cli.py", status="modified", sequence=8
+        ),
+        "src/no-longer-changed.py": ChangedFile(
+            path="src/no-longer-changed.py", status="modified", sequence=99
+        ),
     }
 
     changed = await controller.changed_files()
@@ -237,19 +565,185 @@ async def test_greenfield_untracked_files_keep_sequences_for_validation_freshnes
     assert by_path["src/new module.py"].sequence == 7
     assert by_path["tests/test_cli.py"].status == "??"
     assert by_path["tests/test_cli.py"].sequence == 8
+    behavior_state_id = _review_behavioral_product_state_id(
+        tmp_path,
+        changed,
+        task_contents=task.read_text(encoding="utf-8"),
+    )
 
     controller.validations = [
-        ValidationRun(command="pytest", exit_code=0, passed=True, summary="2 passed", sequence=9)
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="2 passed",
+            sequence=9,
+            product_state_id=behavior_state_id,
+        )
     ]
     assert await controller._done_without_fresh_behavioral_validation() is None
     assert store.get_bello_config().last_relevant_edit_sequence == 8
 
     controller.validations = [
-        ValidationRun(command="pytest", exit_code=0, passed=True, summary="2 passed", sequence=8)
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="2 passed",
+            sequence=8,
+            product_state_id=behavior_state_id,
+        )
     ]
     stale_reason = await controller._done_without_fresh_behavioral_validation()
     assert stale_reason is not None
     assert "relevant edit sequence 8" in stale_reason
+
+    controller.validations = [
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="2 passed",
+            sequence=9,
+            product_state_id="superseded-product-state",
+        )
+    ]
+    product_stale_reason = (
+        await controller._done_without_fresh_behavioral_validation()
+    )
+    assert product_stale_reason is not None
+
+
+async def test_bounded_completion_never_waives_current_product_validation_floor(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, coder = _completion_gate_controller(tmp_path, validations=[])
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("value = 2\n", encoding="utf-8")
+    controller.observed_changed_files = {
+        "src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)
+    }
+    controller.validations = [
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            sequence=3,
+            product_state_id="superseded-product-state",
+        )
+    ]
+    finalized: list[str] = []
+
+    async def capture_finalize(result: str, **kwargs) -> None:
+        finalized.append(result)
+
+    controller.finalize = capture_finalize
+
+    await controller._finalize_bounded_completion(reason="budget reached")
+
+    assert finalized == []
+    assert len(coder.messages) == 1
+    assert "does not waive the evidence floor" in coder.messages[0]
+
+
+async def test_static_document_edit_does_not_force_behavioral_rerun(
+    tmp_path: Path,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    task_text = "Update src/app.py behavior and README.md documentation"
+    Path(controller.task_path).write_text(task_text, encoding="utf-8")
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    readme = tmp_path / "README.md"
+    readme.write_text("documented\n", encoding="utf-8")
+    changed = [
+        ChangedFile(path="src/app.py", status="M", sequence=2),
+        ChangedFile(path="README.md", status="M", sequence=4),
+    ]
+    controller.observed_changed_files = {file.path: file for file in changed}
+    controller.validations = [
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            sequence=3,
+            product_state_id=_review_behavioral_product_state_id(
+                tmp_path,
+                changed,
+                task_contents=task_text,
+            ),
+        )
+    ]
+
+    assert await controller._done_without_fresh_behavioral_validation() is None
+    provenance = _evidence_provenance_summary(
+        validations=controller.validations,
+        changed_files=changed,
+        latest_change_sequence=2,
+    )
+    assert provenance.validations[0].fresh_after_latest_relevant_change is True
+
+
+@pytest.mark.parametrize("bound_state", ["stale", None])
+async def test_mixed_known_and_pathless_change_requires_current_state_evidence(
+    tmp_path: Path,
+    bound_state: str | None,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    task_text = "Update both runtime modules"
+    Path(controller.task_path).write_text(task_text, encoding="utf-8")
+    first = tmp_path / "src" / "first.py"
+    second = tmp_path / "src" / "second.py"
+    first.parent.mkdir()
+    first.write_text("VALUE = 1\n", encoding="utf-8")
+    second.write_text("VALUE = 1\n", encoding="utf-8")
+    changed = [
+        ChangedFile(path="src/first.py", status="M", sequence=2),
+        ChangedFile(path="src/second.py", status="M", sequence=None),
+    ]
+    old_state = _review_behavioral_product_state_id(
+        tmp_path,
+        changed,
+        task_contents=task_text,
+    )
+    second.write_text("VALUE = 2\n", encoding="utf-8")
+    controller.observed_changed_files = {file.path: file for file in changed}
+    controller.validations = [
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            sequence=3,
+            product_state_id=old_state if bound_state == "stale" else None,
+        )
+    ]
+
+    reason = await controller._done_without_fresh_behavioral_validation()
+
+    assert reason is not None
+    assert "current product state" in reason
+
+
+async def test_pathless_behavior_change_with_unknown_sequence_requires_current_evidence(
+    tmp_path: Path,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("value = 2\n", encoding="utf-8")
+    controller.observed_changed_files = {
+        "src/app.py": ChangedFile(path="src/app.py", status="M", sequence=None)
+    }
+
+    issue = await controller._done_without_fresh_behavioral_validation()
+
+    assert issue is not None
+    assert "edit sequence is unknown" in issue
 
 
 def test_coder_sandbox_defaults_to_workspace_write(tmp_path: Path, monkeypatch) -> None:
@@ -263,7 +757,9 @@ def test_coder_sandbox_defaults_to_workspace_write(tmp_path: Path, monkeypatch) 
     }
 
 
-def test_snapshot_mode_protects_entire_original_workspace_from_approval_commands(tmp_path: Path) -> None:
+def test_snapshot_mode_protects_entire_original_workspace_from_approval_commands(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     controller = BelloController.__new__(BelloController)
@@ -274,24 +770,43 @@ def test_snapshot_mode_protects_entire_original_workspace_from_approval_commands
     assert controller._immutable_approval_paths() == (tmp_path, task)
 
 
-def test_workspace_write_preflight_rejects_network_or_extra_writable_roots(tmp_path: Path) -> None:
+def test_workspace_write_preflight_rejects_network_or_extra_writable_roots(
+    tmp_path: Path,
+) -> None:
     valid = {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False}
     same_root = {
         "type": "workspaceWrite",
         "writableRoots": [str(tmp_path.resolve())],
         "networkAccess": False,
     }
-    network_enabled = {"type": "workspaceWrite", "writableRoots": [], "networkAccess": True}
+    network_enabled = {
+        "type": "workspaceWrite",
+        "writableRoots": [],
+        "networkAccess": True,
+    }
     extra_root = {
         "type": "workspaceWrite",
         "writableRoots": [str(tmp_path.parent.resolve())],
         "networkAccess": False,
     }
 
-    assert _sandbox_matches_mode(valid, "workspace-write", workspace_root=tmp_path) is True
-    assert _sandbox_matches_mode(same_root, "workspace-write", workspace_root=tmp_path) is True
-    assert _sandbox_matches_mode(network_enabled, "workspace-write", workspace_root=tmp_path) is False
-    assert _sandbox_matches_mode(extra_root, "workspace-write", workspace_root=tmp_path) is False
+    assert (
+        _sandbox_matches_mode(valid, "workspace-write", workspace_root=tmp_path) is True
+    )
+    assert (
+        _sandbox_matches_mode(same_root, "workspace-write", workspace_root=tmp_path)
+        is True
+    )
+    assert (
+        _sandbox_matches_mode(
+            network_enabled, "workspace-write", workspace_root=tmp_path
+        )
+        is False
+    )
+    assert (
+        _sandbox_matches_mode(extra_root, "workspace-write", workspace_root=tmp_path)
+        is False
+    )
 
 
 def test_coder_sandbox_can_use_read_only(tmp_path: Path, monkeypatch) -> None:
@@ -307,18 +822,36 @@ def test_coder_sandbox_can_use_read_only(tmp_path: Path, monkeypatch) -> None:
 def test_coder_fast_mode_sets_codex_service_tier(tmp_path: Path) -> None:
     assert coder_thread_params(tmp_path)["serviceTier"] is None
     assert coder_turn_params("thread", "work", tmp_path)["serviceTier"] is None
-    assert coder_thread_params(tmp_path, fast=True)["serviceTier"] == CODEX_FAST_SERVICE_TIER
-    assert coder_turn_params("thread", "work", tmp_path, fast=True)["serviceTier"] == CODEX_FAST_SERVICE_TIER
+    assert (
+        coder_thread_params(tmp_path, fast=True)["serviceTier"]
+        == CODEX_FAST_SERVICE_TIER
+    )
+    assert (
+        coder_turn_params("thread", "work", tmp_path, fast=True)["serviceTier"]
+        == CODEX_FAST_SERVICE_TIER
+    )
 
 
 def test_coder_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
-    assert coder_turn_params("thread", "work", tmp_path, intelligence="xhigh")["effort"] == "xhigh"
+    assert (
+        coder_turn_params("thread", "work", tmp_path, intelligence="xhigh")["effort"]
+        == "xhigh"
+    )
 
 
 def test_git_status_path_parser_handles_missing_second_status_column() -> None:
-    assert _path_from_git_status_line(" M public/src/admin/manage/users.js") == "public/src/admin/manage/users.js"
-    assert _path_from_git_status_line("M  public/language/en-GB/admin/manage/users.json") == "public/language/en-GB/admin/manage/users.json"
-    assert _path_from_git_status_line("M public/language/en-GB/admin/manage/users.json") == "public/language/en-GB/admin/manage/users.json"
+    assert (
+        _path_from_git_status_line(" M public/src/admin/manage/users.js")
+        == "public/src/admin/manage/users.js"
+    )
+    assert (
+        _path_from_git_status_line("M  public/language/en-GB/admin/manage/users.json")
+        == "public/language/en-GB/admin/manage/users.json"
+    )
+    assert (
+        _path_from_git_status_line("M public/language/en-GB/admin/manage/users.json")
+        == "public/language/en-GB/admin/manage/users.json"
+    )
 
 
 def test_git_porcelain_z_parser_preserves_exact_paths_and_rename_destination() -> None:
@@ -330,11 +863,15 @@ def test_git_porcelain_z_parser_preserves_exact_paths_and_rename_destination() -
     ]
 
 
-async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(tmp_path: Path) -> None:
+async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
@@ -342,7 +879,9 @@ async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(tmp_
     controller.store = store
     controller.use_git_diff = True
     controller.observed_changed_files = {
-        ".supervisor/CONFIG.json": ChangedFile(path=".supervisor/CONFIG.json", status="modified", sequence=1),
+        ".supervisor/CONFIG.json": ChangedFile(
+            path=".supervisor/CONFIG.json", status="modified", sequence=1
+        ),
         "TASK.md": ChangedFile(path="TASK.md", status="modified", sequence=2),
         "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=3),
     }
@@ -351,7 +890,13 @@ async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(tmp_
         return True
 
     async def git_output(command):
-        if command == ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]:
+        if command == [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ]:
             return " M .supervisor/CONFIG.json\0 M TASK.md\0 M src/app.py\0"
         if command == ["git", "status", "--short"]:
             return " M .supervisor/CONFIG.json\n M TASK.md\n M src/app.py"
@@ -381,31 +926,86 @@ def test_file_kind_classifies_common_test_roots_before_source_extensions() -> No
     assert _file_kind("src/user/email.js") == "source"
 
 
+def test_file_kind_distinguishes_executable_text_from_static_artifacts() -> None:
+    for path in (
+        "scripts/release.sh",
+        "schema/migrate.sql",
+        "Makefile",
+        "build/rules.mk",
+    ):
+        assert _file_kind(path) == "source"
+    for path in ("report.pdf", "assets/logo.svg", "screens/result.png", "deck.pptx"):
+        assert _file_kind(path) == "artifact"
+
+
+def test_material_static_review_files_keep_primary_and_explicit_deliverables() -> None:
+    assert [
+        file.path
+        for file in _material_static_review_files(
+            [ChangedFile(path="docs/user-guide.md", status="M", sequence=2)],
+            task_contents="# Update the user guide",
+        )
+    ] == ["docs/user-guide.md"]
+    assert [
+        file.path
+        for file in _material_static_review_files(
+            [ChangedFile(path="dist/report.pdf", status="A", sequence=2)],
+            task_contents="# Create dist/report.pdf",
+        )
+    ] == ["dist/report.pdf"]
+    assert [
+        file.path
+        for file in _material_static_review_files(
+            [ChangedFile(path="release.bundle", status="A", sequence=2)],
+            task_contents="# Produce the release deliverable",
+        )
+    ] == ["release.bundle"]
+    assert [
+        file.path
+        for file in _material_static_review_files(
+            [
+                ChangedFile(path="index.html", status="M", sequence=2),
+                ChangedFile(path="styles.css", status="M", sequence=2),
+            ],
+            task_contents="# Build a static landing page layout",
+        )
+    ] == ["index.html", "styles.css"]
+
+
 def test_coder_sandbox_can_use_danger_full_access(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("BELLO_CODER_SANDBOX", "danger-full-access")
 
     assert coder_thread_params(tmp_path)["sandbox"] == "danger-full-access"
-    assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {"type": "dangerFullAccess"}
+    assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {
+        "type": "dangerFullAccess"
+    }
 
 
 def test_bello_events_are_append_only_jsonl(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
-    store.append_event(AppEvent(sequence=1, source=AppEventSource.SYSTEM, event_type="test"))
+    store.append_event(
+        AppEvent(sequence=1, source=AppEventSource.SYSTEM, event_type="test")
+    )
 
     lines = store.path(EVENTS).read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0])["event_type"] == "test"
 
 
-
-def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_path: Path) -> None:
+def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
     previous_runs = store.path(PREVIOUS_RUNS)
 
     assert previous_runs.is_dir()
@@ -414,13 +1014,19 @@ def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_p
     store.path(EVENTS).write_text('{"sequence": 9}\n', encoding="utf-8")
     store.path(LOG).write_text("old log\n", encoding="utf-8")
     (previous_runs / "run9").mkdir()
-    (previous_runs / "run9" / "FINAL_REPORT.md").write_text("old report", encoding="utf-8")
+    (previous_runs / "run9" / "FINAL_REPORT.md").write_text(
+        "old report", encoding="utf-8"
+    )
     recovery = store.path(RECOVERY)
     (recovery / "run9" / "workspace").mkdir(parents=True)
-    (recovery / "run9" / "workspace" / "app.py").write_text("recovery", encoding="utf-8")
+    (recovery / "run9" / "workspace" / "app.py").write_text(
+        "recovery", encoding="utf-8"
+    )
     (store.state_dir / "scratch.txt").write_text("scratch", encoding="utf-8")
 
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
 
     assert store.path(EVENTS).read_text(encoding="utf-8") == ""
     assert store.path(LOG).read_text(encoding="utf-8") == ""
@@ -431,7 +1037,9 @@ def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_p
     assert not (store.state_dir / "scratch.txt").exists()
 
 
-def test_resume_initialization_preserves_history_and_resets_runtime_files(tmp_path: Path) -> None:
+def test_resume_initialization_preserves_history_and_resets_runtime_files(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -473,11 +1081,15 @@ def test_resume_initialization_preserves_history_and_resets_runtime_files(tmp_pa
     assert not (store.state_dir / "scratch_dir").exists()
 
 
-def test_archive_completed_run_copies_task_and_report_after_completion(tmp_path: Path) -> None:
+def test_archive_completed_run_copies_task_and_report_after_completion(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh"
+    )
 
     store.write_final_report("first report\n")
     run1 = store.archive_completed_run(task)
@@ -491,7 +1103,9 @@ def test_archive_completed_run_copies_task_and_report_after_completion(tmp_path:
     assert (run2 / "FINAL_REPORT.md").read_text(encoding="utf-8") == "second report\n"
 
 
-def test_controller_event_sequence_starts_at_one_when_events_are_empty(tmp_path: Path) -> None:
+def test_controller_event_sequence_starts_at_one_when_events_are_empty(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
 
@@ -499,6 +1113,7 @@ def test_controller_event_sequence_starts_at_one_when_events_are_empty(tmp_path:
     controller.initialize_state()
 
     assert controller._sequence == 0
+    assert controller.store.get_bello_config().task_path == str(task.resolve())
 
     controller._append_event(AppEventSource.SYSTEM, "test/new")
 
@@ -511,9 +1126,15 @@ def test_controller_event_sequence_continues_existing_events(tmp_path: Path) -> 
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
-    store.append_event(AppEvent(sequence=7, source=AppEventSource.SYSTEM, event_type="old"))
-    store.append_event(AppEvent(sequence=42, source=AppEventSource.SYSTEM, event_type="newer"))
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
+    store.append_event(
+        AppEvent(sequence=7, source=AppEventSource.SYSTEM, event_type="old")
+    )
+    store.append_event(
+        AppEvent(sequence=42, source=AppEventSource.SYSTEM, event_type="newer")
+    )
 
     controller = BelloController(tmp_path, task_path=task)
     controller.initialize_state()
@@ -531,20 +1152,33 @@ def test_final_report_rendering(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
-    store.write_final_report(FinalReport(task_path=str(task), status="complete", result="done", files_changed=["a.py"]))
+    store.write_final_report(
+        FinalReport(
+            task_path=str(task),
+            status="complete",
+            result="done",
+            files_changed=["a.py"],
+        )
+    )
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "# Final Report" in text
     assert "- a.py" in text
 
 
-async def test_final_report_non_git_omits_git_usage_and_includes_validations(tmp_path: Path) -> None:
+async def test_final_report_non_git_omits_git_usage_and_includes_validations(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
@@ -552,9 +1186,17 @@ async def test_final_report_non_git_omits_git_usage_and_includes_validations(tmp
     controller.store = store
     controller.use_git_diff = True
     controller.validations = [
-        ValidationRun(command="pytest -q", exit_code=0, passed=True, summary="command completed: pytest -q exit=0", sequence=1)
+        ValidationRun(
+            command="pytest -q",
+            exit_code=0,
+            passed=True,
+            summary="command completed: pytest -q exit=0",
+            sequence=1,
+        )
     ]
-    controller.observed_changed_files = {"cron.py": ChangedFile(path="cron.py", status="modified")}
+    controller.observed_changed_files = {
+        "cron.py": ChangedFile(path="cron.py", status="modified")
+    }
     controller.tui = _FakeTUI()
     controller.running = True
 
@@ -577,7 +1219,9 @@ async def test_final_report_non_git_omits_git_usage_and_includes_validations(tmp
     assert sorted(path.name for path in store.path(PREVIOUS_RUNS).iterdir()) == ["run1"]
 
 
-async def test_finalize_applies_accepted_snapshot_patch_to_real_workspace(tmp_path: Path) -> None:
+async def test_finalize_applies_accepted_snapshot_patch_to_real_workspace(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     controller.use_git_diff = True
     source = tmp_path / "app.py"
@@ -589,7 +1233,9 @@ async def test_finalize_applies_accepted_snapshot_patch_to_real_workspace(tmp_pa
     controller.workspace_task_path = snapshot.task_path
     (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
 
-    await controller.finalize("task complete", status=BelloStatus.COMPLETE, completion_review_accepted=True)
+    await controller.finalize(
+        "task complete", status=BelloStatus.COMPLETE, completion_review_accepted=True
+    )
 
     assert source.read_text(encoding="utf-8") == "value = 2\n"
     assert not snapshot.temp_root.exists()
@@ -597,7 +1243,9 @@ async def test_finalize_applies_accepted_snapshot_patch_to_real_workspace(tmp_pa
     assert "- app.py" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
 
 
-async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_rejected(tmp_path: Path) -> None:
+async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_rejected(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     controller.use_git_diff = True
     snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
@@ -607,7 +1255,9 @@ async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_reje
     controller.workspace_task_path = snapshot.task_path
     (snapshot.snapshot_root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
 
-    await controller.finalize("task complete", status=BelloStatus.COMPLETE, completion_review_accepted=True)
+    await controller.finalize(
+        "task complete", status=BelloStatus.COMPLETE, completion_review_accepted=True
+    )
 
     assert not (tmp_path / ".env").exists()
     assert not snapshot.temp_root.exists()
@@ -624,7 +1274,9 @@ async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_reje
     assert "snapshot preserved" in report
 
 
-async def test_noncomplete_run_preserves_workspace_without_applying_it(tmp_path: Path) -> None:
+async def test_noncomplete_run_preserves_workspace_without_applying_it(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     source = tmp_path / "app.py"
     source.write_text("value = 1\n", encoding="utf-8")
@@ -644,10 +1296,14 @@ async def test_noncomplete_run_preserves_workspace_without_applying_it(tmp_path:
     assert not (recovery_workspace / ".git").exists()
     assert not (recovery_workspace / ".supervisor").exists()
     assert store.get_bello_config().status == BelloStatus.EXITED
-    assert str(recovery_workspace) in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert str(recovery_workspace) in store.path(FINAL_REPORT).read_text(
+        encoding="utf-8"
+    )
 
 
-async def test_preflight_failure_cleans_unused_snapshot_without_recovery(tmp_path: Path) -> None:
+async def test_preflight_failure_cleans_unused_snapshot_without_recovery(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
     controller._coder_snapshot = snapshot
@@ -674,12 +1330,17 @@ def test_task_integrity_detects_replaced_snapshot_link(tmp_path: Path) -> None:
         snapshot.task_path.unlink()
         snapshot.task_path.write_text("weakened\n", encoding="utf-8")
 
-        assert controller._task_integrity_issue() == "the coder workspace replaced or removed the read-only task link"
+        assert (
+            controller._task_integrity_issue()
+            == "the coder workspace replaced or removed the read-only task link"
+        )
     finally:
         snapshot.cleanup()
 
 
-async def test_runtime_git_inspection_waits_for_trusted_snapshot_config(tmp_path: Path) -> None:
+async def test_runtime_git_inspection_waits_for_trusted_snapshot_config(
+    tmp_path: Path,
+) -> None:
     controller, _store, _ = _runtime_controller(tmp_path)
     snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
     controller._coder_snapshot = snapshot
@@ -779,7 +1440,9 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
             summary="command completed: pytest tests/test_user.py::test_sends_email -k sends exit=0",
         ),
         sequence=13,
-        item={"stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"},
+        item={
+            "stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"
+        },
     )
     filtered_same_identity = _validation_from_action(
         TriggeringAction(
@@ -790,7 +1453,9 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
             summary="command completed: pytest tests/test_user.py::test_sends_email -k sends exit=0",
         ),
         sequence=99,
-        item={"stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"},
+        item={
+            "stdout": "tests/test_user.py::test_sends_email PASSED\n1 passed in 0.01s\n"
+        },
     )
     broad_pytest = _validation_from_action(
         TriggeringAction(
@@ -801,7 +1466,9 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
             summary="command completed: pytest broad target exit=0",
         ),
         sequence=15,
-        item={"stdout": "============================= 155 passed in 5.45s =============================\n"},
+        item={
+            "stdout": "============================= 155 passed in 5.45s =============================\n"
+        },
     )
     broad_pytest_without_output = _validation_from_action(
         TriggeringAction(
@@ -844,7 +1511,9 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
             summary="command completed: /bin/bash -lc ./run_visible_tests.sh exit=0",
         ),
         sequence=16,
-        item={"stdout": "============================= 45 passed in 0.06s =============================\n"},
+        item={
+            "stdout": "============================= 45 passed in 0.06s =============================\n"
+        },
     )
     direct_visible_script = _validation_from_action(
         TriggeringAction(
@@ -855,7 +1524,9 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
             summary="command completed: ./run_visible_tests.sh exit=0",
         ),
         sequence=17,
-        item={"stdout": "============================= 45 passed in 0.06s =============================\n"},
+        item={
+            "stdout": "============================= 45 passed in 0.06s =============================\n"
+        },
     )
     absolute_go_test = _validation_from_action(
         TriggeringAction(
@@ -869,7 +1540,10 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
         item={"result": {"stdout": "ok github.com/example/project/core 0.02s\n"}},
     )
 
-    assert all(run is not None and run.type == "static" and run.outcome == "pass" for run in static_runs)
+    assert all(
+        run is not None and run.type == "static" and run.outcome == "pass"
+        for run in static_runs
+    )
     assert behavioral is not None
     assert behavioral.type == "behavioral"
     assert behavioral.outcome == "pass"
@@ -889,8 +1563,13 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert filtered_same_identity is not None
     assert filtered.validation_id.startswith("validation-")
     assert filtered.validation_id == filtered_same_identity.validation_id
-    assert filtered.raw_command == "pytest tests/test_user.py::test_sends_email -k sends"
-    assert filtered.normalized_command == "pytest tests/test_user.py::test_sends_email -k sends"
+    assert (
+        filtered.raw_command == "pytest tests/test_user.py::test_sends_email -k sends"
+    )
+    assert (
+        filtered.normalized_command
+        == "pytest tests/test_user.py::test_sends_email -k sends"
+    )
     assert filtered.trusted_validation_outcome == "passed"
     assert filtered.was_filtered is True
     assert "tests/test_user.py::test_sends_email" in filtered.executed_test_names
@@ -914,10 +1593,7 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert broad_pytest_without_output.executed_test_files == []
     assert broad_pytest_without_output.passed_count is None
     assert broad_pytest_without_output.failed_count is None
-    assert direct_script is not None
-    assert direct_script.type == "behavior_demo"
-    assert direct_script.captured_output == "hello world\n"
-    assert direct_script.validation_id.startswith("validation-")
+    assert direct_script is None
     assert python_unittest is not None
     assert python_unittest.type == "behavioral"
     assert python_unittest.trusted_validation_outcome == "passed"
@@ -934,17 +1610,34 @@ def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
     assert absolute_go_test.type == "behavioral"
     assert absolute_go_test.passed is True
     assert "github.com/example/project/core" in absolute_go_test.captured_output
-    assert _has_passing_behavioral_validation([*static_runs, behavioral, zero_tests, filtered, direct_script, shell_visible_script, direct_visible_script, absolute_go_test])
+    assert _has_passing_behavioral_validation(
+        [
+            *static_runs,
+            behavioral,
+            zero_tests,
+            filtered,
+            shell_visible_script,
+            direct_visible_script,
+            absolute_go_test,
+        ]
+    )
 
 
-async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
+async def test_command_output_delta_is_attached_to_validation_ledger(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
         AppServerMessage(
             {
                 "method": "item/commandExecution/outputDelta",
-                "params": {"threadId": "thread", "turnId": "turn", "itemId": "cmd-1", "delta": "hello "},
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "cmd-1",
+                    "delta": "tests/test_app.py::test_smoke ",
+                },
             }
         )
     )
@@ -952,7 +1645,12 @@ async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: P
         AppServerMessage(
             {
                 "method": "item/commandExecution/outputDelta",
-                "params": {"threadId": "thread", "turnId": "turn", "itemId": "cmd-1", "delta": {"text": "world\n"}},
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "cmd-1",
+                    "delta": {"text": "PASSED\n1 passed in 0.01s\n"},
+                },
             }
         )
     )
@@ -966,7 +1664,7 @@ async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: P
                     "itemId": "cmd-1",
                     "item": {
                         "type": "commandExecution",
-                        "command": "python3 hello.py",
+                        "command": "pytest tests/test_app.py",
                         "exitCode": 0,
                         "status": "completed",
                     },
@@ -979,22 +1677,159 @@ async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: P
 
     assert len(controller.validations) == 1
     validation = controller.validations[0]
-    assert validation.command == "python3 hello.py"
-    assert validation.type == "behavior_demo"
+    assert validation.command == "pytest tests/test_app.py"
+    assert validation.type == "behavioral"
     assert validation.passed is True
-    assert "hello world" in validation.summary
-    assert validation.captured_output == "hello world\n"
+    assert "test_smoke PASSED" in validation.summary
+    assert validation.captured_output == (
+        "tests/test_app.py::test_smoke PASSED\n1 passed in 0.01s\n"
+    )
     assert controller._command_output_chunks == {}
 
 
-async def test_camelcase_stdout_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
+async def test_live_completion_item_notification_is_captured_as_reviewer_evidence(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
+    agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+    agent.completion_thread_id = "completion-thread"
+    controller = BelloController.__new__(BelloController)
+    controller.project_root = tmp_path
+    controller.workspace_root = tmp_path
+    controller.store = store
+    controller.supervisor = None
+    controller.completion_supervisor = agent
+    controller.event_queue = asyncio.Queue()
+    controller._command_output_chunks = {}
+    controller.completion_reviewer_evidence = []
+
+    await controller._on_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "completion-thread",
+                    "turnId": "completion-turn",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "read-source",
+                        "command": "/bin/zsh -lc 'cat src/app.py'",
+                        "cwd": str(tmp_path),
+                        "status": "completed",
+                        "commandActions": [
+                            {
+                                "type": "read",
+                                "path": str(source),
+                                "name": "src/app.py",
+                            }
+                        ],
+                        "aggregatedOutput": "value = 1\n",
+                        "exitCode": 0,
+                    },
+                },
+            }
+        )
+    )
+
+    assert [item["id"] for item in agent.last_completion_review_items] == [
+        "read-source"
+    ]
+    controller._record_completion_reviewer_evidence(
+        agent.last_completion_review_items,
+        workspace_state_id="workspace-state",
+    )
+    assert len(controller.completion_reviewer_evidence) == 1
+    evidence = controller.completion_reviewer_evidence[0]
+    assert evidence.paths == ("src/app.py",)
+    assert evidence.passed is True
+    assert evidence.observed_output is True
+
+
+async def test_live_completion_delta_is_captured_before_item_queue_processing(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
+    agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
+    agent.completion_thread_id = "completion-thread"
+    controller = BelloController.__new__(BelloController)
+    controller.project_root = tmp_path
+    controller.workspace_root = tmp_path
+    controller.store = store
+    controller.supervisor = None
+    controller.completion_supervisor = agent
+    controller.event_queue = asyncio.Queue()
+    controller._command_output_chunks = {}
+
+    await controller._on_notification(
+        AppServerMessage(
+            {
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": "completion-thread",
+                    "turnId": "completion-turn",
+                    "itemId": "read-source",
+                    "delta": "value = 1\n",
+                },
+            }
+        )
+    )
+    await controller._on_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "completion-thread",
+                    "turnId": "completion-turn",
+                    "itemId": "read-source",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "read-source",
+                        "command": "cat src/app.py",
+                        "cwd": str(tmp_path),
+                        "exitCode": 0,
+                    },
+                },
+            }
+        )
+    )
+
+    assert controller.event_queue.qsize() == 2
+    assert controller._command_output_chunks == {}
+    assert len(agent.last_completion_review_items) == 1
+    assert agent.last_completion_review_items[0]["output"] == "value = 1\n"
+
+
+async def test_camelcase_stdout_delta_is_attached_to_validation_ledger(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
         AppServerMessage(
             {
                 "method": "item/commandExecution/stdoutDelta",
-                "params": {"threadId": "thread", "turnId": "turn", "itemId": "cmd-1", "stdout": "ok pkg/a 0.01s\n"},
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "cmd-1",
+                    "stdout": "ok pkg/a 0.01s\n",
+                },
             }
         )
     )
@@ -1026,7 +1861,9 @@ async def test_camelcase_stdout_delta_is_attached_to_validation_ledger(tmp_path:
     assert "ok pkg/a" in validation.summary
 
 
-async def test_command_aggregated_output_is_attached_to_validation_ledger(tmp_path: Path) -> None:
+async def test_command_aggregated_output_is_attached_to_validation_ledger(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -1039,11 +1876,11 @@ async def test_command_aggregated_output_is_attached_to_validation_ledger(tmp_pa
                     "itemId": "cmd-1",
                     "item": {
                         "type": "commandExecution",
-                        "command": "python3 hello.py",
+                        "command": "pytest tests/test_app.py",
                         "cwd": str(tmp_path),
                         "exitCode": 0,
                         "status": "completed",
-                        "aggregatedOutput": "Hello world\n",
+                        "aggregatedOutput": "tests/test_app.py::test_smoke PASSED\n1 passed in 0.01s\n",
                     },
                 },
             }
@@ -1052,11 +1889,13 @@ async def test_command_aggregated_output_is_attached_to_validation_ledger(tmp_pa
 
     assert len(controller.validations) == 1
     validation = controller.validations[0]
-    assert validation.command == "python3 hello.py"
-    assert validation.type == "behavior_demo"
+    assert validation.command == "pytest tests/test_app.py"
+    assert validation.type == "behavioral"
     assert validation.passed is True
-    assert validation.captured_output == "Hello world\n"
-    assert "Hello world" in validation.summary
+    assert validation.captured_output == (
+        "tests/test_app.py::test_smoke PASSED\n1 passed in 0.01s\n"
+    )
+    assert "test_smoke PASSED" in validation.summary
 
 
 def test_readiness_marker_detection_requires_own_exact_line() -> None:
@@ -1065,7 +1904,9 @@ def test_readiness_marker_detection_requires_own_exact_line() -> None:
     assert not _has_readiness_marker("bello_ready_for_review")
     assert _has_malformed_readiness_marker("bello_ready_for_review")
     assert _has_malformed_readiness_marker("BELLO READY FOR REVIEW")
-    assert not _has_malformed_readiness_marker("I am not emitting `BELLO_READY_FOR_REVIEW`.")
+    assert not _has_malformed_readiness_marker(
+        "I am not emitting `BELLO_READY_FOR_REVIEW`."
+    )
 
 
 async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) -> None:
@@ -1073,7 +1914,9 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
 
@@ -1081,6 +1924,14 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
         def __init__(self) -> None:
             self.agent = StatelessSupervisorAgent(None, store, task)  # type: ignore[arg-type]
             self.completion_packets = []
+            self.last_completion_review_items = [
+                {
+                    "type": "commandExecution",
+                    "command": "cat TASK.md",
+                    "exitCode": 0,
+                    "output": "# Task",
+                }
+            ]
 
         def build_packet(self, **kwargs):
             packet = self.agent.build_packet(**kwargs)
@@ -1094,8 +1945,21 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
             return CompletionReviewDecision(
                 decision="accept",
                 reason="fresh behavioral validation covers the task",
+                decision_artifact={
+                    "current_state": "task behavior is implemented and validation passes",
+                    "resolved_concerns": [],
+                    "stale_concerns": [],
+                    "uncovered_edge_candidates": [],
+                    "actionable_gap_or_none": None,
+                },
                 files_reviewed=[
-                    {"path": "TASK.md", "reason": "task contract", "kind": "other", "inspected": True, "limitation": None}
+                    {
+                        "path": "TASK.md",
+                        "reason": "task contract",
+                        "kind": "other",
+                        "inspected": True,
+                        "limitation": None,
+                    }
                 ],
                 behavior_evidence_matrix=[
                     {
@@ -1122,6 +1986,13 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
                 claim_evidence_mismatches=[],
                 packet_or_access_limitations=[],
                 changed_test_risks=[],
+                behavior_surface=[
+                    {
+                        "category": "task-required behavior",
+                        "status": "required",
+                        "note": None,
+                    }
+                ],
                 message_to_coder=None,
                 persistent_decision=None,
                 progress_update="Completion review accepted final readiness.",
@@ -1144,7 +2015,18 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
         sequence=1,
     )
     controller.validations = [
-        ValidationRun(command="pytest", exit_code=0, passed=True, summary="passed", sequence=1)
+        ValidationRun(
+            command="pytest",
+            exit_code=0,
+            passed=True,
+            summary="passed",
+            sequence=1,
+            product_state_id=_review_behavioral_product_state_id(
+                tmp_path,
+                [],
+                task_contents=task.read_text(encoding="utf-8"),
+            ),
+        )
     ]
     controller.prior_interventions = []
     controller.observed_changed_files = {}
@@ -1169,16 +2051,27 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
     await controller._supervisor_task
 
     assert len(fake.completion_packets) == 1
-    assert fake.completion_packets[0].last_coder_message.text.endswith("BELLO_READY_FOR_REVIEW")
+    assert fake.completion_packets[0].last_coder_message.text.endswith(
+        "BELLO_READY_FOR_REVIEW"
+    )
     assert store.get_bello_config().status == BelloStatus.COMPLETE
-    assert "accepted by completion_review" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "accepted by completion_review" in store.path(FINAL_REPORT).read_text(
+        encoding="utf-8"
+    )
 
 
-async def test_summary_done_without_marker_steers_for_exact_marker_not_completion(tmp_path: Path) -> None:
+async def test_summary_done_without_marker_steers_for_exact_marker_not_completion(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
+        overwrite=True,
+    )
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -1195,7 +2088,9 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     controller.supervisor = None
     controller.coder = FakeCoder()
     controller.pending_approvals = {}
-    controller.last_coder_message = CoderMessage(text="All tests pass. Done.", sequence=1)
+    controller.last_coder_message = CoderMessage(
+        text="All tests pass. Done.", sequence=1
+    )
     controller.validations = []
     controller.prior_interventions = []
     controller.observed_changed_files = {}
@@ -1217,11 +2112,18 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     assert store.get_bello_config().status == BelloStatus.STARTING
 
 
-async def test_material_limitation_without_marker_escalates_instead_of_marker_nudge(tmp_path: Path) -> None:
+async def test_material_limitation_without_marker_escalates_instead_of_marker_nudge(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
+        overwrite=True,
+    )
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -1277,14 +2179,20 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
     assert store.get_bello_config().status == BelloStatus.ESCALATED
     assert controller.coder.messages == []
     assert controller.coder.interrupted is True
-    assert "Coder reported material limitation" in store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "material validation limitation" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "Coder reported material limitation" in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
+    assert "material validation limitation" in store.path(FINAL_REPORT).read_text(
+        encoding="utf-8"
+    )
 
 
 async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
+        lambda cfg: cfg.model_copy(
+            update={"active_coder_turn_id": None, "last_event_sequence": 17}
+        )
     )
 
     await controller._handle_no_marker_idle()
@@ -1292,22 +2200,30 @@ async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> N
 
     assert len(fake.completion_packets) == 1
     assert controller.completion_returns[0].reason == "not used"
-    assert "Controller forcing completion_review" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Controller forcing completion_review" in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
 
     await controller._handle_no_marker_idle()
 
     assert len(fake.completion_packets) == 1
 
 
-async def test_marker_with_completion_review_disabled_finalizes_without_review(tmp_path: Path) -> None:
+async def test_marker_with_completion_review_disabled_finalizes_without_review(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"completion_review_enabled": False})
+    )
     controller.last_coder_message = CoderMessage(
         text="Summary: done\nValidation: pytest\nBELLO_READY_FOR_REVIEW",
         sequence=1,
     )
     controller.validations = [
-        ValidationRun(command="pytest", exit_code=0, passed=True, summary="passed", sequence=1)
+        ValidationRun(
+            command="pytest", exit_code=0, passed=True, summary="passed", sequence=1
+        )
     ]
 
     await controller._handle_coder_turn_completed(item_id="message-item")
@@ -1319,18 +2235,27 @@ async def test_marker_with_completion_review_disabled_finalizes_without_review(t
     assert "- Completion review accepted: false" in report
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "completion review is disabled by config" in progress
-    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
-    assert any(event["event_type"] == "completion/review_disabled_finalize" for event in events)
+    events = [
+        json.loads(line)
+        for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event["event_type"] == "completion/review_disabled_finalize" for event in events
+    )
 
 
-async def test_completion_review_cli_override_beats_persisted_config(tmp_path: Path) -> None:
+async def test_completion_review_cli_override_beats_persisted_config(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
 
     controller.completion_review = False
     assert controller._effective_completion_review() is False
 
     controller.completion_review = True
-    store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"completion_review_enabled": False})
+    )
     assert controller._effective_completion_review() is True
 
     controller.completion_review = None
@@ -1342,18 +2267,26 @@ async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -
     controller.adversary_enabled = True
     controller.adversary_runs = None
     store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "completion_review_enabled": False})
+        lambda cfg: cfg.model_copy(
+            update={"max_adversary_runs": 2, "completion_review_enabled": False}
+        )
     )
 
     assert controller._effective_max_adversary_runs() == 0
     assert controller._adversary_model_required_for_preflight() is False
 
 
-async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_path: Path) -> None:
+async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     store.update_bello_config(
         lambda cfg: cfg.model_copy(
-            update={"active_coder_turn_id": None, "last_event_sequence": 17, "completion_review_enabled": False}
+            update={
+                "active_coder_turn_id": None,
+                "last_event_sequence": 17,
+                "completion_review_enabled": False,
+            }
         )
     )
 
@@ -1381,7 +2314,9 @@ def test_runtime_supervisor_schema_rejects_complete() -> None:
 def test_validation_freshness_summary_marks_stale_behavioral_pass() -> None:
     summary = _validation_freshness_summary(
         validations=[
-            ValidationRun(command="pytest", exit_code=0, passed=True, summary="passed", sequence=5),
+            ValidationRun(
+                command="pytest", exit_code=0, passed=True, summary="passed", sequence=5
+            ),
         ],
         changed_files=[ChangedFile(path="app.py", status="modified", sequence=8)],
     )
@@ -1389,7 +2324,9 @@ def test_validation_freshness_summary_marks_stale_behavioral_pass() -> None:
     assert "behavioral validation is stale" in summary
 
 
-async def test_runtime_noop_action_skips_supervisor_and_records_trace(tmp_path: Path) -> None:
+async def test_runtime_noop_action_skips_supervisor_and_records_trace(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -1412,7 +2349,9 @@ async def test_runtime_noop_action_skips_supervisor_and_records_trace(tmp_path: 
     )
 
     assert fake.runtime_packets == []
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert trace["skipped_noop"] is True
     assert trace["should_wake_runtime_supervisor"] is False
     metrics = json.loads(store.path(RUNTIME_METRICS).read_text(encoding="utf-8"))
@@ -1443,7 +2382,9 @@ async def test_runtime_nonzero_action_wakes_supervisor(tmp_path: Path) -> None:
 
     assert len(fake.runtime_packets) == 1
     assert fake.runtime_packets[0].triggering_action.exit_code == 1
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert trace["should_wake_runtime_supervisor"] is True
     assert "nonzero_exit" in trace["trigger_reasons"]
 
@@ -1472,7 +2413,9 @@ async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
     await controller._supervisor_task
 
     assert len(fake.runtime_packets) == 1
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert "restart_budget" in trace["trigger_reasons"]
 
 
@@ -1551,12 +2494,22 @@ def _runtime_unresolved_validation(
     )
 
 
-def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_reason() -> None:
-    first = _runtime_failure_validation(sequence=1, output="AssertionError: expected 1, got 2")
-    different = _runtime_failure_validation(sequence=2, output="ValueError: malformed header")
+def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_reason() -> (
+    None
+):
+    first = _runtime_failure_validation(
+        sequence=1, output="AssertionError: expected 1, got 2"
+    )
+    different = _runtime_failure_validation(
+        sequence=2, output="ValueError: malformed header"
+    )
 
-    first_issue = _runtime_restart_issue(_runtime_validation_packet(first, wake_sequence=1))
-    different_issue = _runtime_restart_issue(_runtime_validation_packet(different, wake_sequence=2))
+    first_issue = _runtime_restart_issue(
+        _runtime_validation_packet(first, wake_sequence=1)
+    )
+    different_issue = _runtime_restart_issue(
+        _runtime_validation_packet(different, wake_sequence=2)
+    )
 
     assert first_issue is not None
     assert different_issue is not None
@@ -1580,10 +2533,14 @@ def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_re
     )
 
     masked_a_issue = _runtime_restart_issue(
-        _runtime_validation_packet(masked_a, wake_sequence=3, reason="masked_validation")
+        _runtime_validation_packet(
+            masked_a, wake_sequence=3, reason="masked_validation"
+        )
     )
     masked_b_issue = _runtime_restart_issue(
-        _runtime_validation_packet(masked_b, wake_sequence=4, reason="masked_validation")
+        _runtime_validation_packet(
+            masked_b, wake_sequence=4, reason="masked_validation"
+        )
     )
 
     assert masked_a_issue is not None
@@ -1591,7 +2548,9 @@ def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_re
     assert masked_a_issue.key == masked_b_issue.key
 
 
-def test_runtime_restart_issue_groups_nested_shells_for_same_unresolved_command() -> None:
+def test_runtime_restart_issue_groups_nested_shells_for_same_unresolved_command() -> (
+    None
+):
     direct = _runtime_unresolved_validation(
         sequence=1,
         command="/bin/bash -lc ./compile.sh",
@@ -1608,8 +2567,12 @@ def test_runtime_restart_issue_groups_nested_shells_for_same_unresolved_command(
         validation_id="validation-different",
     )
 
-    direct_issue = _runtime_restart_issue(_runtime_validation_packet(direct, wake_sequence=1))
-    nested_issue = _runtime_restart_issue(_runtime_validation_packet(nested, wake_sequence=2))
+    direct_issue = _runtime_restart_issue(
+        _runtime_validation_packet(direct, wake_sequence=1)
+    )
+    nested_issue = _runtime_restart_issue(
+        _runtime_validation_packet(nested, wake_sequence=2)
+    )
     different_issue = _runtime_restart_issue(
         _runtime_validation_packet(different, wake_sequence=3)
     )
@@ -1668,7 +2631,9 @@ def test_runtime_restart_issue_carries_active_failure_across_turn_completion() -
     )
     unrelated_wake = _runtime_restart_issue(
         packet.model_copy(
-            update={"current_summary": "Runtime integrity trigger: runtime links restored."}
+            update={
+                "current_summary": "Runtime integrity trigger: runtime links restored."
+            }
         ),
         active_issue_key=active.key,
         active_issue_last_sequence=first.sequence,
@@ -1707,7 +2672,9 @@ def test_runtime_event_issue_ignores_optional_file_change_action_metadata() -> N
         }
     )
     different_path = with_action.model_copy(
-        update={"changed_files": [ChangedFile(path="src/lexer.py", status="M", sequence=24)]}
+        update={
+            "changed_files": [ChangedFile(path="src/lexer.py", status="M", sequence=24)]
+        }
     )
 
     base_issue = _runtime_restart_issue(base)
@@ -1737,7 +2704,9 @@ async def test_runtime_restart_gate_counts_rejected_restart_as_steering_and_igno
     controller.coder = coder
     restarts: list[tuple[str, RestartHandoff | None]] = []
 
-    async def capture_restart(reason: str, *, handoff: RestartHandoff | None = None) -> None:
+    async def capture_restart(
+        reason: str, *, handoff: RestartHandoff | None = None
+    ) -> None:
         restarts.append((reason, handoff))
 
     controller.restart = capture_restart  # type: ignore[method-assign]
@@ -1797,9 +2766,13 @@ async def test_runtime_restart_gate_counts_rejected_restart_as_steering_and_igno
     assert progress.count("Restart requested for the repeated validation failure.") == 1
 
 
-def test_trusted_pass_clears_only_matching_runtime_restart_issue(tmp_path: Path) -> None:
+def test_trusted_pass_clears_only_matching_runtime_restart_issue(
+    tmp_path: Path,
+) -> None:
     controller, store, _fake = _runtime_controller(tmp_path)
-    failed = _runtime_failure_validation(sequence=1, output="AssertionError: expected 1, got 2")
+    failed = _runtime_failure_validation(
+        sequence=1, output="AssertionError: expected 1, got 2"
+    )
     issue = _runtime_restart_issue(_runtime_validation_packet(failed, wake_sequence=1))
     assert issue is not None
     controller._record_runtime_intervention(
@@ -1835,7 +2808,9 @@ def test_trusted_pass_clears_unresolved_issue_through_equivalent_shell_wrapper(
         command="/bin/bash -lc '/bin/bash -lc ./compile.sh'",
         validation_id="validation-nested",
     )
-    issue = _runtime_restart_issue(_runtime_validation_packet(unresolved, wake_sequence=1))
+    issue = _runtime_restart_issue(
+        _runtime_validation_packet(unresolved, wake_sequence=1)
+    )
     assert issue is not None
     controller._record_runtime_intervention(
         reason="build did not execute",
@@ -1876,7 +2851,9 @@ def test_trusted_pass_clears_unresolved_issue_through_equivalent_shell_wrapper(
         "unknown_signal",
     ],
 )
-async def test_quality_runtime_wake_can_be_filtered_by_cheap_runtime(tmp_path: Path, reason: str) -> None:
+async def test_quality_runtime_wake_can_be_filtered_by_cheap_runtime(
+    tmp_path: Path, reason: str
+) -> None:
     controller, _store, fake = _runtime_controller(tmp_path)
     cheap = _CheapRuntimeNoopReviewer()
     controller.runtime_triage_reviewer = cheap
@@ -1906,7 +2883,9 @@ def test_cheap_runtime_switch_reads_persisted_runtime_config(tmp_path: Path) -> 
     controller, store, _fake = _runtime_controller(tmp_path)
     assert controller._cheap_runtime_enabled() is True
 
-    store.update_bello_config(lambda cfg: cfg.model_copy(update={"cheap_runtime": False}))
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"cheap_runtime": False})
+    )
 
     assert controller._cheap_runtime_enabled() is False
 
@@ -1919,7 +2898,9 @@ def test_cheap_runtime_switch_reads_persisted_runtime_config(tmp_path: Path) -> 
         "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
     ],
 )
-async def test_mandatory_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path, summary: str) -> None:
+async def test_mandatory_runtime_wake_bypasses_cheap_runtime_noop(
+    tmp_path: Path, summary: str
+) -> None:
     controller, _store, fake = _runtime_controller(tmp_path)
     cheap = _CheapRuntimeNoopReviewer()
     controller.runtime_triage_reviewer = cheap
@@ -1938,7 +2919,9 @@ async def test_mandatory_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path
     assert len(fake.runtime_packets) == 1
 
 
-def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(tmp_path: Path) -> None:
+def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     read_only_action = TriggeringAction(
         kind="commandExecution",
@@ -1954,7 +2937,11 @@ def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(t
         status="completed",
         summary="command completed",
     )
-    changed_files = [ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)]
+    changed_files = [
+        ChangedFile(
+            path="src/app.py", status="M", additions=600, deletions=0, sequence=2
+        )
+    ]
 
     read_only = controller.should_wake_runtime_supervisor(
         action=read_only_action,
@@ -1974,7 +2961,11 @@ def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(t
     changed_signature = controller.should_wake_runtime_supervisor(
         action=execution_action,
         validation=None,
-        changed_files=[ChangedFile(path="src/app.py", status="M", additions=601, deletions=0, sequence=2)],
+        changed_files=[
+            ChangedFile(
+                path="src/app.py", status="M", additions=601, deletions=0, sequence=2
+            )
+        ],
     )
 
     assert read_only.should_wake is False
@@ -2000,7 +2991,13 @@ def test_suspicious_file_trigger_wakes_once_per_file_state(tmp_path: Path) -> No
         summary="command completed",
     )
     changed_files = [
-        ChangedFile(path="tests/test_parser.py", status="M", additions=1, deletions=1, sequence=2)
+        ChangedFile(
+            path="tests/test_parser.py",
+            status="M",
+            additions=1,
+            deletions=1,
+            sequence=2,
+        )
     ]
 
     first = controller.should_wake_runtime_supervisor(
@@ -2037,12 +3034,16 @@ def test_suspicious_file_trigger_wakes_once_per_file_state(tmp_path: Path) -> No
     assert changed_after_clean.reasons == ("suspicious_file_touched",)
 
 
-def test_unchanged_suspicious_file_does_not_hide_another_runtime_reason(tmp_path: Path) -> None:
+def test_unchanged_suspicious_file_does_not_hide_another_runtime_reason(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     test_path = tmp_path / "tests" / "test_parser.py"
     test_path.parent.mkdir()
     test_path.write_text("assert parse('a') == 1\n", encoding="utf-8")
-    changed_files = [ChangedFile(path="tests/test_parser.py", status="M", additions=1, deletions=0)]
+    changed_files = [
+        ChangedFile(path="tests/test_parser.py", status="M", additions=1, deletions=0)
+    ]
     successful_action = TriggeringAction(
         kind="commandExecution",
         command="python3 -c 'print(1)'",
@@ -2078,7 +3079,11 @@ def test_file_change_large_diff_noops_without_runtime_model(tmp_path: Path) -> N
             summary="file change completed: src/app.py",
         ),
         validation=None,
-        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
+        changed_files=[
+            ChangedFile(
+                path="src/app.py", status="M", additions=600, deletions=0, sequence=2
+            )
+        ],
     )
 
     assert decision.should_wake is False
@@ -2097,7 +3102,11 @@ def test_project_execution_large_diff_wakes_runtime_supervisor(tmp_path: Path) -
             summary="command completed",
         ),
         validation=None,
-        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
+        changed_files=[
+            ChangedFile(
+                path="src/app.py", status="M", additions=600, deletions=0, sequence=2
+            )
+        ],
     )
 
     assert decision.should_wake is True
@@ -2132,7 +3141,9 @@ def test_project_execution_nonzero_wakes_runtime_supervisor(tmp_path: Path) -> N
     assert decision.reasons == ("nonzero_exit",)
 
 
-def test_protected_runtime_reason_stays_visible_for_project_execution(tmp_path: Path) -> None:
+def test_protected_runtime_reason_stays_visible_for_project_execution(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     decision = controller.should_wake_runtime_supervisor(
@@ -2152,7 +3163,9 @@ def test_protected_runtime_reason_stays_visible_for_project_execution(tmp_path: 
     assert decision.reasons == ("repeated_same_failing_validation", "nonzero_exit")
 
 
-def test_unresolved_masked_validation_still_wakes_for_project_execution(tmp_path: Path) -> None:
+def test_unresolved_masked_validation_still_wakes_for_project_execution(
+    tmp_path: Path,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     controller.validation_runtime_state = {
         "validation-old": {
@@ -2179,7 +3192,11 @@ def test_unresolved_masked_validation_still_wakes_for_project_execution(tmp_path
             trusted_validation_outcome="passed",
             sequence=4,
         ),
-        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=3)],
+        changed_files=[
+            ChangedFile(
+                path="src/app.py", status="M", additions=600, deletions=0, sequence=3
+            )
+        ],
     )
 
     assert decision.should_wake is True
@@ -2193,13 +3210,17 @@ def test_read_only_action_does_not_wake_only_for_restart_budget(tmp_path: Path) 
     decision = controller.should_wake_runtime_supervisor(
         action=TriggeringAction(
             kind="commandExecution",
-            command="rg -n \"TODO\" src",
+            command='rg -n "TODO" src',
             exit_code=1,
             status="completed",
             summary="command completed",
         ),
         validation=None,
-        changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
+        changed_files=[
+            ChangedFile(
+                path="src/app.py", status="M", additions=600, deletions=0, sequence=2
+            )
+        ],
     )
 
     assert decision.should_wake is False
@@ -2232,11 +3253,15 @@ async def test_masked_validation_wakes_and_is_not_trusted(tmp_path: Path) -> Non
     assert len(fake.runtime_packets) == 1
     assert controller.validations[0].trusted_validation_outcome == "masked_or_unknown"
     assert controller.validations[0].masking_reason == "pipeline_without_pipefail"
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert "masked_validation" in trace["trigger_reasons"]
 
 
-async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: Path) -> None:
+async def test_repeated_same_failing_validation_uses_command_identity(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     item = {
         "type": "commandExecution",
@@ -2247,23 +3272,42 @@ async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: 
     }
 
     await controller.handle_notification(
-        AppServerMessage({"method": "item/completed", "params": {"threadId": "thread", "itemId": "cmd-1", "item": item}})
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {"threadId": "thread", "itemId": "cmd-1", "item": item},
+            }
+        )
     )
     await controller._supervisor_task
     await controller.handle_notification(
-        AppServerMessage({"method": "item/completed", "params": {"threadId": "thread", "itemId": "cmd-2", "item": item}})
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {"threadId": "thread", "itemId": "cmd-2", "item": item},
+            }
+        )
     )
     await controller._supervisor_task
 
     assert len(fake.runtime_packets) == 2
-    assert controller.validations[0].validation_id == controller.validations[1].validation_id
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert (
+        controller.validations[0].validation_id
+        == controller.validations[1].validation_id
+    )
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert "repeated_same_failing_validation" in trace["trigger_reasons"]
 
 
-async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_path: Path) -> None:
+async def test_done_without_fresh_validation_wakes_runtime_not_completion(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    controller.last_coder_message = CoderMessage(text="Summary\nBELLO_READY_FOR_REVIEW", sequence=3)
+    controller.last_coder_message = CoderMessage(
+        text="Summary\nBELLO_READY_FOR_REVIEW", sequence=3
+    )
     controller.observed_changed_files = {
         "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=2)
     }
@@ -2284,33 +3328,116 @@ async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_pa
     assert len(fake.runtime_packets) == 1
     assert fake.completion_packets == []
     assert store.get_bello_config().last_relevant_edit_sequence == 2
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
 
 
-async def test_completion_packet_details_can_send_delta_after_return(tmp_path: Path) -> None:
+async def test_artifact_only_readiness_reaches_completion_for_direct_review(
+    tmp_path: Path,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    controller.task_path.write_text(
+        "# Create report.pdf with the requested layout", encoding="utf-8"
+    )
+    controller.observed_changed_files = {
+        "report.pdf": ChangedFile(path="report.pdf", status="M", sequence=2)
+    }
+    (tmp_path / "report.pdf").write_bytes(b"pdf")
+    controller.validations = []
+
+    assert await controller._done_without_fresh_behavioral_validation() is None
+
+
+async def test_generated_artifact_output_reaches_completion_for_direct_review(
+    tmp_path: Path,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    controller.task_path.write_text(
+        "# Create a polished PDF report with the requested layout", encoding="utf-8"
+    )
+    output = tmp_path / "build" / "final-report.pdf"
+    output.parent.mkdir()
+    output.write_bytes(b"pdf")
+    controller.observed_changed_files = {
+        "build/final-report.pdf": ChangedFile(
+            path="build/final-report.pdf", status="M", sequence=2
+        )
+    }
+    controller.validations = []
+
+    assert await controller._done_without_fresh_behavioral_validation() is None
+
+
+async def test_completion_packet_details_can_send_delta_after_return(
+    tmp_path: Path,
+) -> None:
     controller, _, _ = _runtime_controller(tmp_path)
     controller.validations = [
-        ValidationRun(command="pytest old.py", exit_code=0, passed=True, summary="old", sequence=1),
-        ValidationRun(command="pytest new.py", exit_code=0, passed=True, summary="new", sequence=5),
+        ValidationRun(
+            command="pytest old.py", exit_code=0, passed=True, summary="old", sequence=1
+        ),
+        ValidationRun(
+            command="pytest new.py", exit_code=0, passed=True, summary="new", sequence=5
+        ),
     ]
     changed_files = [
         ChangedFile(path="src/old.py", status="M", sequence=2),
         ChangedFile(path="src/new.py", status="M", sequence=6),
     ]
 
-    details = await controller.completion_packet_details(changed_files, since_sequence=3)
+    details = await controller.completion_packet_details(
+        changed_files, since_sequence=3
+    )
 
     assert [diff.path for diff in details["changed_file_diffs"]] == ["src/new.py"]
-    assert [validation.validation_id for validation in details["validation_outputs"]] == [
-        controller.validations[1].validation_id
-    ]
+    assert [
+        validation.validation_id for validation in details["validation_outputs"]
+    ] == [controller.validations[1].validation_id]
     assert details["completion_delta_evidence_summary"] == [
         (
             f"validation {controller.validations[1].validation_id} seq=5 "
             "type=behavioral outcome=passed command=pytest new.py"
         )
     ]
+
+
+async def test_completion_packet_details_use_filtered_evidence_view(
+    tmp_path: Path,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    raw = ValidationRun(
+        validation_id="validation-stale",
+        command="pytest",
+        exit_code=0,
+        passed=True,
+        summary="1 passed",
+        sequence=3,
+        product_state_id="old-state",
+    )
+    masked = raw.model_copy(
+        update={
+            "outcome": "fail",
+            "passed": False,
+            "trusted_validation_outcome": "masked_or_unknown",
+            "masking_reason": "stale_product_state",
+        }
+    )
+    controller.validations = [raw]
+
+    details = await controller.completion_packet_details(
+        [],
+        validations=[masked],
+        inspections=[],
+    )
+
+    assert len(details["validation_outputs"]) == 1
+    assert (
+        details["validation_outputs"][0].trusted_validation_outcome
+        == "masked_or_unknown"
+    )
+    assert details["validation_outputs"][0].passed is False
 
 
 def test_evidence_provenance_marks_changed_test_as_self_confirming() -> None:
@@ -2338,7 +3465,9 @@ def test_evidence_provenance_marks_changed_test_as_self_confirming() -> None:
     assert provenance.output_identifies_test_files is True
     assert provenance.coder_authored_test_files == ["tests/test_app_new.py"]
     assert provenance.untouched_executed_test_files == []
-    assert provenance.risk_reasons == ["all_output_identified_tests_were_coder_authored"]
+    assert provenance.risk_reasons == [
+        "all_output_identified_tests_were_coder_authored"
+    ]
 
 
 def test_evidence_provenance_canonicalizes_changed_tsx_test_reported_as_ts() -> None:
@@ -2355,20 +3484,32 @@ def test_evidence_provenance_canonicalizes_changed_tsx_test_reported_as_ts() -> 
             )
         ],
         changed_files=[
-            ChangedFile(path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2),
-            ChangedFile(path="src/components/DeviceDetailHeading-test.tsx", status="A", sequence=2),
+            ChangedFile(
+                path="src/components/DeviceDetailHeading.tsx", status="M", sequence=2
+            ),
+            ChangedFile(
+                path="src/components/DeviceDetailHeading-test.tsx",
+                status="A",
+                sequence=2,
+            ),
         ],
         latest_change_sequence=2,
     )
 
     provenance = summary.validations[0]
     assert provenance.independence_class == "self_confirming"
-    assert provenance.executed_test_files == ["src/components/DeviceDetailHeading-test.ts"]
-    assert provenance.coder_authored_test_files == ["src/components/DeviceDetailHeading-test.tsx"]
+    assert provenance.executed_test_files == [
+        "src/components/DeviceDetailHeading-test.ts"
+    ]
+    assert provenance.coder_authored_test_files == [
+        "src/components/DeviceDetailHeading-test.tsx"
+    ]
     assert provenance.untouched_executed_test_files == []
 
 
-def test_evidence_provenance_marks_untouched_output_identified_test_as_independent() -> None:
+def test_evidence_provenance_marks_untouched_output_identified_test_as_independent() -> (
+    None
+):
     summary = _evidence_provenance_summary(
         validations=[
             ValidationRun(
@@ -2383,7 +3524,10 @@ def test_evidence_provenance_marks_untouched_output_identified_test_as_independe
                     "tests/test_app_existing.py::test_requested_behavior PASSED\n"
                     "tests/test_app_new.py::test_requested_behavior PASSED\n2 passed\n"
                 ),
-                executed_test_files=["tests/test_app_existing.py", "tests/test_app_new.py"],
+                executed_test_files=[
+                    "tests/test_app_existing.py",
+                    "tests/test_app_new.py",
+                ],
                 sequence=4,
             )
         ],
@@ -2405,7 +3549,7 @@ def test_evidence_provenance_classifies_behavior_demo_output() -> None:
     summary = _evidence_provenance_summary(
         validations=[
             ValidationRun(
-                command="node -e \"console.log(render())\"",
+                command='node -e "console.log(render())"',
                 exit_code=0,
                 type="behavior_demo",
                 passed=True,
@@ -2423,7 +3567,7 @@ def test_evidence_provenance_classifies_behavior_demo_output() -> None:
                 sequence=4,
             ),
             ValidationRun(
-                command="node -e \"runJest()\"",
+                command='node -e "runJest()"',
                 exit_code=0,
                 type="behavior_demo",
                 passed=True,
@@ -2468,7 +3612,7 @@ def test_heredoc_script_command_is_behavior_demo_validation() -> None:
     assert validation.captured_output == "<button>Save</button>\n"
 
 
-def test_absolute_python_script_command_is_behavior_demo_validation() -> None:
+def test_unrelated_absolute_python_script_is_not_behavior_demo_validation() -> None:
     command = f"{sys.executable} targeted_validation.py"
     validation = _validation_from_action(
         TriggeringAction(
@@ -2483,10 +3627,7 @@ def test_absolute_python_script_command_is_behavior_demo_validation() -> None:
         changed_paths=["src/app.py"],
     )
 
-    assert validation is not None
-    assert validation.type == "behavior_demo"
-    assert validation.trusted_validation_outcome == "passed"
-    assert validation.captured_output == "actual=42 expected=42\n"
+    assert validation is None
 
 
 def test_marked_behavior_demo_command_gets_validation_but_echo_is_rejected() -> None:
@@ -2520,11 +3661,8 @@ def test_marked_behavior_demo_command_gets_validation_but_echo_is_rejected() -> 
     assert echo is None
 
 
-def test_marked_behavior_demo_allows_honest_shell_sequence() -> None:
-    command = (
-        "BELLO_BEHAVIOR_DEMO=1 bash -lc 'set -euo pipefail; "
-        "./bin/app --scenario smoke; printf \"scenario=smoke state=requested\\n\"'"
-    )
+def test_marked_behavior_demo_accepts_direct_observed_program_output() -> None:
+    command = "BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke"
 
     validation = _validation_from_action(
         TriggeringAction(
@@ -2588,10 +3726,10 @@ def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
     assert logical_or.masking_reason == "logical_or_may_mask_validation_failure"
     assert pipeline is not None
     assert pipeline.trusted_validation_outcome == "masked_or_unknown"
-    assert pipeline.masking_reason == "pipeline_without_pipefail"
+    assert pipeline.masking_reason == "behavior_demo_pipeline_may_transform_output"
     assert bare_pass is not None
     assert bare_pass.trusted_validation_outcome == "masked_or_unknown"
-    assert bare_pass.masking_reason == "behavior_demo_self_verdict_only"
+    assert bare_pass.masking_reason == "command_separator_may_mask_validation_failure"
 
 
 def test_validation_ledger_reads_aggregated_output_field() -> None:
@@ -2604,7 +3742,10 @@ def test_validation_ledger_reads_aggregated_output_field() -> None:
             summary="command completed",
         ),
         sequence=10,
-        item={"type": "commandExecution", "aggregatedOutput": "scenario=smoke state=requested\n"},
+        item={
+            "type": "commandExecution",
+            "aggregatedOutput": "scenario=smoke state=requested\n",
+        },
         changed_paths=["bin/app"],
     )
 
@@ -2624,7 +3765,10 @@ def test_command_output_aliases_are_attached_to_validation_ledger() -> None:
             summary="command completed",
         ),
         sequence=10,
-        item={"type": "commandExecution", "aggregated_output": "scenario=smoke state=requested\n"},
+        item={
+            "type": "commandExecution",
+            "aggregated_output": "scenario=smoke state=requested\n",
+        },
         changed_paths=["bin/app"],
     )
 
@@ -2720,7 +3864,9 @@ def test_supervisor_policy_has_no_specbench_split_triggers() -> None:
             assert token not in lowered
 
 
-def test_validation_output_prefers_test_runner_suite_files_over_stack_trace_paths() -> None:
+def test_validation_output_prefers_test_runner_suite_files_over_stack_trace_paths() -> (
+    None
+):
     validation = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -2742,7 +3888,9 @@ def test_validation_output_prefers_test_runner_suite_files_over_stack_trace_path
     )
 
     assert validation is not None
-    assert validation.executed_test_files == ["src/components/DeviceDetailHeading-test.ts"]
+    assert validation.executed_test_files == [
+        "src/components/DeviceDetailHeading-test.ts"
+    ]
 
 
 def test_git_inspection_commands_are_not_behavioral_validations() -> None:
@@ -2755,7 +3903,10 @@ def test_git_inspection_commands_are_not_behavioral_validations() -> None:
             summary="command completed",
         ),
         sequence=8,
-        item={"type": "commandExecution", "stdout": "diff --git a/tests/test_app.py b/tests/test_app.py\n"},
+        item={
+            "type": "commandExecution",
+            "stdout": "diff --git a/tests/test_app.py b/tests/test_app.py\n",
+        },
         changed_paths=["tests/test_app.py"],
     )
     check_validation = _validation_from_action(
@@ -2784,9 +3935,14 @@ def test_read_only_test_file_commands_are_inspections_not_validations() -> None:
         status="completed",
         summary="command completed",
     )
-    item = {"type": "commandExecution", "stdout": "def test_public():\n    assert app()\n"}
+    item = {
+        "type": "commandExecution",
+        "stdout": "def test_public():\n    assert app()\n",
+    }
 
-    validation = _validation_from_action(action, sequence=8, item=item, changed_paths=["tests/public/test_public.py"])
+    validation = _validation_from_action(
+        action, sequence=8, item=item, changed_paths=["tests/public/test_public.py"]
+    )
     inspection = _inspection_from_action(action, sequence=8, item=item)
 
     assert validation is None
@@ -2797,7 +3953,9 @@ def test_read_only_test_file_commands_are_inspections_not_validations() -> None:
     assert "def test_public" in inspection.captured_output
 
 
-def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validations() -> None:
+def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validations() -> (
+    None
+):
     action = TriggeringAction(
         kind="commandExecution",
         command="/bin/bash -lc \"sed -n '1,80p' tests/public/test_public.py\"",
@@ -2805,9 +3963,14 @@ def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validati
         status="completed",
         summary="command completed",
     )
-    item = {"type": "commandExecution", "stdout": "def test_public():\n    assert app()\n"}
+    item = {
+        "type": "commandExecution",
+        "stdout": "def test_public():\n    assert app()\n",
+    }
 
-    validation = _validation_from_action(action, sequence=8, item=item, changed_paths=["tests/public/test_public.py"])
+    validation = _validation_from_action(
+        action, sequence=8, item=item, changed_paths=["tests/public/test_public.py"]
+    )
     inspection = _inspection_from_action(action, sequence=8, item=item)
 
     assert validation is None
@@ -2827,7 +3990,9 @@ def test_forbidden_pattern_scan_with_regex_alternation_records_inspection() -> N
     )
     item = {"type": "commandExecution", "stdout": ""}
 
-    validation = _validation_from_action(action, sequence=8, item=item, changed_paths=["src/compiler.c"])
+    validation = _validation_from_action(
+        action, sequence=8, item=item, changed_paths=["src/compiler.c"]
+    )
     inspection = _inspection_from_action(action, sequence=8, item=item)
 
     assert validation is None
@@ -2837,7 +4002,9 @@ def test_forbidden_pattern_scan_with_regex_alternation_records_inspection() -> N
     assert inspection.inspected_paths == ["src", "include"]
 
 
-async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path) -> None:
+async def test_read_only_command_is_recorded_in_inspection_ledger(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -2849,7 +4016,7 @@ async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path
                     "itemId": "cmd-1",
                     "item": {
                         "type": "commandExecution",
-                        "command": "rg -n \"system\\(\" src",
+                        "command": 'rg -n "system\\(" src',
                         "exitCode": 1,
                         "status": "completed",
                         "stdout": "",
@@ -2863,17 +4030,23 @@ async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path
     assert len(controller.inspections) == 1
     assert controller.inspections[0].passed is True
     assert fake.runtime_packets == []
-    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    trace = json.loads(
+        store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert trace["should_wake_runtime_supervisor"] is False
 
 
-async def test_declared_grading_path_completed_command_escalates_integrity_failure(tmp_path: Path) -> None:
+async def test_declared_grading_path_completed_command_escalates_integrity_failure(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     grading_root = tmp_path / "SpecBench" / "examples" / "c_compiler"
     grading_root.mkdir(parents=True)
     (grading_root / "hidden.c").write_text("int secret;\n", encoding="utf-8")
     controller.declared_grading_roots = (str(grading_root),)
-    controller.approvals = ApprovalManager(tmp_path, declared_grading_roots=controller.declared_grading_roots)
+    controller.approvals = ApprovalManager(
+        tmp_path, declared_grading_roots=controller.declared_grading_roots
+    )
 
     await controller.handle_notification(
         AppServerMessage(
@@ -2924,11 +4097,15 @@ def test_evidence_provenance_marks_validation_before_latest_edit_as_stale() -> N
     assert provenance.risk_reasons == ["stale_after_latest_relevant_change"]
 
 
-async def test_completion_review_agent_reuses_thread_until_closed(tmp_path: Path) -> None:
+async def test_completion_review_agent_reuses_thread_until_closed(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class FakeClient:
         def __init__(self) -> None:
@@ -2999,7 +4176,9 @@ async def test_supervisor_fast_mode_sets_codex_service_tier(tmp_path: Path) -> N
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class FakeClient:
         def __init__(self) -> None:
@@ -3019,7 +4198,9 @@ async def test_supervisor_fast_mode_sets_codex_service_tier(tmp_path: Path) -> N
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": json.dumps({"decision": "noop", "reason": "routine progress"}),
+                            "text": json.dumps(
+                                {"decision": "noop", "reason": "routine progress"}
+                            ),
                         }
                     ],
                 }
@@ -3046,7 +4227,9 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class FakeClient:
         def __init__(self) -> None:
@@ -3064,7 +4247,9 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": json.dumps({"decision": "noop", "reason": "routine progress"}),
+                            "text": json.dumps(
+                                {"decision": "noop", "reason": "routine progress"}
+                            ),
                         }
                     ],
                 }
@@ -3083,11 +4268,15 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
     assert client.turn_params["effort"] == "high"
 
 
-async def test_completion_review_agent_overrides_stale_model_wake_sequence(tmp_path: Path) -> None:
+async def test_completion_review_agent_overrides_stale_model_wake_sequence(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class FakeClient:
         async def thread_start(self, params, *, timeout):
@@ -3137,16 +4326,22 @@ async def test_completion_review_agent_overrides_stale_model_wake_sequence(tmp_p
 
     assert decision.wake_sequence == 11
     assert decision.generation == 0
-    audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
+    audit = json.loads(
+        store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert audit["decision"]["wake_sequence"] == 11
     assert '"wake_sequence": 3' in audit["raw_text"]
 
 
-async def test_completion_review_reads_assistant_message_content_from_turns_list(tmp_path: Path) -> None:
+async def test_completion_review_reads_assistant_message_content_from_turns_list(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     decision_text = json.dumps(
         {
             "decision": "return",
@@ -3181,14 +4376,19 @@ async def test_completion_review_reads_assistant_message_content_from_turns_list
             assert items_view == "full"
             return {
                 "data": [
-                    {"id": "older-turn", "items": [{"type": "agentMessage", "text": "{}"}]},
+                    {
+                        "id": "older-turn",
+                        "items": [{"type": "agentMessage", "text": "{}"}],
+                    },
                     {
                         "id": "turn-1",
                         "items": [
                             {
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{"type": "output_text", "text": decision_text}],
+                                "content": [
+                                    {"type": "output_text", "text": decision_text}
+                                ],
                             }
                         ],
                     },
@@ -3204,16 +4404,22 @@ async def test_completion_review_reads_assistant_message_content_from_turns_list
     decision = await agent.decide_completion(packet)
 
     assert decision.decision == "return"
-    audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
+    audit = json.loads(
+        store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert audit["status"] == "decision"
     assert audit["raw_text"] == decision_text
 
 
-async def test_completion_review_no_message_retries_with_ultra_compact_minimal_prompt(tmp_path: Path) -> None:
+async def test_completion_review_no_message_retries_with_ultra_compact_minimal_prompt(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\nImplement the compiler.\n", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     valid_decision = {
         "decision": "return",
         "reason": "needs independent demo",
@@ -3269,7 +4475,9 @@ async def test_completion_review_no_message_retries_with_ultra_compact_minimal_p
                 "turn": {
                     "id": "turn-3",
                     "status": "completed",
-                    "items": [{"type": "agentMessage", "text": json.dumps(valid_decision)}],
+                    "items": [
+                        {"type": "agentMessage", "text": json.dumps(valid_decision)}
+                    ],
                 }
             }
 
@@ -3307,18 +4515,24 @@ async def test_completion_review_no_message_retries_with_ultra_compact_minimal_p
     assert client.archived == ["completion-thread-1"]
     audit_rows = [
         json.loads(line)
-        for line in store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()
+        for line in store.path(SUPERVISOR_WAKES)
+        .read_text(encoding="utf-8")
+        .splitlines()
         if line.strip()
     ]
     assert audit_rows[-1]["use_case"] == "completion_review_no_message_minimal_retry"
     assert audit_rows[-1]["status"] == "decision"
 
 
-async def test_supervisor_agent_retries_invalid_structured_output_once(tmp_path: Path) -> None:
+async def test_supervisor_agent_retries_invalid_structured_output_once(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     valid_decision = {
         "decision": "return",
         "reason": "needs factual demo",
@@ -3353,14 +4567,21 @@ async def test_supervisor_agent_retries_invalid_structured_output_once(tmp_path:
                     "turn": {
                         "id": "turn-1",
                         "status": "completed",
-                        "items": [{"type": "agentMessage", "text": '{"decision":"return","reason":"unterminated'}],
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "text": '{"decision":"return","reason":"unterminated',
+                            }
+                        ],
                     }
                 }
             return {
                 "turn": {
                     "id": "turn-2",
                     "status": "completed",
-                    "items": [{"type": "agentMessage", "text": json.dumps(valid_decision)}],
+                    "items": [
+                        {"type": "agentMessage", "text": json.dumps(valid_decision)}
+                    ],
                 }
             }
 
@@ -3375,22 +4596,36 @@ async def test_supervisor_agent_retries_invalid_structured_output_once(tmp_path:
 
     assert decision.decision == "return"
     assert len(client.turn_inputs) == 2
-    assert "previous completion-review response was not valid structured JSON" in client.turn_inputs[1]
+    assert (
+        "previous completion-review response was not valid structured JSON"
+        in client.turn_inputs[1]
+    )
     assert "compact completion-review JSON object" in client.turn_inputs[1]
     assert "files_reviewed=[]" in client.turn_inputs[1]
     assert "behavior_evidence_matrix=[]" in client.turn_inputs[1]
-    assert "under 3000 characters" in client.turn_inputs[1]
-    audits = [json.loads(line) for line in store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()]
+    assert "every concrete blocking issue" in client.turn_inputs[1]
+    assert "arbitrary whole-object cap" in client.turn_inputs[1]
+    assert "under 3000 characters" not in client.turn_inputs[1]
+    audits = [
+        json.loads(line)
+        for line in store.path(SUPERVISOR_WAKES)
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
     assert audits[-2]["use_case"] == "completion_review_parse_retry"
     assert audits[-2]["status"] == "error"
     assert audits[-1]["status"] == "decision"
 
 
-async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_path: Path) -> None:
+async def test_terminal_state_denies_new_server_request_without_policy_path(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class FakeClient:
         def __init__(self) -> None:
@@ -3412,7 +4647,10 @@ async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_
             {
                 "id": 99,
                 "method": "item/commandExecution/requestApproval",
-                "params": {"command": "echo after terminal", "availableDecisions": ["accept", "decline"]},
+                "params": {
+                    "command": "echo after terminal",
+                    "availableDecisions": ["accept", "decline"],
+                },
             }
         )
     )
@@ -3420,12 +4658,97 @@ async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_
     assert controller.client.responses == [(99, {"decision": "decline"})]
 
 
-async def test_completion_return_sends_message_and_continues_same_generation(tmp_path: Path) -> None:
+async def test_run_shutdown_waits_for_supervisor_owned_terminal_commit(
+    tmp_path: Path,
+) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller._snapshot_patch_applied = False
+    controller._coder_started = True
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+    commit_paused = asyncio.Event()
+    allow_commit = asyncio.Event()
+    original_diff_summary = controller.diff_summary
+
+    async def paused_diff_summary() -> str:
+        commit_paused.set()
+        await allow_commit.wait()
+        return await original_diff_summary()
+
+    controller.diff_summary = paused_diff_summary
+    event_loop_task = asyncio.create_task(controller.event_loop())
+    await asyncio.sleep(0)
+    finalizer = asyncio.create_task(
+        controller.finalize(
+            "terminal commit finished",
+            status=BelloStatus.COMPLETE,
+            completion_review_accepted=True,
+        )
+    )
+    controller._supervisor_task = finalizer
+    await commit_paused.wait()
+
+    controller.event_queue.put_nowait(ControllerEvent(kind="shutdown"))
+    await event_loop_task
+
+    settling = asyncio.create_task(
+        controller._settle_supervisor_task_for_run_shutdown()
+    )
+    await asyncio.sleep(0)
+
+    assert not settling.done()
+    assert not finalizer.cancelled()
+
+    allow_commit.set()
+    await settling
+
+    assert finalizer.done()
+    assert not finalizer.cancelled()
+    assert source.read_text(encoding="utf-8") == "value = 2\n"
+    assert controller._snapshot_patch_applied is True
+    assert not hasattr(controller, "_snapshot_recovery_path")
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "- Result: terminal commit finished" in report
+    log = store.path(LOG).read_text(encoding="utf-8")
+    assert '"type": "coder_snapshot_patch_applied"' in log
+    assert '"type": "coder_workspace_preserved"' not in log
+
+
+async def test_run_shutdown_still_cancels_nonterminal_supervisor_task(
+    tmp_path: Path,
+) -> None:
+    controller, _, _ = _runtime_controller(tmp_path)
+    started = asyncio.Event()
+
+    async def stale_review() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    review_task = asyncio.create_task(stale_review())
+    controller._supervisor_task = review_task
+    await started.wait()
+
+    await controller._settle_supervisor_task_for_run_shutdown()
+
+    assert review_task.cancelled()
+
+
+async def test_completion_return_sends_message_and_continues_same_generation(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
 
@@ -3487,17 +4810,29 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     )
 
     assert store.get_bello_config().generation == 0
-    assert controller.coder.messages == ["Validate missing-key fallback before marking ready again."]
+    assert controller.coder.messages == [
+        "Validate missing-key fallback before marking ready again."
+    ]
     assert len(controller.completion_returns) == 1
+    assert controller.completion_returns[0].message_to_coder == (
+        "Validate missing-key fallback before marking ready again."
+    )
+    assert controller.prior_interventions[-1].message_to_coder == (
+        "Validate missing-key fallback before marking ready again."
+    )
     assert store.get_health().interventions == 0
-    assert "Completion review returned missing fallback coverage" in store.path("PROGRESS.md").read_text(encoding="utf-8")
+    assert "Completion review returned missing fallback coverage" in store.path(
+        "PROGRESS.md"
+    ).read_text(encoding="utf-8")
     # Fresh completion-review thread per review: a normal return closes the session so the
     # next readiness review starts a new thread instead of accumulating prior turns.
     assert runtime_supervisor.closed == 0
     assert completion_supervisor.closed == 1
 
 
-async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validation(tmp_path: Path) -> None:
+async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validation(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -3509,10 +4844,28 @@ async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validatio
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     decision = CompletionReviewDecision(
         decision="accept",
         reason="fresh validation passed",
+        files_reviewed=[
+            {
+                "path": "src/app.py",
+                "reason": "changed source was semantically inspected",
+                "kind": "source",
+                "inspected": True,
+                "limitation": None,
+            },
+            {
+                "path": "tests/test_app.py",
+                "reason": "changed test was semantically inspected",
+                "kind": "test",
+                "inspected": True,
+                "limitation": None,
+            },
+        ],
         message_to_coder=None,
         persistent_decision=None,
         progress_update="Accepted by completion review.",
@@ -3533,16 +4886,316 @@ async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validatio
     assert len(controller.completion_returns) == 0
     assert coder.messages == []
     assert store.get_bello_config().accept_gate_accepts == 1
-    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
-    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_pass")
+    log_entries = [
+        json.loads(line)
+        for line in store.path(LOG).read_text(encoding="utf-8").splitlines()
+    ]
+    log_entry = next(
+        entry
+        for entry in log_entries
+        if entry.get("type") == "completion_accept_gate_pass"
+    )
     check_names = {check["check_name"] for check in log_entry["checks"]}
     assert "behavioral_floor" in check_names
+    assert "code_review_coverage" in check_names
     assert "evidence_binding" not in check_names
     assert "independent_evidence_binding" not in check_names
     assert "file_review_coverage" not in check_names
 
 
-async def test_completion_accept_gate_allows_changed_test_without_independent_evidence(tmp_path: Path) -> None:
+async def test_completion_accept_gate_rejects_unreviewed_material_source(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="tests/test_app.py::test_requested_behavior PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_requested_behavior PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    decision = CompletionReviewDecision(
+        decision="accept",
+        reason="fresh validation passed but changed files were not inspected",
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert controller.completion_reviewer_rerun_count == 1
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    log_entries = [
+        json.loads(line)
+        for line in store.path(LOG).read_text(encoding="utf-8").splitlines()
+    ]
+    rejection = next(
+        entry
+        for entry in log_entries
+        if entry.get("type") == "completion_accept_gate_rejection"
+    )
+    assert rejection["check_name"] == "code_review_coverage"
+
+
+async def test_completion_accept_gate_requires_live_reads_for_each_reviewed_code_file(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, _store, task, _coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    packet = _gate_packet(task, validations=validations)
+    decision = CompletionReviewDecision(
+        decision="accept",
+        reason="reviewed both changed files",
+        files_reviewed=[
+            {
+                "path": "src/app.py",
+                "reason": "source inspected",
+                "kind": "source",
+                "inspected": True,
+                "limitation": None,
+            },
+            {
+                "path": "tests/test_app.py",
+                "reason": "test inspected",
+                "kind": "test",
+                "inspected": True,
+                "limitation": None,
+            },
+        ],
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+    state = _workspace_state_id(tmp_path)
+    controller._completion_review_workspace_state_id = state
+    controller.completion_reviewer_evidence = [
+        CompletionReviewerEvidence(
+            workspace_state_id=state,
+            kind="command",
+            command="cat src/app.py",
+            paths=("src/app.py",),
+            passed=True,
+            summary="source contents",
+            observed_output=True,
+        )
+    ]
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is False
+    assert gate.check_name == "code_review_coverage"
+    assert "tests/test_app.py" in (gate.reason or "")
+
+    controller.completion_reviewer_evidence.append(
+        CompletionReviewerEvidence(
+            workspace_state_id=state,
+            kind="command",
+            command="cat tests/test_app.py",
+            paths=("tests/test_app.py",),
+            passed=True,
+            summary="test contents",
+            observed_output=True,
+        )
+    )
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is True
+
+
+async def test_completion_source_access_failure_retries_without_consuming_return_budget(
+    tmp_path: Path,
+) -> None:
+    controller, store, task, _coder = _completion_gate_controller(
+        tmp_path, validations=[]
+    )
+    packet = _gate_packet(task, validations=[])
+    decision = CompletionReviewDecision(
+        decision="return",
+        reason="could not inspect implementation",
+        packet_or_access_limitations=["Workspace source tools were unavailable."],
+        validation_gaps=["implementation was not reviewed"],
+        message_to_coder="retry review",
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+    state = _workspace_state_id(tmp_path)
+    controller.completion_reviewer_evidence = []
+    issue = controller._completion_review_access_issue(
+        decision,
+        packet=packet,
+        workspace_state_id=state,
+    )
+
+    assert issue is not None
+    recovered = await controller._handle_completion_review_access_failure(
+        message=issue,
+        summary="coder ready",
+    )
+
+    assert recovered is True
+    assert store.get_bello_config().completion_return_count == 0
+    assert controller.completion_returns == []
+    assert controller._supervisor_dirty is True
+    assert controller._supervisor_next_completion_review is True
+
+
+def test_completion_source_access_guard_covers_static_only_changes(
+    tmp_path: Path,
+) -> None:
+    controller, _store, task, _coder = _completion_gate_controller(
+        tmp_path, validations=[]
+    )
+    packet = _gate_packet(task, validations=[])
+    packet.changed_files = [
+        ChangedFile(path="pyproject.toml", status="M", sequence=2)
+    ]
+    decision = CompletionReviewDecision(
+        decision="return",
+        reason="configuration needs another pass",
+        validation_gaps=["configuration behavior was not verified"],
+        message_to_coder="correct the configuration",
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+    state = _workspace_state_id(tmp_path)
+    controller.completion_reviewer_evidence = []
+
+    issue = controller._completion_review_access_issue(
+        decision,
+        packet=packet,
+        workspace_state_id=state,
+    )
+
+    assert issue is not None
+    assert "capable workspace-bound read" in issue
+
+    controller.completion_reviewer_evidence = [
+        CompletionReviewerEvidence(
+            workspace_state_id=state,
+            kind="command",
+            command="sed -n '1,200p' pyproject.toml",
+            paths=("pyproject.toml",),
+            passed=True,
+            summary="configuration contents",
+            observed_output=True,
+        )
+    ]
+
+    assert (
+        controller._completion_review_access_issue(
+            decision,
+            packet=packet,
+            workspace_state_id=state,
+        )
+        is None
+    )
+
+
+async def test_completion_accept_gate_reruns_reviewer_for_constructed_accept_with_typed_blocker(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="tests/test_app.py::test_requested_behavior PASSED\n1 passed",
+            captured_output="tests/test_app.py::test_requested_behavior PASSED\n1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    decision = CompletionReviewDecision.model_construct(
+        decision=CompletionReviewDecisionKind.ACCEPT,
+        reason="incorrectly accepted despite an explicit gap",
+        validation_gaps=["required fallback remains unvalidated"],
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
+
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert controller.completion_reviewer_rerun_count == 1
+    assert store.get_bello_config().accept_gate_reviewer_reruns == 1
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    log_entries = [
+        json.loads(line)
+        for line in store.path(LOG).read_text(encoding="utf-8").splitlines()
+    ]
+    rejection = next(
+        entry
+        for entry in log_entries
+        if entry.get("type") == "completion_accept_gate_rejection"
+    )
+    assert rejection["failure_type"] == ACCEPT_GATE_REVIEWER_INCOMPLETE
+    assert rejection["check_name"] == "typed_blockers"
+    assert rejection["details"] == {"blocker_fields": ["validation_gaps"]}
+
+
+async def test_completion_accept_gate_allows_changed_test_without_independent_evidence(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app_new.py",
@@ -3554,7 +5207,9 @@ async def test_completion_accept_gate_allows_changed_test_without_independent_ev
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     packet = _gate_packet(task, validations=validations)
     packet.changed_files = [
         ChangedFile(path="src/app.py", status="M", sequence=2),
@@ -3570,7 +5225,12 @@ async def test_completion_accept_gate_allows_changed_test_without_independent_ev
     ]
 
     await controller.apply_completion_decision(
-        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        _covered_accept_decision(
+            wake_sequence=1,
+            validation_id="validation-3",
+            validation_command="pytest tests/test_app_new.py",
+            reviewed_files=("src/app.py", "tests/test_app_new.py"),
+        ),
         packet_thread_id="thread",
         packet=packet,
     )
@@ -3596,7 +5256,9 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     controller.adversary_enabled = None
     controller.client = object()
     controller.model = None
@@ -3604,12 +5266,32 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
     controller._pending_adversary_report = None
     controller._active_adversary_thread_id = None
     controller._active_adversary_workspace_root = None
+    controller.adv_report_controller = _FakeAdvReportController(
+        AdvReportControllerDecision(
+            forward_to_coder=False,
+            reason="no findings or observations remain",
+            report_to_coder=None,
+            material_coverage_limitations=[
+                "external database behavior could not be exercised"
+            ],
+        )
+    )
     (tmp_path / ".supervisor" / "secret.txt").parent.mkdir(parents=True, exist_ok=True)
-    (tmp_path / ".supervisor" / "secret.txt").write_text("runtime history", encoding="utf-8")
+    (tmp_path / ".supervisor" / "secret.txt").write_text(
+        "runtime history", encoding="utf-8"
+    )
     seen_snapshot_roots: list[Path] = []
 
     class FakeAdversary:
-        def __init__(self, client, project_root, *, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+        def __init__(
+            self,
+            client,
+            project_root,
+            *,
+            on_thread_start=None,
+            on_thread_done=None,
+            **kwargs,
+        ) -> None:
             self.project_root = Path(project_root)
             self.on_thread_start = on_thread_start
             self.on_thread_done = on_thread_done
@@ -3618,8 +5300,11 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
             seen_snapshot_roots.append(self.project_root)
             assert self.project_root != tmp_path
             assert (self.project_root / "TASK.md").exists()
+            assert not (self.project_root / "TASK.md").is_symlink()
             assert not (self.project_root / ".supervisor").exists()
-            (self.project_root / "adversary_probe.txt").write_text("probe", encoding="utf-8")
+            (self.project_root / "adversary_probe.txt").write_text(
+                "probe", encoding="utf-8"
+            )
             assert previous_adversary_report is None
             if self.on_thread_start:
                 self.on_thread_start("adv-thread")
@@ -3630,7 +5315,7 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
                     "attacked: boundary inputs\n"
                     "findings: none\n"
                     "held: boundary inputs held\n"
-                    "not_reached: none\n"
+                    "not_reached: external database behavior could not be exercised\n"
                     "overall: held"
                 ),
                 thread_id="adv-thread",
@@ -3657,7 +5342,10 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
     assert seen_snapshot_roots and not seen_snapshot_roots[0].exists()
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Adversarial tester completed" in progress
-    assert "without a candidate finding" in progress
+    assert "adv_report_controller found no findings or observations" in progress
+    final_report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "## Adversary Coverage Limitations" in final_report
+    assert "external database behavior could not be exercised" in final_report
 
 
 async def test_adversary_run_limit_skips_additional_run_and_finalizes(
@@ -3675,10 +5363,23 @@ async def test_adversary_run_limit_skips_additional_run_and_finalizes(
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     controller.adversary_enabled = True
     store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"max_adversary_runs": 1, "adversary_run_count": 1})
+        lambda cfg: cfg.model_copy(
+            update={"max_adversary_runs": 1, "adversary_run_count": 1}
+        )
+    )
+    controller._pending_adversary_report = AdversaryReport(
+        candidate_finding=True,
+        report_text="findings: old defect\nobservations: none\nnot_reached: none\noverall: broke",
+        generation=0,
+        completion_wake_sequence=1,
+        latest_relevant_change_sequence=1,
+        workspace_state_id="stale-workspace",
+        created_at=datetime.now(timezone.utc).isoformat(),
     )
 
     class UnexpectedAdversary:
@@ -3695,10 +5396,18 @@ async def test_adversary_run_limit_skips_additional_run_and_finalizes(
 
     assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert store.get_bello_config().adversary_run_count == 1
+    assert controller._pending_adversary_report is None
+    assert controller._adversary_stale_limitations
     assert coder.messages == []
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "Skipping adversarial tester before complete: adversary run limit reached (1/1)" in progress
-    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    assert (
+        "Skipping adversarial tester before complete: adversary run limit reached (1/1)"
+        in progress
+    )
+    events = [
+        json.loads(line)
+        for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()
+    ]
     assert any(event["event_type"] == "adversary/limit_reached" for event in events)
 
 
@@ -3720,7 +5429,9 @@ async def test_adversary_infra_failure_completes_with_recorded_gap(
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     controller.adversary_enabled = True
     controller.client = object()
     controller.model = None
@@ -3753,15 +5464,22 @@ async def test_adversary_infra_failure_completes_with_recorded_gap(
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Adversarial tester could not run" in progress
     assert "adversary coverage recorded as missing" in progress
-    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    events = [
+        json.loads(line)
+        for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()
+    ]
     assert any(event["event_type"] == "adversary/unavailable" for event in events)
     assert any(event["event_type"] == "completion/accept" for event in events)
     final_report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "status=error" in final_report
+    assert "## Adversary Coverage Limitations" in final_report
+    assert "Adversary coverage unavailable" in final_report
     assert "provider_failure" not in final_report.lower()
 
 
-async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path) -> None:
+async def test_adversary_fresh_report_allows_completion_finalize(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -3773,7 +5491,9 @@ async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path)
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     controller.adversary_enabled = True
     packet = _gate_packet(task, validations=validations)
     packet.adversary_report = AdversaryReport(
@@ -3784,6 +5504,7 @@ async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path)
         completion_wake_sequence=1,
         latest_relevant_change_sequence=2,
         validation_sequence=3,
+        workspace_state_id=_workspace_state_id(tmp_path),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -3799,7 +5520,7 @@ async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path)
     assert "## Adversary Reports" in final_report
 
 
-async def test_adversary_candidate_finding_reruns_completion_review_with_report(
+async def test_adversary_candidate_finding_is_normalized_and_sent_to_coder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3814,9 +5535,30 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     fake = _RuntimeFakeSupervisor(store, task)
     controller.supervisor = fake
+    processed_report = (
+        "Finding: a confirmed adversary defect that requires correction.\n\n"
+        "Observation: an unconfirmed adversary concern; investigate it and fix it only if confirmed.\n\n"
+        "## Findings requiring correction\n\n"
+        "Stack arguments crash on seven arguments. Reproducer: run seven_args; observed: SIGSEGV.\n\n"
+        "## Observations requiring investigation\n\n"
+        "Odd register ordering was observed."
+    )
+    adv_controller = _FakeAdvReportController(
+        AdvReportControllerDecision(
+            forward_to_coder=True,
+            reason="one finding retained and one observation carried forward",
+            report_to_coder=processed_report,
+            material_coverage_limitations=[
+                "External database behavior was not reached."
+            ],
+        )
+    )
+    controller.adv_report_controller = adv_controller
     controller.adversary_enabled = True
     controller.client = object()
     controller.model = None
@@ -3825,7 +5567,9 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     controller.adversary_model = "gpt-adversary"
     controller.adversary_intelligence = "ultra"
     controller.running = True
-    controller.observed_changed_files = {"src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)}
+    controller.observed_changed_files = {
+        "src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)
+    }
 
     class FakeAdversary:
         def __init__(
@@ -3849,7 +5593,16 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
             if self.on_thread_done:
                 self.on_thread_done("adv-thread")
             return SimpleNamespace(
-                report_text="attacked: stack args\nfindings: crash on seven args\noverall: broke",
+                report_text=(
+                    "candidate_finding: true\n"
+                    "attacked: stack args\n"
+                    "findings: Stack arguments crash on seven arguments. Reproducer: run seven_args; "
+                    "observed: SIGSEGV.\n"
+                    "observations: Odd register ordering was observed.\n"
+                    "held: six arguments\n"
+                    "not_reached: External database behavior was not reached.\n"
+                    "overall: broke"
+                ),
                 thread_id="adv-thread",
                 turn_id="adv-turn",
                 candidate_finding=True,
@@ -3862,15 +5615,103 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
         packet_thread_id="thread",
         packet=_gate_packet(task, validations=validations),
     )
-    assert controller._supervisor_task is not None
-    await controller._supervisor_task
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert fake.completion_packets == []
+    assert len(adv_controller.packets) == 1
+    assert adv_controller.packets[0].adversary_report is not None
+    assert adv_controller.packets[0].adversary_report.candidate_finding is True
+    assert store.get_bello_config().adversary_run_count == 1
+    assert coder.messages == [processed_report]
+    assert "attacked:" not in coder.messages[0]
+    assert "held:" not in coder.messages[0]
+    assert "External database behavior was not reached" not in coder.messages[0]
+    assert controller._pending_adversary_report is not None
+    assert controller._pending_adversary_report.material_coverage_limitations == [
+        "External database behavior was not reached."
+    ]
+
+
+async def test_adversary_observations_without_findings_are_sent_to_coder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    processed_report = (
+        "Finding: a confirmed adversary defect that requires correction.\n\n"
+        "Observation: an unconfirmed adversary concern; investigate it and fix it only if confirmed.\n\n"
+        "## Observations requiring investigation\n\n"
+        "Quoted newline behavior produced a suspicious intermediate state."
+    )
+    valid_normalization = AdvReportControllerDecision(
+        forward_to_coder=True,
+        reason="one observation carried forward",
+        report_to_coder=processed_report,
+    )
+    adv_controller = _FakeAdvReportController(
+        decisions=[
+            AdvReportControllerDecision(
+                forward_to_coder=False,
+                reason="incorrectly dropped the raw observation",
+                report_to_coder=None,
+            ),
+            valid_normalization,
+        ]
+    )
+    controller.adv_report_controller = adv_controller
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.running = False
+
+    class ObservationAdversary:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            return SimpleNamespace(
+                report_text=(
+                    "candidate_finding: false\n"
+                    "attacked: quoted rows\n"
+                    "findings: none\n"
+                    "observations: Quoted newline behavior produced a suspicious intermediate state.\n"
+                    "held: ordinary rows\n"
+                    "not_reached: none\n"
+                    "overall: held"
+                ),
+                thread_id="adv-thread",
+                turn_id="adv-turn",
+                candidate_finding=False,
+            )
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", ObservationAdversary)
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
 
     assert store.get_bello_config().status == BelloStatus.STARTING
-    assert fake.completion_packets
-    assert fake.completion_packets[0].adversary_report is not None
-    assert fake.completion_packets[0].adversary_report.candidate_finding is True
-    assert store.get_bello_config().adversary_run_count == 1
-    assert "Adversarial tester report:" in coder.messages[0]
+    assert len(adv_controller.packets) == 2
+    assert "violated the routing contract" in adv_controller.packets[1].current_summary
+    assert adv_controller.packets[0].adversary_report is not None
+    assert adv_controller.packets[0].adversary_report.candidate_finding is False
+    assert coder.messages == [processed_report]
+    cfg = store.get_bello_config()
+    assert cfg.completion_return_count == 0
+    assert cfg.completion_returns_since_adversary == 0
 
 
 async def test_completion_return_budget_waits_for_coder_readiness_before_forcing_adversary(
@@ -3907,7 +5748,9 @@ async def test_completion_return_budget_waits_for_coder_readiness_before_forcing
     assert cfg.completion_return_count == 1
     assert cfg.completion_returns_since_adversary == 0
     assert cfg.adversary_run_count == 0
-    assert coder.messages == ["Fix and validate the edge case, then report readiness again."]
+    assert coder.messages == [
+        "Fix and validate the edge case, then report readiness again."
+    ]
     assert controller._completion_review_budget_action() == "adversary"
 
 
@@ -3937,7 +5780,9 @@ async def test_completion_only_review_budget_finalizes_without_restart_or_extra_
 
     controller.finalize = capture_finalize
 
-    await controller._run_supervisor_check("coder ready after final allowed review", None, None, None, None, True)
+    await controller._run_supervisor_check(
+        "coder ready after final allowed review", None, None, None, None, True
+    )
 
     assert fake.completion_packets == []
     assert controller.completion_restarts == 0
@@ -4013,7 +5858,9 @@ def test_zero_post_adversary_review_budget_completes(tmp_path: Path) -> None:
     assert controller._completion_review_budget_action() == "complete"
 
 
-def test_zero_post_adversary_budget_allows_one_candidate_adjudication(tmp_path: Path) -> None:
+def test_zero_post_adversary_budget_is_not_extended_by_raw_candidate(
+    tmp_path: Path,
+) -> None:
     controller, store, task, _ = _completion_gate_controller(tmp_path, validations=[])
     controller.adversary_enabled = True
     store.update_bello_config(
@@ -4029,19 +5876,178 @@ def test_zero_post_adversary_budget_allows_one_candidate_adjudication(tmp_path: 
     packet = _gate_packet(task, validations=[])
     packet.adversary_report = AdversaryReport(
         candidate_finding=True,
-        report_text="attacked: edge\nfindings: candidate defect\noverall: broke",
+        report_text=(
+            "candidate_finding: true\n"
+            "attacked: edge\n"
+            "findings: candidate defect\n"
+            "observations: none\n"
+            "overall: broke"
+        ),
         generation=packet.generation,
         completion_wake_sequence=packet.wake_sequence,
         latest_relevant_change_sequence=packet.latest_relevant_change_sequence,
+        workspace_state_id=_workspace_state_id(tmp_path),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    assert controller._completion_review_budget_action(packet=packet) is None
-
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"completion_returns_since_adversary": 1})
-    )
     assert controller._completion_review_budget_action(packet=packet) == "complete"
+
+
+def test_adv_report_normalization_contract_preserves_raw_observations_and_grounded_limits() -> (
+    None
+):
+    raw_report = (
+        "candidate_finding: false\n"
+        "attacked: quoted rows\n"
+        "findings: none\n"
+        "observations:\n"
+        "- A quoted newline produced a suspicious intermediate state.\n"
+        "- Repeated input retained one stale row.\n"
+        "held: ordinary rows\n"
+        "not_reached: none\n"
+        "overall: no defects found"
+    )
+
+    assert (
+        _adv_report_normalization_contract_issue(
+            raw_report,
+            AdvReportControllerDecision(
+                forward_to_coder=False,
+                reason="incorrectly dropped observation",
+                report_to_coder=None,
+            ),
+        )
+        == "raw observations were dropped by forward_to_coder=false"
+    )
+    assert (
+        _adv_report_normalization_contract_issue(
+            raw_report,
+            AdvReportControllerDecision(
+                forward_to_coder=True,
+                reason="incorrectly invented limitation",
+                report_to_coder=(
+                    "## Observations requiring investigation\n\n"
+                    "- A quoted newline produced a suspicious intermediate state.\n"
+                    "- Repeated input retained one stale row."
+                ),
+                material_coverage_limitations=["External database was not reached."],
+            ),
+        )
+        == "material coverage limitations were added without a raw not_reached fact"
+    )
+
+    empty_observations = AdvReportControllerDecision(
+        forward_to_coder=True,
+        reason="incorrectly emitted only a heading",
+        report_to_coder="## Observations requiring investigation",
+    )
+    assert (
+        _adv_report_normalization_contract_issue(raw_report, empty_observations)
+        == "coder-facing observation section is empty"
+    )
+
+    missing_second = AdvReportControllerDecision(
+        forward_to_coder=True,
+        reason="incorrectly dropped the second observation",
+        report_to_coder=(
+            "## Observations requiring investigation\n\n"
+            "- A quoted newline produced a suspicious intermediate state."
+        ),
+    )
+    assert "not preserved one-to-one" in (
+        _adv_report_normalization_contract_issue(raw_report, missing_second) or ""
+    )
+
+    invented_extra = AdvReportControllerDecision(
+        forward_to_coder=True,
+        reason="incorrectly invented a third observation",
+        report_to_coder=(
+            "## Observations requiring investigation\n\n"
+            "- A quoted newline produced a suspicious intermediate state.\n"
+            "- Repeated input retained one stale row.\n"
+            "- An unrelated invented concern."
+        ),
+    )
+    assert "not preserved one-to-one" in (
+        _adv_report_normalization_contract_issue(raw_report, invented_extra) or ""
+    )
+
+    no_raw_observations = raw_report.replace(
+        "observations:\n"
+        "- A quoted newline produced a suspicious intermediate state.\n"
+        "- Repeated input retained one stale row.",
+        "observations: none",
+    )
+    assert "not preserved one-to-one" in (
+        _adv_report_normalization_contract_issue(
+            no_raw_observations,
+            AdvReportControllerDecision(
+                forward_to_coder=True,
+                reason="incorrectly invented an observation",
+                report_to_coder=(
+                    "## Observations requiring investigation\n\n"
+                    "- An unrelated invented concern."
+                ),
+            ),
+        )
+        or ""
+    )
+
+
+def test_adv_report_section_parser_ignores_labels_inside_fenced_evidence() -> None:
+    raw_report = (
+        "candidate_finding: true\n"
+        "findings: malformed output was observed:\n"
+        "```text\n"
+        "observations: this is captured target output, not a report section\n"
+        "```\n"
+        "observations: none\n"
+        "not_reached: none\n"
+        "overall: Defects remain in the submitted solution"
+    )
+
+    assert (
+        _adv_report_normalization_contract_issue(
+            raw_report,
+            AdvReportControllerDecision(
+                forward_to_coder=False,
+                reason="the raw report contains no observations",
+                report_to_coder=None,
+            ),
+        )
+        is None
+    )
+
+    raw_observation_with_heading = (
+        "candidate_finding: false\n"
+        "findings: none\n"
+        "observations:\n"
+        "- Renderer emitted this suspicious heading:\n"
+        "  ```text\n"
+        "  ## Broken title\n"
+        "  ```\n"
+        "held: other rendering held\n"
+        "not_reached: none\n"
+        "overall: no defects found"
+    )
+    normalized_observation_with_heading = AdvReportControllerDecision(
+        forward_to_coder=True,
+        reason="one raw observation carried verbatim",
+        report_to_coder=(
+            "## Observations requiring investigation\n\n"
+            "- Renderer emitted this suspicious heading:\n"
+            "  ```text\n"
+            "  ## Broken title\n"
+            "  ```"
+        ),
+    )
+    assert (
+        _adv_report_normalization_contract_issue(
+            raw_observation_with_heading,
+            normalized_observation_with_heading,
+        )
+        is None
+    )
 
 
 async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_completion_call(
@@ -4098,7 +6104,7 @@ async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_compl
     assert cfg.completion_returns_since_adversary == 0
     assert finalized == [
         (
-            "completed by bounded review policy: completion review budget reached and adversary reported no candidate finding",
+            "completed by bounded review policy: completion review budget reached and the normalized adversary report had nothing for the coder",
             BelloStatus.COMPLETE,
             False,
         )
@@ -4134,7 +6140,9 @@ async def test_post_adversary_return_budget_finalizes_on_next_readiness_without_
 
     controller.finalize = capture_finalize
 
-    await controller._run_supervisor_check("coder ready after final return", None, None, None, None, True)
+    await controller._run_supervisor_check(
+        "coder ready after final return", None, None, None, None, True
+    )
 
     assert fake.completion_packets == []
     assert finalized == [
@@ -4144,7 +6152,10 @@ async def test_post_adversary_return_budget_finalizes_on_next_readiness_without_
             False,
         )
     ]
-    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    events = [
+        json.loads(line)
+        for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()
+    ]
     assert events[-1]["event_type"] == "completion/budget_finalize"
     assert events[-1]["decision"]["completion_return_count"] == 9
 
@@ -4214,13 +6225,17 @@ async def test_adversary_receives_previous_report_as_regression_context(
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     controller.adversary_enabled = True
     controller.client = object()
     controller.model = None
     controller.running = False
     store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "adversary_run_count": 1})
+        lambda cfg: cfg.model_copy(
+            update={"max_adversary_runs": 2, "adversary_run_count": 1}
+        )
     )
     controller._pending_adversary_report = AdversaryReport(
         candidate_finding=True,
@@ -4236,13 +6251,15 @@ async def test_adversary_receives_previous_report_as_regression_context(
     )
 
     class FakeAdversary:
-        def __init__(self, *args, on_thread_start=None, on_thread_done=None, **kwargs) -> None:
+        def __init__(
+            self, *args, on_thread_start=None, on_thread_done=None, **kwargs
+        ) -> None:
             self.on_thread_start = on_thread_start
             self.on_thread_done = on_thread_done
 
         async def run(self, packet, *, previous_adversary_report=None):
             assert previous_adversary_report is not None
-            assert previous_adversary_report["report_text"].startswith("attacked: previous edge")
+            assert previous_adversary_report.startswith("attacked: previous edge")
             if self.on_thread_start:
                 self.on_thread_start("new-adv-thread")
             if self.on_thread_done:
@@ -4268,7 +6285,9 @@ async def test_adversary_receives_previous_report_as_regression_context(
     assert coder.messages == []
 
 
-async def test_completion_return_after_adversary_includes_report_for_coder(tmp_path: Path) -> None:
+async def test_completion_return_after_adversary_does_not_append_raw_report(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -4280,7 +6299,9 @@ async def test_completion_return_after_adversary_includes_report_for_coder(tmp_p
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     packet = _gate_packet(task, validations=validations)
     packet.adversary_report = AdversaryReport(
         report_text="attacked: stack args\nfindings: crash on seven args\nraw observed output: SIGSEGV\noverall: broke",
@@ -4290,6 +6311,7 @@ async def test_completion_return_after_adversary_includes_report_for_coder(tmp_p
         completion_wake_sequence=1,
         latest_relevant_change_sequence=2,
         validation_sequence=3,
+        workspace_state_id=_workspace_state_id(tmp_path),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
     decision = CompletionReviewDecision(
@@ -4310,15 +6332,185 @@ async def test_completion_return_after_adversary_includes_report_for_coder(tmp_p
         generation=0,
     )
 
-    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+    await controller.apply_completion_decision(
+        decision, packet_thread_id="thread", packet=packet
+    )
 
     assert len(controller.completion_returns) == 1
-    assert "Fix the reproduced stack-argument crash." in coder.messages[0]
-    assert "Adversarial tester report:" in coder.messages[0]
-    assert "SIGSEGV" in coder.messages[0]
+    assert coder.messages == ["Fix the reproduced stack-argument crash."]
+    assert "Adversarial tester report:" not in coder.messages[0]
+    assert "SIGSEGV" not in coder.messages[0]
 
 
-async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(tmp_path: Path) -> None:
+async def test_stale_normalized_adversary_report_is_not_sent_to_coder(
+    tmp_path: Path,
+) -> None:
+    controller, _, task, coder = _completion_gate_controller(tmp_path, validations=[])
+    product = tmp_path / "src.py"
+    product.write_text("value = 1\n", encoding="utf-8")
+    token = controller._capture_completion_review_token()
+    controller._completion_review_token = token
+    controller._accepted_completion_review_token = token
+    packet = _gate_packet(task, validations=[], latest_change=None)
+    report = AdversaryReport(
+        candidate_finding=True,
+        report_text=(
+            "candidate_finding: true\n"
+            "findings: src.py returns the wrong value; command: python src.py; raw output: 1\n"
+            "observations: none\n"
+            "not_reached: none\n"
+            "overall: Defects remain in the submitted solution"
+        ),
+        generation=0,
+        completion_wake_sequence=1,
+        latest_relevant_change_sequence=None,
+        workspace_state_id=token.workspace_state_id,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    class MutatingNormalizer:
+        async def decide_adv_report(self, packet):
+            product.write_text("value = 2\n", encoding="utf-8")
+            return AdvReportControllerDecision(
+                forward_to_coder=True,
+                reason="one finding retained",
+                report_to_coder=(
+                    "## Findings requiring correction\n\n"
+                    "src.py returns the wrong value; command: python src.py; raw output: 1"
+                ),
+            )
+
+    controller.adv_report_controller = MutatingNormalizer()
+    controller._pending_adversary_report = report
+
+    await controller._run_adv_report_controller(
+        report,
+        packet=packet,
+        accepted_completion_decision=None,
+    )
+
+    assert coder.messages == []
+    assert controller._pending_adversary_report is None
+    assert controller._adversary_stale_limitations
+
+
+async def test_stale_exhausted_adversary_report_is_quarantined_once(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _ = _completion_gate_controller(tmp_path, validations=[])
+    token = controller._capture_completion_review_token()
+    controller._completion_review_token = token
+    controller._accepted_completion_review_token = token
+    controller._pending_adversary_report = AdversaryReport(
+        candidate_finding=False,
+        report_text="findings: none\nobservations: none\nnot_reached: none\noverall: held",
+        generation=0,
+        completion_wake_sequence=1,
+        workspace_state_id="stale-state",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    finalized: list[str] = []
+
+    async def capture_finalize(result: str, **kwargs) -> None:
+        finalized.append(result)
+
+    controller.finalize = capture_finalize
+
+    await controller._finalize_bounded_completion(reason="budget reached")
+    assert controller._pending_adversary_report is None
+    assert finalized == []
+
+    fresh_token = controller._capture_completion_review_token()
+    controller._completion_review_token = fresh_token
+    controller._accepted_completion_review_token = fresh_token
+    await controller._finalize_bounded_completion(reason="budget reached")
+    assert len(finalized) == 1
+
+
+def test_adversary_precommit_rejects_edit_revert_with_newer_sequence(
+    tmp_path: Path,
+) -> None:
+    controller, store, _, _ = _completion_gate_controller(tmp_path, validations=[])
+    product = tmp_path / "product.txt"
+    product.write_text("original\n", encoding="utf-8")
+    reviewed_workspace_state = _workspace_state_id(tmp_path)
+    report = AdversaryReport(
+        candidate_finding=False,
+        report_text="findings: none\nobservations: none\nnot_reached: none\noverall: held",
+        generation=0,
+        completion_wake_sequence=1,
+        latest_relevant_change_sequence=2,
+        workspace_state_id=reviewed_workspace_state,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    product.write_text("temporary edit\n", encoding="utf-8")
+    product.write_text("original\n", encoding="utf-8")
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"last_relevant_edit_sequence": 4})
+    )
+
+    assert _workspace_state_id(tmp_path) == reviewed_workspace_state
+    issue = controller._completion_precommit_issue(report)
+    assert issue is not None
+    assert "edit sequence" in issue
+
+
+def test_completion_budget_does_not_bypass_pending_accept_gate_rejection(
+    tmp_path: Path,
+) -> None:
+    controller, store, _, _ = _completion_gate_controller(tmp_path, validations=[])
+    controller.adversary_enabled = False
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"completion_return_count": 1})
+    )
+    controller._pending_completion_gate_rejection = {
+        "check_name": "changed_test_masking",
+        "reason": "changed test no longer constrains behavior",
+    }
+
+    assert controller._completion_review_budget_action() is None
+
+    controller._pending_completion_gate_rejection = None
+    assert controller._completion_review_budget_action() == "complete"
+
+
+async def test_semantic_return_does_not_clear_pending_accept_gate_rejection(
+    tmp_path: Path,
+) -> None:
+    controller, _, task, _ = _completion_gate_controller(tmp_path, validations=[])
+    pending = {
+        "check_name": "changed_test_masking",
+        "reason": "changed test no longer constrains behavior",
+    }
+    controller._pending_completion_gate_rejection = pending
+    decision = CompletionReviewDecision(
+        decision="return",
+        reason="a separate required behavior is still wrong",
+        validation_gaps=["required fallback behavior is missing"],
+        message_to_coder="Correct the missing fallback and validate it.",
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=[]),
+    )
+
+    assert controller._pending_completion_gate_rejection == pending
+    assert controller._completion_review_budget_action() is None
+
+
+async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -4330,7 +6522,9 @@ async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(t
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     packet = _gate_packet(task, validations=validations)
     packet.changed_file_diffs = [
         ChangedFileDiff(
@@ -4359,7 +6553,9 @@ async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(t
     assert "trivially true assertion" in coder.messages[0]
 
 
-async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(tmp_path: Path) -> None:
+async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -4371,7 +6567,9 @@ async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(t
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     packet = _gate_packet(task, validations=validations)
     packet.changed_file_diffs = [
         ChangedFileDiff(
@@ -4395,7 +6593,9 @@ async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(t
     assert "skipped/todo test marker" in coder.messages[0]
 
 
-async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_validation(tmp_path: Path) -> None:
+async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_validation(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             command="python -m py_compile src/app.py",
@@ -4406,10 +6606,14 @@ async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_
             sequence=3,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    decision = _covered_accept_decision(wake_sequence=1, validation_id="validation-3")
+    decision.behavior_evidence_matrix = []
 
     await controller.apply_completion_decision(
-        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        decision,
         packet_thread_id="thread",
         packet=_gate_packet(task, validations=validations),
     )
@@ -4420,7 +6624,490 @@ async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_
     assert store.get_bello_config().accept_gate_coder_returns == 1
 
 
-async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(tmp_path: Path) -> None:
+async def test_completion_accept_gate_allows_artifact_only_work_after_direct_review(
+    tmp_path: Path,
+) -> None:
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=[]
+    )
+    task.write_text("# Create report.pdf with the requested layout", encoding="utf-8")
+    packet = _gate_packet(task, validations=[], latest_change=2)
+    packet.changed_files = [ChangedFile(path="report.pdf", status="M", sequence=2)]
+    decision = CompletionReviewDecision(
+        decision="accept",
+        reason="the requested PDF was rendered and inspected",
+        files_reviewed=[
+            {
+                "path": "report.pdf",
+                "reason": "rendered pages and required content inspected",
+                "kind": "other",
+                "inspected": True,
+                "limitation": None,
+            }
+        ],
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update="Accepted by completion review.",
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert coder.messages == []
+    log_entries = [
+        json.loads(line)
+        for line in store.path(LOG).read_text(encoding="utf-8").splitlines()
+    ]
+    accepted = next(
+        entry
+        for entry in log_entries
+        if entry.get("type") == "completion_accept_gate_pass"
+    )
+    assert any(
+        check["check_name"] == "static_artifact_review" for check in accepted["checks"]
+    )
+    assert all(
+        check["check_name"] != "behavioral_floor" for check in accepted["checks"]
+    )
+
+
+async def test_completion_accept_gate_requires_current_reviewer_lane_evidence_for_artifact(
+    tmp_path: Path,
+) -> None:
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=[]
+    )
+    task.write_text("# Create report.pdf with the requested layout", encoding="utf-8")
+    packet = _gate_packet(task, validations=[], latest_change=2)
+    packet.changed_files = [ChangedFile(path="report.pdf", status="M", sequence=2)]
+    decision = CompletionReviewDecision(
+        decision="accept",
+        reason="the requested PDF was inspected",
+        files_reviewed=[
+            {
+                "path": "report.pdf",
+                "reason": "rendered pages inspected",
+                "kind": "other",
+                "inspected": True,
+                "limitation": None,
+            }
+        ],
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+    workspace_state_id = _workspace_state_id(tmp_path)
+    controller._completion_review_workspace_state_id = workspace_state_id
+    controller.completion_reviewer_evidence = []
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is False
+    assert gate.failure_type == ACCEPT_GATE_REVIEWER_INCOMPLETE
+    assert gate.check_name == "static_artifact_review"
+
+    controller.completion_reviewer_evidence = [
+        CompletionReviewerEvidence(
+            workspace_state_id=workspace_state_id,
+            kind="command",
+            command="pdftotext report.pdf -",
+            paths=("report.pdf",),
+            passed=True,
+            summary="document text inspected",
+        )
+    ]
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is False
+
+    controller.completion_reviewer_evidence = [
+        CompletionReviewerEvidence(
+            workspace_state_id=workspace_state_id,
+            kind="command",
+            command="pdftoppm -png report.pdf /tmp/report-page",
+            paths=("report.pdf",),
+            passed=True,
+            summary="rendered document pages",
+            path_commands=(
+                ("report.pdf", "pdftoppm -png report.pdf /tmp/report-page"),
+            ),
+            resource_paths=(
+                (tmp_path / "report.pdf").as_posix(),
+                "/tmp/report-page",
+            ),
+        ),
+        CompletionReviewerEvidence(
+            workspace_state_id=workspace_state_id,
+            kind="image_view",
+            command=None,
+            paths=(),
+            passed=True,
+            summary="rendered page inspected",
+            resource_paths=("/tmp/report-page-1.png",),
+            observed_output=True,
+        ),
+    ]
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is True
+
+
+async def test_completion_accept_gate_requires_minimal_semantic_review_structure(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, _, task, _ = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    packet = _gate_packet(task, validations=validations)
+    token = controller._capture_completion_review_token()
+    controller._completion_review_token = token
+    controller._completion_review_workspace_state_id = token.workspace_state_id
+    decision = _covered_accept_decision(wake_sequence=1)
+    decision.behavior_evidence_matrix = []
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is False
+    assert gate.failure_type == ACCEPT_GATE_REVIEWER_INCOMPLETE
+    assert gate.check_name == "review_structure"
+    assert (
+        gate.reason
+        == "behavior_evidence_matrix is empty for a behavior-affecting change"
+    )
+
+
+async def test_completion_accept_gate_rejects_all_out_of_scope_behavior_surface(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, _, task, _ = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    packet = _gate_packet(task, validations=validations)
+    token = controller._capture_completion_review_token()
+    controller._completion_review_token = token
+    controller._completion_review_workspace_state_id = token.workspace_state_id
+    decision = _covered_accept_decision(wake_sequence=1)
+    decision.behavior_surface[0].status = "out_of_scope"
+
+    gate = await controller._completion_accept_gate(decision, packet=packet)
+
+    assert gate.passed is False
+    assert gate.check_name == "review_structure"
+    assert gate.reason == "behavior_surface contains no required behavior"
+
+
+async def test_completion_accept_gate_reruns_reviewer_when_task_artifact_was_not_inspected(
+    tmp_path: Path,
+) -> None:
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=[]
+    )
+    task.write_text("# Create report.pdf with the requested layout", encoding="utf-8")
+    packet = _gate_packet(task, validations=[], latest_change=2)
+    packet.changed_files = [ChangedFile(path="report.pdf", status="M", sequence=2)]
+    decision = CompletionReviewDecision(
+        decision="accept",
+        reason="looks ready",
+        message_to_coder=None,
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert controller.completion_reviewer_rerun_count == 1
+    assert coder.messages == []
+    assert len(controller.completion_returns) == 0
+
+
+async def test_completion_accept_gate_does_not_gate_incidental_image_in_code_task(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    packet = _gate_packet(task, validations=validations)
+    packet.changed_files.append(
+        ChangedFile(path="assets/incidental.png", status="M", sequence=2)
+    )
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert coder.messages == []
+
+
+async def test_completion_accept_gate_allows_fully_bound_intrinsic_static_contract(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            validation_id="validation-3",
+            command="npm run typecheck",
+            exit_code=0,
+            type="static",
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="typecheck passed",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    task.write_text("# Correct the public type declarations", encoding="utf-8")
+    packet = _gate_packet(task, validations=validations)
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "accept",
+            "reason": "the type contract is satisfied",
+            "files_reviewed": [
+                {
+                    "path": "src/app.py",
+                    "reason": "changed declaration source was semantically inspected",
+                    "kind": "source",
+                    "inspected": True,
+                    "limitation": None,
+                },
+                {
+                    "path": "tests/test_app.py",
+                    "reason": "changed declaration test was semantically inspected",
+                    "kind": "test",
+                    "inspected": True,
+                    "limitation": None,
+                },
+            ],
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "public type declarations compile",
+                    "task_basis": "required type contract",
+                    "files_considered": ["src/app.py"],
+                    "evidence": [
+                        {
+                            "validation_id": "validation-3",
+                            "command": "npm run typecheck",
+                            "sequence": 3,
+                            "validation_type": "static",
+                            "outcome": "pass",
+                            "freshness": "fresh",
+                            "why_it_covers_behavior": "runs the required type checker",
+                        }
+                    ],
+                    "status": "covered",
+                    "gap": None,
+                }
+            ],
+            "message_to_coder": None,
+            "persistent_decision": None,
+            "progress_update": "Accepted by completion review.",
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 1,
+            "generation": 0,
+        }
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert coder.messages == []
+    log_entries = [
+        json.loads(line)
+        for line in store.path(LOG).read_text(encoding="utf-8").splitlines()
+    ]
+    accepted = next(
+        entry
+        for entry in log_entries
+        if entry.get("type") == "completion_accept_gate_pass"
+    )
+    assert any(
+        check["check_name"] == "intrinsic_static_contract_floor"
+        for check in accepted["checks"]
+    )
+
+
+async def test_completion_accept_gate_rejects_static_contract_claim_with_mismatched_ledger_command(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            validation_id="validation-3",
+            command="ruff check .",
+            exit_code=0,
+            type="static",
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="lint passed",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    task.write_text("# Correct the public type declarations", encoding="utf-8")
+    packet = _gate_packet(task, validations=validations)
+    decision = CompletionReviewDecision.model_validate(
+        {
+            "decision": "accept",
+            "reason": "claimed type contract evidence",
+            "behavior_evidence_matrix": [
+                {
+                    "behavior": "public type declarations compile",
+                    "task_basis": "required type contract",
+                    "files_considered": ["src/app.py"],
+                    "evidence": [
+                        {
+                            "validation_id": "validation-3",
+                            "command": "npm run typecheck",
+                            "sequence": 3,
+                            "validation_type": "static",
+                            "outcome": "pass",
+                            "freshness": "fresh",
+                            "why_it_covers_behavior": "claims to run the type checker",
+                        }
+                    ],
+                    "status": "covered",
+                    "gap": None,
+                }
+            ],
+            "message_to_coder": None,
+            "persistent_decision": None,
+            "progress_update": None,
+            "clear_handoff": False,
+            "display_message": None,
+            "handoff": None,
+            "wake_sequence": 1,
+            "generation": 0,
+        }
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert len(controller.completion_returns) == 0
+    assert coder.messages == []
+    assert controller.completion_reviewer_rerun_count == 1
+
+
+async def test_runtime_config_edit_invalidates_earlier_behavioral_validation(
+    tmp_path: Path,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            trusted_validation_outcome="passed",
+            summary="1 passed",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    packet = _gate_packet(task, validations=validations)
+    packet.changed_files = [
+        ChangedFile(path="src/app.py", status="M", sequence=2),
+        ChangedFile(path="config/routes.yaml", status="M", sequence=4),
+    ]
+    decision = _covered_accept_decision(wake_sequence=1, validation_id="validation-3")
+    decision.behavior_evidence_matrix = []
+    decision.files_reviewed.append(
+        ReviewedFile(
+            path="config/routes.yaml",
+            reason="runtime routes inspected",
+            kind="config",
+            inspected=True,
+            limitation=None,
+        )
+    )
+
+    await controller.apply_completion_decision(
+        decision,
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert len(controller.completion_returns) == 1
+    assert "no fresh passing behavioral validation" in coder.messages[0]
+
+
+async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             validation_id="validation-new",
@@ -4434,8 +7121,12 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
             sequence=12,
         )
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
-    packet = _gate_packet(task, validations=validations, wake_sequence=20, latest_change=11)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
+    packet = _gate_packet(
+        task, validations=validations, wake_sequence=20, latest_change=11
+    )
     packet.latest_event_sequence = 20
     decision = CompletionReviewDecision.model_validate(
         {
@@ -4452,7 +7143,13 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
             "last_relevant_edit_seq": 8,
             "last_validation_seq": 9,
             "files_reviewed": [
-                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
+                {
+                    "path": "src/app.py",
+                    "reason": "changed source",
+                    "kind": "source",
+                    "inspected": True,
+                    "limitation": None,
+                }
             ],
             "behavior_evidence_matrix": [
                 {
@@ -4480,7 +7177,9 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
         }
     )
 
-    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+    await controller.apply_completion_decision(
+        decision, packet_thread_id="thread", packet=packet
+    )
 
     assert store.get_bello_config().status == BelloStatus.STARTING
     assert controller.completion_returns == []
@@ -4493,12 +7192,16 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
     assert "last_validation_seq=9 < latest_validation_sequence=12" in log
 
 
-async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_path: Path) -> None:
+async def test_completion_restart_writes_handoff_and_starts_new_generation(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
 
@@ -4578,11 +7281,15 @@ async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_p
     assert controller.client.started_turns
 
 
-async def test_transport_error_writes_provider_failure_final_report(tmp_path: Path) -> None:
+async def test_transport_error_writes_provider_failure_final_report(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
@@ -4609,11 +7316,15 @@ async def test_transport_error_writes_provider_failure_final_report(tmp_path: Pa
     assert controller.running is False
 
 
-async def test_supervisor_turn_start_timeout_writes_provider_failure_final_report(tmp_path: Path) -> None:
+async def test_supervisor_turn_start_timeout_writes_provider_failure_final_report(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class HangingTurnStartClient:
         async def thread_start(self, params, *, timeout):
@@ -4653,18 +7364,24 @@ async def test_supervisor_turn_start_timeout_writes_provider_failure_final_repor
     assert "supervisor turn/start response timed out after 0.01s" in text
     assert "thread_id=supervisor-thread" in text
     assert controller.running is False
-    audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
+    audit = json.loads(
+        store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert audit["status"] == "error"
     assert audit["thread_id"] == "supervisor-thread"
     assert audit["turn_id"] is None
     assert "supervisor turn/start response timed out after 0.01s" in audit["error"]
 
 
-async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(tmp_path: Path) -> None:
+async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
 
     class HangingTurnStartClient:
         async def thread_start(self, params, *, timeout):
@@ -4697,7 +7414,9 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
     controller._supervisor_dirty = True
     controller._supervisor_next_completion_review = True
 
-    await controller._run_supervisor_check("stale runtime check", None, None, None, None)
+    await controller._run_supervisor_check(
+        "stale runtime check", None, None, None, None
+    )
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     health = store.get_health()
@@ -4706,11 +7425,320 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
     assert controller.running is True
     assert health.timeout_fallback_count == 1
     assert "stale_runtime_supervisor_timeout" in health.risk_signals
-    assert "continuing with the latest queued review" in store.path(PROGRESS).read_text(encoding="utf-8")
-    assert any("supervisor check failed" in message for _, message in controller.tui.messages)
+    assert "continuing with the latest queued review" in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
+    assert any(
+        "supervisor check failed" in message for _, message in controller.tui.messages
+    )
 
 
-async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: Path) -> None:
+async def test_stale_successful_runtime_decision_does_not_steer_after_newer_wake(
+    tmp_path: Path,
+) -> None:
+    controller, store, packet_builder = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str):
+            self.messages.append(message)
+            return "turn"
+
+    class DirtyingSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            controller._supervisor_dirty = True
+            controller._supervisor_next_summary = "fresh passing validation"
+            controller._supervisor_next_completion_review = False
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="stale failed validation",
+                message_to_coder="fix the failure",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    coder = FakeCoder()
+    controller.coder = coder
+    controller.supervisor = DirtyingSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert coder.messages == []
+    assert controller.prior_interventions == []
+    assert controller._supervisor_dirty is True
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+    assert "stale_runtime_decision_discarded" in store.path(LOG).read_text(
+        encoding="utf-8"
+    )
+
+
+async def test_runtime_product_revision_discards_stale_decision_without_dirty_wake(
+    tmp_path: Path,
+) -> None:
+    controller, store, packet_builder = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str):
+            self.messages.append(message)
+            return "turn"
+
+    class ProductChangingSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            controller._bump_completion_product_revision()
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="old failure",
+                message_to_coder="fix old failure",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    coder = FakeCoder()
+    controller.coder = coder
+    controller.supervisor = ProductChangingSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert coder.messages == []
+    assert controller.prior_interventions == []
+    assert controller._supervisor_dirty is True
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+    log = store.path(LOG).read_text(encoding="utf-8")
+    assert "stale_runtime_decision_discarded" in log
+    assert "product_revision" in log
+
+
+async def test_raw_coder_notification_discards_runtime_decision_before_queue_processing(
+    tmp_path: Path,
+) -> None:
+    controller, store, packet_builder = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str):
+            self.messages.append(message)
+            return "turn"
+
+    class NotifyingSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            controller._capture_runtime_transport_activity(
+                AppServerMessage(
+                    {
+                        "method": "item/started",
+                        "params": {"threadId": "thread", "item": {"id": "new"}},
+                    }
+                )
+            )
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="old failure",
+                message_to_coder="fix old failure",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    coder = FakeCoder()
+    controller.coder = coder
+    controller.supervisor = NotifyingSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert coder.messages == []
+    assert controller._supervisor_dirty is True
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+    assert "notification_revision" in store.path(LOG).read_text(encoding="utf-8")
+
+
+async def test_user_pause_prevents_in_flight_runtime_decision_from_restarting_coder(
+    tmp_path: Path,
+) -> None:
+    controller, store, packet_builder = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+            self.interrupts = 0
+
+        async def interrupt(self) -> None:
+            self.interrupts += 1
+
+        async def steer_or_start(self, message: str):
+            self.messages.append(message)
+            return "turn"
+
+    class PausingSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            await controller.pause()
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="old failure",
+                message_to_coder="restart work",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    coder = FakeCoder()
+    controller.coder = coder
+    controller.supervisor = PausingSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert controller.paused is True
+    assert store.get_bello_config().status == BelloStatus.PAUSED
+    assert coder.interrupts == 1
+    assert coder.messages == []
+    assert controller._supervisor_dirty is False
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+
+
+async def test_stale_runtime_discard_preserves_queued_completion_review(
+    tmp_path: Path,
+) -> None:
+    controller, _store, packet_builder = _runtime_controller(tmp_path)
+
+    class CompletionQueuingSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            controller._supervisor_dirty = True
+            controller._supervisor_next_summary = "coder declared readiness"
+            controller._supervisor_next_completion_review = True
+            controller._bump_completion_product_revision()
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="old failure",
+                message_to_coder="stale steering",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    controller.supervisor = CompletionQueuingSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert controller._supervisor_dirty is True
+    assert controller._supervisor_next_completion_review is True
+    assert controller._supervisor_next_summary == "coder declared readiness"
+
+
+async def test_runtime_timeout_after_newer_product_revision_is_discarded(
+    tmp_path: Path,
+) -> None:
+    controller, store, packet_builder = _runtime_controller(tmp_path)
+
+    class StaleTimeoutSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            controller._bump_completion_product_revision()
+            raise SupervisorAgentError("turn/start timed out after 1s")
+
+    controller.supervisor = StaleTimeoutSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert controller.running is True
+    assert controller._supervisor_dirty is True
+    assert store.get_health().timeout_fallback_count == 1
+    log = store.path(LOG).read_text(encoding="utf-8")
+    assert "stale_runtime_decision_discarded" in log
+    assert "decision_error" in log
+
+
+async def test_raw_coder_approval_request_discards_runtime_decision(
+    tmp_path: Path,
+) -> None:
+    controller, store, packet_builder = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str):
+            self.messages.append(message)
+            return "turn"
+
+    class ApprovalQueuingSupervisor:
+        def build_packet(self, **kwargs):
+            return packet_builder.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            await controller._on_server_request(
+                AppServerMessage(
+                    {
+                        "id": 91,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {
+                            "threadId": "thread",
+                            "turnId": "turn",
+                            "itemId": "command",
+                            "command": "python3 -m pytest",
+                            "cwd": str(tmp_path),
+                            "availableDecisions": ["accept", "decline"],
+                        },
+                    }
+                )
+            )
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="old failure",
+                message_to_coder="stale steering",
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+
+    coder = FakeCoder()
+    controller.coder = coder
+    controller.supervisor = ApprovalQueuingSupervisor()
+
+    await controller._run_supervisor_check(
+        "failed validation", None, None, None, None
+    )
+
+    assert coder.messages == []
+    assert controller._supervisor_dirty is True
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+    assert controller.event_queue.qsize() == 1
+    assert "notification_revision" in store.path(LOG).read_text(encoding="utf-8")
+
+
+async def test_supervisor_no_message_retries_from_latest_stable_state(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
 
     class NoMessageThenNoopSupervisor:
@@ -4724,7 +7752,9 @@ async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: 
         async def decide(self, packet):
             self.calls += 1
             if self.calls == 1:
-                raise SupervisorAgentError("supervisor did not produce an agent message")
+                raise SupervisorAgentError(
+                    "supervisor did not produce an agent message"
+                )
             return SupervisorDecision(
                 decision=SupervisorDecisionKind.NOOP,
                 reason="recovered",
@@ -4735,7 +7765,9 @@ async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: 
     supervisor = NoMessageThenNoopSupervisor(store, controller.task_path)
     controller.supervisor = supervisor
 
-    await controller._supervisor_check_loop("runtime check", None, None, None, None, False)
+    await controller._supervisor_check_loop(
+        "runtime check", None, None, None, None, False
+    )
 
     assert supervisor.calls == 2
     assert store.get_bello_config().status == BelloStatus.STARTING
@@ -4743,10 +7775,14 @@ async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: 
     # After a successful recovery the consecutive no_message budget resets, so a recovered
     # provider does not carry earlier blips toward infra-invalid.
     assert controller.provider_failure_recovery_counts == {}
-    assert "supervisor produced no agent message" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "supervisor produced no agent message" in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
 
 
-async def test_repeated_runtime_supervisor_no_message_skips_current_review(tmp_path: Path) -> None:
+async def test_repeated_runtime_supervisor_no_message_skips_current_review(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
 
     class AlwaysNoMessageRuntimeSupervisor:
@@ -4764,7 +7800,9 @@ async def test_repeated_runtime_supervisor_no_message_skips_current_review(tmp_p
     supervisor = AlwaysNoMessageRuntimeSupervisor(store, controller.task_path)
     controller.supervisor = supervisor
 
-    await controller._supervisor_check_loop("runtime check", None, None, None, None, False)
+    await controller._supervisor_check_loop(
+        "runtime check", None, None, None, None, False
+    )
 
     assert supervisor.calls == 2
     assert store.get_bello_config().status == BelloStatus.STARTING
@@ -4772,13 +7810,17 @@ async def test_repeated_runtime_supervisor_no_message_skips_current_review(tmp_p
     assert controller.running is True
     assert controller._supervisor_dirty is False
     assert controller.provider_failure_recovery_counts["no_message"] == 2
-    assert controller.provider_failure_recovery_counts["runtime_monitor_no_message"] == 2
+    assert (
+        controller.provider_failure_recovery_counts["runtime_monitor_no_message"] == 2
+    )
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "retrying review from latest stable state" in progress
     assert "skipping this runtime-only review" in progress
 
 
-async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failure(tmp_path: Path) -> None:
+async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failure(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
 
     class AlwaysNoMessageSupervisor:
@@ -4803,17 +7845,26 @@ async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failu
     controller._completion_no_message_max_retries = 1
     controller._no_message_backoff_seconds = ()
 
-    await controller._supervisor_check_loop("completion check", None, None, None, None, True)
+    await controller._supervisor_check_loop(
+        "completion check", None, None, None, None, True
+    )
 
     assert supervisor.calls == 2
     assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert "infra-invalid: supervisor no_message provider failure after retry/resume" in report
+    assert (
+        "infra-invalid: supervisor no_message provider failure after retry/resume"
+        in report
+    )
     assert "- Status: provider_failure" in report
-    assert "repeated supervisor no_message" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "repeated supervisor no_message" in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
 
 
-async def test_completion_no_message_budget_rides_out_blip_before_infra_invalid(tmp_path: Path) -> None:
+async def test_completion_no_message_budget_rides_out_blip_before_infra_invalid(
+    tmp_path: Path,
+) -> None:
     # A transient provider blip (empty completions) must be ridden out with backed-off retries
     # up to the configurable budget; infra-invalid only fires after the full budget is spent.
     controller, store, _ = _runtime_controller(tmp_path)
@@ -4838,14 +7889,18 @@ async def test_completion_no_message_budget_rides_out_blip_before_infra_invalid(
     controller._completion_no_message_max_retries = 3
     controller._no_message_backoff_seconds = ()  # no real sleeping in the test
 
-    await controller._supervisor_check_loop("completion check", None, None, None, None, True)
+    await controller._supervisor_check_loop(
+        "completion check", None, None, None, None, True
+    )
 
     # 3 retries then the infra-invalid attempt = 4 model calls (old behavior gave up after 1 retry).
     assert supervisor.calls == 4
     assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
 
 
-async def test_preflight_appserver_timeout_writes_provider_failure_final_report(tmp_path: Path, monkeypatch) -> None:
+async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
+    tmp_path: Path, monkeypatch
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
 
@@ -4860,9 +7915,13 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
             return None
 
         async def account_read(self):
-            raise AppServerTimeoutError("app-server RPC account/read response timed out after 30s")
+            raise AppServerTimeoutError(
+                "app-server RPC account/read response timed out after 30s"
+            )
 
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -4917,7 +7976,9 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
             raise AssertionError("coder must not start with an unavailable model")
 
     client = MissingModelClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -4975,10 +8036,14 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
 
         async def thread_start(self, params):
             self.thread_started = True
-            raise AssertionError("coder must not start with an unavailable adversary model")
+            raise AssertionError(
+                "coder must not start with an unavailable adversary model"
+            )
 
     client = MissingAdversaryModelClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -5029,21 +8094,29 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
             return {}
 
         async def thread_start(self, params):
-                return {
-                    "thread": {"id": "probe-thread"},
-                    "approvalPolicy": "on-request",
-                    "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False},
-                }
+            return {
+                "thread": {"id": "probe-thread"},
+                "approvalPolicy": "on-request",
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [],
+                    "networkAccess": False,
+                },
+            }
 
         async def thread_archive(self, thread_id):
-            raise AssertionError("preflight probe cleanup should not archive threads without rollouts")
+            raise AssertionError(
+                "preflight probe cleanup should not archive threads without rollouts"
+            )
 
         async def thread_unsubscribe(self, thread_id):
             self.unsubscribed.append(thread_id)
             raise AppServerError("unsubscribe cleanup failed")
 
     client = ProbeCleanupClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -5072,7 +8145,9 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
     assert entry["error_type"] == "AppServerError"
 
 
-async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: Path, monkeypatch) -> None:
+async def test_preflight_rate_limit_probe_failure_warns_and_continues(
+    tmp_path: Path, monkeypatch
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
 
@@ -5095,11 +8170,15 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
             return {}
 
         async def thread_start(self, params):
-                return {
-                    "thread": {"id": "probe-thread"},
-                    "approvalPolicy": "on-request",
-                    "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False},
-                }
+            return {
+                "thread": {"id": "probe-thread"},
+                "approvalPolicy": "on-request",
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [],
+                    "networkAccess": False,
+                },
+            }
 
         async def thread_unsubscribe(self, thread_id):
             self.unsubscribed.append(thread_id)
@@ -5107,7 +8186,9 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
 
     client = RateLimitFailureClient()
     tui = _FakeTUI()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -5136,7 +8217,9 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
     assert entry["error_type"] == "AppServerError"
 
 
-async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path: Path, monkeypatch) -> None:
+async def test_preflight_accepts_configured_danger_full_access_sandbox(
+    tmp_path: Path, monkeypatch
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
 
@@ -5171,7 +8254,9 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
 
     client = DangerSandboxClient()
     monkeypatch.setenv("BELLO_CODER_SANDBOX", "danger-full-access")
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -5191,18 +8276,140 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
     assert client.unsubscribed == ["probe-thread"]
 
 
-async def test_server_request_respond_timeout_writes_provider_failure_final_report(tmp_path: Path) -> None:
+async def test_preflight_tolerates_unsupported_config_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    class UnsupportedConfigClient:
+        async def account_read(self):
+            return {"requiresOpenaiAuth": False, "account": {"id": "acct"}}
+
+        async def account_rate_limits_read(self):
+            return {}
+
+        async def model_list(self):
+            return {"data": [{"id": DEFAULT_MODEL}]}
+
+        async def config_requirements_read(self):
+            return {}
+
+        async def config_read(self):
+            raise AppServerError("-32601 Method not found: config/read")
+
+        async def thread_start(self, params):
+            return {
+                "thread": {"id": "probe-thread"},
+                "approvalPolicy": "on-request",
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [],
+                    "networkAccess": False,
+                },
+            }
+
+        async def thread_unsubscribe(self, thread_id):
+            return {}
+
+    tui = _FakeTUI()
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
+    controller = BelloController(
+        tmp_path,
+        task_path=task,
+        client=UnsupportedConfigClient(),  # type: ignore[arg-type]
+        tui=tui,
+        overwrite_state=True,
+        use_git_diff=False,
+    )
+    controller._generate_schema_hash_async = _async_schema_hash
+    controller._structured_output_self_test = _async_noop
+    controller.initialize_state()
+
+    await controller.preflight()
+
+    assert controller._configured_mcp_server_names == ()
+    assert controller._configured_plugin_names == ()
+    entries = [
+        json.loads(line)
+        for line in controller.store.path(LOG).read_text(encoding="utf-8").splitlines()
+    ]
+    warning = next(
+        entry
+        for entry in entries
+        if entry.get("type") == "preflight_warning"
+        and entry.get("check") == "config_read"
+    )
+    assert warning["fallback"] == "empty_capability_inventory"
+    assert any("config/read is unsupported" in message for _, message in tui.messages)
+
+
+async def test_preflight_does_not_hide_config_error_containing_unknown_method(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+
+    class InvalidConfigClient:
+        async def account_read(self):
+            return {"requiresOpenaiAuth": False, "account": {"id": "acct"}}
+
+        async def account_rate_limits_read(self):
+            return {}
+
+        async def model_list(self):
+            return {"data": [{"id": DEFAULT_MODEL}]}
+
+        async def config_requirements_read(self):
+            return {}
+
+        async def config_read(self):
+            raise AppServerError(
+                "failed to parse config: unknown method value in plugin settings"
+            )
+
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
+    controller = BelloController(
+        tmp_path,
+        task_path=task,
+        client=InvalidConfigClient(),  # type: ignore[arg-type]
+        tui=_FakeTUI(),
+        overwrite_state=True,
+        use_git_diff=False,
+    )
+    controller._generate_schema_hash_async = _async_schema_hash
+    controller._structured_output_self_test = _async_noop
+    controller.initialize_state()
+
+    with pytest.raises(AppServerError, match="unknown method value"):
+        await controller.preflight()
+
+
+async def test_server_request_respond_timeout_writes_provider_failure_final_report(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="thread",
+            active_coder_turn_id="turn",
+        ),
         overwrite=True,
     )
 
     class RespondTimeoutClient:
         async def respond(self, request_id, response):
-            raise AppServerTimeoutError("app-server respond 61 send timed out after 15s")
+            raise AppServerTimeoutError(
+                "app-server respond 61 send timed out after 15s"
+            )
 
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
@@ -5226,7 +8433,10 @@ async def test_server_request_respond_timeout_writes_provider_failure_final_repo
                 {
                     "id": 61,
                     "method": "item/fileChange/requestApproval",
-                    "params": {"grantRoot": str(tmp_path / "src.py"), "availableDecisions": ["accept", "decline"]},
+                    "params": {
+                        "grantRoot": str(tmp_path / "src.py"),
+                        "availableDecisions": ["accept", "decline"],
+                    },
                 }
             ),
         )
@@ -5240,12 +8450,18 @@ async def test_server_request_respond_timeout_writes_provider_failure_final_repo
     assert controller.running is False
 
 
-async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp_path: Path) -> None:
+async def test_coder_turn_start_timeout_writes_provider_failure_final_report(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="coder-thread",
+        ),
         overwrite=True,
     )
 
@@ -5255,7 +8471,9 @@ async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp
 
         async def turn_start(self, params, *, timeout):
             assert timeout == APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
-            raise AppServerTimeoutError(f"app-server RPC turn/start response timed out after {timeout:g}s")
+            raise AppServerTimeoutError(
+                f"app-server RPC turn/start response timed out after {timeout:g}s"
+            )
 
     controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
@@ -5306,7 +8524,10 @@ async def test_restart_preserves_coder_intelligence(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
+    store.ensure_coder_checklist("B-1 IMPLEMENTED parser\nB-2 TODO CLI boundary\n")
 
     class FakeClient:
         def __init__(self) -> None:
@@ -5341,13 +8562,19 @@ async def test_restart_preserves_coder_intelligence(tmp_path: Path) -> None:
     assert controller.coder is not None
     assert controller.coder.intelligence == "high"
     assert client.turn_params[-1]["effort"] == "high"
+    assert (
+        store.read_coder_checklist()
+        == "B-1 IMPLEMENTED parser\nB-2 TODO CLI boundary\n"
+    )
 
 
 async def test_supervisor_decision_can_clear_handoff(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     store.write_handoff("restart context\n")
 
     controller = BelloController.__new__(BelloController)
@@ -5370,7 +8597,9 @@ def test_structured_handoff_is_read_back_verbatim(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     handoff = RestartHandoff(
         objective="task",
         restart_reason="loop",
@@ -5389,11 +8618,15 @@ def test_structured_handoff_is_read_back_verbatim(tmp_path: Path) -> None:
     assert packet.handoff == handoff
 
 
-async def test_controller_approval_packet_carries_structured_context(tmp_path: Path) -> None:
+async def test_controller_approval_packet_carries_structured_context(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True
+    )
     context = normalize_approval_request(
         AppServerMessage(
             {
@@ -5436,8 +8669,14 @@ async def test_controller_approval_packet_carries_structured_context(tmp_path: P
     controller.supervisor = fake
     controller.pending_approvals = {context.server_request_id: context}
     controller.last_coder_message = CoderMessage(text="ready", sequence=1)
-    controller.validations = [ValidationRun(command="pytest", exit_code=1, passed=False, summary="failed", sequence=2)]
-    controller.prior_interventions = [PriorIntervention(reason="drift", message_to_coder="focus", sequence=3)]
+    controller.validations = [
+        ValidationRun(
+            command="pytest", exit_code=1, passed=False, summary="failed", sequence=2
+        )
+    ]
+    controller.prior_interventions = [
+        PriorIntervention(reason="drift", message_to_coder="focus", sequence=3)
+    ]
     controller.use_git_diff = False
 
     await controller.decide_approval(context, "needs judgment")
@@ -5456,7 +8695,12 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="thread",
+            active_coder_turn_id="turn",
+        ),
         overwrite=True,
     )
     context = normalize_approval_request(
@@ -5464,7 +8708,10 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
             {
                 "id": 51,
                 "method": "item/commandExecution/requestApproval",
-                "params": {"command": "curl https://example.com", "availableDecisions": ["accept", "decline", "cancel"]},
+                "params": {
+                    "command": "curl https://example.com",
+                    "availableDecisions": ["accept", "decline", "cancel"],
+                },
             }
         )
     )
@@ -5503,7 +8750,15 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
     controller.tui = _FakeTUI()
     controller._sequence = 0
 
-    await controller.handle_server_request(AppServerMessage({"id": 51, "method": context.server_request_method, "params": context.raw_params}))
+    await controller.handle_server_request(
+        AppServerMessage(
+            {
+                "id": 51,
+                "method": context.server_request_method,
+                "params": context.raw_params,
+            }
+        )
+    )
 
     assert controller.client.responses == [(51, {"decision": "decline"})]
     assert controller.coder.messages == ["Network access is not required by the task."]
@@ -5514,7 +8769,12 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="thread",
+            active_coder_turn_id="turn",
+        ),
         overwrite=True,
     )
 
@@ -5557,15 +8817,23 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
     )
 
     assert controller.client.responses == [(52, {"decision": "decline"})]
-    assert controller.coder.messages == ["writes to supervisor runtime/state files are denied"]
+    assert controller.coder.messages == [
+        "writes to supervisor runtime/state files are denied"
+    ]
 
 
-async def test_adversary_file_change_request_is_denied_without_steering_coder(tmp_path: Path) -> None:
+async def test_adversary_file_change_request_is_denied_without_steering_coder(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="coder-thread",
+        ),
         overwrite=True,
     )
 
@@ -5625,7 +8893,12 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="thread",
+            active_coder_turn_id="turn",
+        ),
         overwrite=True,
     )
 
@@ -5642,7 +8915,9 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
             self.started_messages = []
 
         async def steer_or_start(self, message):
-            raise AppServerError("{'code': -32600, 'message': 'no active turn to steer'}")
+            raise AppServerError(
+                "{'code': -32600, 'message': 'no active turn to steer'}"
+            )
 
         async def start_turn(self, message):
             self.started_messages.append(message)
@@ -5677,9 +8952,13 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
     assert controller.client.responses == [(55, {"decision": "decline"})]
     assert health.denied_requests == 1
     assert health.last_denial == "writes to supervisor runtime/state files are denied"
-    assert coder.started_messages == ["writes to supervisor runtime/state files are denied"]
+    assert coder.started_messages == [
+        "writes to supervisor runtime/state files are denied"
+    ]
     assert store.get_bello_config().active_coder_turn_id == "new-turn"
-    assert "started a new coder turn with the denial reason" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "started a new coder turn with the denial reason" in store.path(
+        PROGRESS
+    ).read_text(encoding="utf-8")
 
 
 async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
@@ -5687,7 +8966,12 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="thread",
+            active_coder_turn_id="turn",
+        ),
         overwrite=True,
     )
 
@@ -5721,7 +9005,10 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
             {
                 "id": 53,
                 "method": "item/fileChange/requestApproval",
-                "params": {"grantRoot": str(tmp_path / "src.py"), "availableDecisions": ["accept", "decline"]},
+                "params": {
+                    "grantRoot": str(tmp_path / "src.py"),
+                    "availableDecisions": ["accept", "decline"],
+                },
             }
         )
     )
@@ -5730,16 +9017,25 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
     assert controller.coder.messages == []
 
 
-async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path: Path) -> None:
+async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path=str(task),
+            coder_thread_id="thread",
+            active_coder_turn_id="turn",
+        ),
         overwrite=True,
     )
     amendment = ["/bin/zsh", "-lc", "printf 'hello bello\\n' > hello.txt"]
-    offered_decision = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}}
+    offered_decision = {
+        "acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}
+    }
 
     class FakeSupervisor:
         async def decide_approval(self, context, reason):
@@ -5794,7 +9090,9 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path:
     assert controller.coder.messages == []
 
 
-async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path: Path, monkeypatch) -> None:
+async def test_run_shutdown_after_final_report_stops_stubbed_appserver(
+    tmp_path: Path, monkeypatch
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
 
@@ -5837,7 +9135,11 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
             return {
                 "thread": {"id": f"thread-{self.thread_count}"},
                 "approvalPolicy": "on-request",
-                "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False},
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [],
+                    "networkAccess": False,
+                },
             }
 
         async def thread_unsubscribe(self, thread_id, **kwargs):
@@ -5848,7 +9150,9 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
             return {"turn": {"id": "turn-1", "status": "running"}}
 
     client = ShutdownClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    monkeypatch.setattr(
+        "supervisor.controller._run_probe", lambda args: (True, "codex-cli test")
+    )
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -5882,21 +9186,27 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     assert controller.completion_supervisor is not controller.supervisor
     assert controller.completion_supervisor.model == "gpt-completion"
     assert controller.completion_supervisor.intelligence == "high"
+    assert controller.adv_report_controller is not None
+    assert controller.adv_report_controller is not controller.completion_supervisor
+    assert controller.adv_report_controller.model == "gpt-completion"
+    assert controller.adv_report_controller.intelligence == "high"
     assert client.stopped is True
     assert controller.running is False
 
 
-async def test_finalize_writes_report_and_status_before_terminal_shutdown(tmp_path: Path) -> None:
+async def test_finalize_quiesces_before_writing_report_and_status(
+    tmp_path: Path,
+) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     shutdown_seen = False
 
     async def fake_prepare_terminal_shutdown(reason: str) -> None:
         nonlocal shutdown_seen
         shutdown_seen = True
-        assert store.get_bello_config().status == BelloStatus.COMPLETE
+        assert reason == "finalizing: task complete"
+        assert store.get_bello_config().status == BelloStatus.STARTING
         report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-        assert "# Final Report" in report
-        assert "task complete" in report
+        assert "task complete" not in report
 
     controller._prepare_terminal_shutdown = fake_prepare_terminal_shutdown  # type: ignore[method-assign]
 
@@ -5904,7 +9214,9 @@ async def test_finalize_writes_report_and_status_before_terminal_shutdown(tmp_pa
 
     assert shutdown_seen is True
     assert store.get_bello_config().status == BelloStatus.COMPLETE
-    assert store.path(FINAL_REPORT).read_text(encoding="utf-8").strip()
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "# Final Report" in report
+    assert "task complete" in report
 
 
 def test_run_async_cleanly_exits_zero_after_loop_cleanup() -> None:
@@ -5931,6 +9243,30 @@ class _GateFakeCoder:
         return "turn"
 
 
+class _FakeAdvReportController:
+    def __init__(
+        self,
+        decision: AdvReportControllerDecision | None = None,
+        *,
+        decisions: list[AdvReportControllerDecision] | None = None,
+    ) -> None:
+        self.packets: list[SupervisorWakePacket] = []
+        self.decision = decision or AdvReportControllerDecision(
+            forward_to_coder=False,
+            reason="no findings or observations remain",
+            report_to_coder=None,
+        )
+        self.decisions = list(decisions or [])
+
+    async def decide_adv_report(
+        self, packet: SupervisorWakePacket
+    ) -> AdvReportControllerDecision:
+        self.packets.append(packet)
+        if self.decisions:
+            return self.decisions.pop(0)
+        return self.decision
+
+
 def _completion_gate_controller(
     tmp_path: Path,
     *,
@@ -5941,7 +9277,9 @@ def _completion_gate_controller(
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
     coder = _GateFakeCoder()
@@ -5950,6 +9288,7 @@ def _completion_gate_controller(
     controller.task_path = task
     controller.store = store
     controller.supervisor = None
+    controller.adv_report_controller = _FakeAdvReportController()
     controller.coder = coder
     controller.pending_approvals = {}
     controller.last_coder_message = None
@@ -5994,6 +9333,14 @@ class _RuntimeFakeSupervisor:
         self.completion_packets = []
         self.completion_thread_id = None
         self.closed_completion_reviews = 0
+        self.last_completion_review_items = [
+            {
+                "type": "commandExecution",
+                "command": "cat TASK.md",
+                "exitCode": 0,
+                "output": "# Task",
+            }
+        ]
 
     def build_packet(self, **kwargs):
         return self.agent.build_packet(**kwargs)
@@ -6044,12 +9391,16 @@ class _CheapRuntimeNoopReviewer:
         return CheapRuntimeDecision(decision="noop", reason_code="routine_progress")
 
 
-def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _RuntimeFakeSupervisor]:
+def _runtime_controller(
+    tmp_path: Path,
+) -> tuple[BelloController, StateStore, _RuntimeFakeSupervisor]:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
     fake = _RuntimeFakeSupervisor(store, task)
@@ -6058,6 +9409,7 @@ def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _R
     controller.task_path = task
     controller.store = store
     controller.supervisor = fake
+    controller.adv_report_controller = _FakeAdvReportController()
     controller.coder = None
     controller.pending_approvals = {}
     controller.last_coder_message = None
@@ -6096,7 +9448,9 @@ def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _R
     return controller, store, fake
 
 
-async def test_controller_idle_guard_forces_completion_review_for_stalled_no_active_turn(tmp_path: Path) -> None:
+async def test_controller_idle_guard_forces_completion_review_for_stalled_no_active_turn(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     class FakeCoder:
@@ -6133,24 +9487,45 @@ async def test_controller_idle_guard_forces_completion_review_for_stalled_no_act
     assert '"type": "controller_idle_guard"' in log
 
 
-def _covered_accept_decision(*, wake_sequence: int, validation_id: str = "validation-3") -> CompletionReviewDecision:
+def _covered_accept_decision(
+    *,
+    wake_sequence: int,
+    validation_id: str = "validation-3",
+    validation_command: str = "pytest tests/test_app.py",
+    reviewed_files: tuple[str, ...] = ("src/app.py", "tests/test_app.py"),
+) -> CompletionReviewDecision:
     return CompletionReviewDecision.model_validate(
         {
             "decision": "accept",
             "reason": "covered",
+            "decision_artifact": {
+                "current_state": "the requested behavior is implemented and its current validation passes",
+                "resolved_concerns": [],
+                "stale_concerns": [],
+                "uncovered_edge_candidates": [],
+                "actionable_gap_or_none": None,
+            },
             "files_reviewed": [
-                {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None},
-                {"path": "tests/test_app.py", "reason": "changed test", "kind": "test", "inspected": True, "limitation": None},
+                {
+                    "path": path,
+                    "reason": "changed test"
+                    if path.startswith("tests/")
+                    else "changed source",
+                    "kind": "test" if path.startswith("tests/") else "source",
+                    "inspected": True,
+                    "limitation": None,
+                }
+                for path in reviewed_files
             ],
             "behavior_evidence_matrix": [
                 {
                     "behavior": "requested behavior",
                     "task_basis": "TASK.md",
-                    "files_considered": ["src/app.py", "tests/test_app.py"],
+                    "files_considered": list(reviewed_files),
                     "evidence": [
                         {
                             "validation_id": validation_id,
-                            "command": "pytest tests/test_app.py",
+                            "command": validation_command,
                             "sequence": 3,
                             "validation_type": "behavioral",
                             "outcome": "pass",
@@ -6167,6 +9542,13 @@ def _covered_accept_decision(*, wake_sequence: int, validation_id: str = "valida
             "claim_evidence_mismatches": [],
             "packet_or_access_limitations": [],
             "changed_test_risks": [],
+            "behavior_surface": [
+                {
+                    "category": "requested behavior",
+                    "status": "required",
+                    "note": None,
+                }
+            ],
             "message_to_coder": None,
             "persistent_decision": None,
             "progress_update": "Accepted by completion review.",
@@ -6203,7 +9585,9 @@ def _gate_packet(
     )
 
 
-async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without_rerun(tmp_path: Path) -> None:
+async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without_rerun(
+    tmp_path: Path,
+) -> None:
     validations = [
         ValidationRun(
             validation_id="validation-old",
@@ -6225,7 +9609,9 @@ async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without
             sequence=15,
         ),
     ]
-    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path, validations=validations
+    )
     packet = _gate_packet(task, validations=validations, wake_sequence=20)
     packet.completion_payload_mode = "delta"
     packet.completion_payload_since_sequence = 10
@@ -6251,14 +9637,20 @@ async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without
         }
     )
 
-    await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
+    await controller.apply_completion_decision(
+        decision, packet_thread_id="thread", packet=packet
+    )
 
     assert coder.messages == ["provide direct behavior evidence"]
     assert len(controller.completion_returns) == 1
     assert controller.completion_decision_staleness_rerun_count == 0
     assert getattr(controller, "completion_return_freshness_rerun_count", 0) == 0
-    assert "stale return ignored fresh delta evidence" not in store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "completion_return_freshness_failure" not in store.path(LOG).read_text(encoding="utf-8")
+    assert "stale return ignored fresh delta evidence" not in store.path(
+        PROGRESS
+    ).read_text(encoding="utf-8")
+    assert "completion_return_freshness_failure" not in store.path(LOG).read_text(
+        encoding="utf-8"
+    )
 
 
 class _FakeTUI:
@@ -6306,6 +9698,121 @@ def test_adversary_snapshot_gets_functional_git_repo(tmp_path: Path) -> None:
         assert "?? app.py" in status.stdout
     finally:
         _shutil.rmtree(snapshot.parent, ignore_errors=True)
+
+
+def test_adversary_snapshot_cannot_follow_links_outside_snapshot(
+    tmp_path: Path,
+) -> None:
+    from supervisor.controller import _create_adversary_snapshot
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    app = project / "app.py"
+    app.write_text("print('safe')\n", encoding="utf-8")
+    private = project / ".supervisor" / "coder" / "CHECKLIST.md"
+    private.parent.mkdir(parents=True)
+    private.write_text("PRIVATE\n", encoding="utf-8")
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("OUTSIDE\n", encoding="utf-8")
+    os.symlink(private, project / "private-link")
+    os.symlink(outside, project / "outside-link")
+    os.symlink("../outside-secret.txt", project / "relative-outside-link")
+    os.symlink(app, project / "internal-link")
+    # A coder workspace exposes TASK.md as an absolute read-only link to the
+    # canonical task.  The adversary copy must materialize content, not retain it.
+    os.symlink(outside, project / "TASK.md")
+
+    snapshot = _create_adversary_snapshot(
+        project,
+        task_relative_path="TASK.md",
+        task_contents="# Blind task\n",
+    )
+    try:
+        assert not (snapshot / "private-link").exists()
+        assert not (snapshot / "private-link").is_symlink()
+        assert not (snapshot / "outside-link").exists()
+        assert not (snapshot / "outside-link").is_symlink()
+        assert not (snapshot / "relative-outside-link").exists()
+        assert not (snapshot / "relative-outside-link").is_symlink()
+        assert (snapshot / "internal-link").is_symlink()
+        assert (snapshot / "internal-link").resolve() == snapshot / "app.py"
+        assert (snapshot / "TASK.md").is_file()
+        assert not (snapshot / "TASK.md").is_symlink()
+        assert (snapshot / "TASK.md").read_text(encoding="utf-8") == "# Blind task\n"
+        assert not (snapshot / ".supervisor").exists()
+    finally:
+        import shutil as _shutil
+
+        _shutil.rmtree(snapshot.parent, ignore_errors=True)
+
+
+def test_adversary_snapshot_restores_only_approved_coder_dependency_mounts(
+    tmp_path: Path,
+) -> None:
+    import shutil as _shutil
+
+    from supervisor.controller import (
+        _approved_adversary_dependency_mounts,
+        _create_adversary_snapshot,
+    )
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    dependency = project / "node_modules" / "pkg"
+    dependency.mkdir(parents=True)
+    (dependency / "index.js").write_text("module.exports = 7;\n", encoding="utf-8")
+    venv_bin = project / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "tool").write_text("ready\n", encoding="utf-8")
+    coder_snapshot = create_workspace_snapshot(project, task)
+    adversary_snapshot: Path | None = None
+    try:
+        mounts = _approved_adversary_dependency_mounts(
+            coder_snapshot,
+            active_workspace_root=coder_snapshot.snapshot_root,
+        )
+        assert {mount.relative_path for mount in mounts} == {
+            ".venv",
+            "node_modules",
+        }
+
+        # The coder-side link is untrusted.  Repoint it outside; the adversary
+        # mount must still be rebuilt from immutable original snapshot metadata.
+        malicious = tmp_path / "malicious-node-modules"
+        malicious.mkdir()
+        (malicious / "payload.js").write_text("malicious\n", encoding="utf-8")
+        coder_node_modules = coder_snapshot.snapshot_root / "node_modules"
+        coder_node_modules.unlink()
+        coder_node_modules.symlink_to(malicious, target_is_directory=True)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret\n", encoding="utf-8")
+        (coder_snapshot.snapshot_root / "arbitrary-link").symlink_to(outside)
+
+        adversary_snapshot = _create_adversary_snapshot(
+            coder_snapshot.snapshot_root,
+            task_relative_path="TASK.md",
+            task_contents="# Task\n",
+            approved_readonly_dependency_mounts=mounts,
+        )
+
+        adversary_node_modules = adversary_snapshot / "node_modules"
+        assert adversary_node_modules.is_symlink()
+        assert adversary_node_modules.resolve() == (project / "node_modules").resolve()
+        assert (adversary_node_modules / "pkg" / "index.js").read_text(
+            encoding="utf-8"
+        ) == "module.exports = 7;\n"
+        assert (adversary_snapshot / ".venv" / "bin" / "tool").read_text(
+            encoding="utf-8"
+        ) == "ready\n"
+        assert not (adversary_snapshot / "arbitrary-link").exists()
+        assert not (adversary_snapshot / "arbitrary-link").is_symlink()
+        assert not (adversary_node_modules / "payload.js").exists()
+    finally:
+        if adversary_snapshot is not None:
+            _shutil.rmtree(adversary_snapshot.parent, ignore_errors=True)
+        coder_snapshot.cleanup()
 
 
 def test_adversary_snapshot_git_ignores_global_template_hooks(
@@ -6360,6 +9867,371 @@ def test_workspace_state_id_does_not_open_fifo(tmp_path: Path) -> None:
     assert fifo_state != file_state
 
 
+def test_workspace_state_id_changes_when_executable_mode_changes(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "run.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o644)
+    before = _workspace_state_id(tmp_path)
+
+    script.chmod(0o755)
+
+    assert _workspace_state_id(tmp_path) != before
+
+
+def test_completion_reviewer_evidence_paths_are_exact_and_workspace_relative(
+    tmp_path: Path,
+) -> None:
+    inside = tmp_path / "report.pdf"
+    inside.write_bytes(b"pdf")
+
+    absolute_inside = _completion_reviewer_evidence_from_item(
+        {"type": "commandExecution", "command": f"cat {inside}", "exitCode": 0},
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+    outside = _completion_reviewer_evidence_from_item(
+        {"type": "commandExecution", "command": "cat /tmp/report.pdf", "exitCode": 0},
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+    traversal = _completion_reviewer_evidence_from_item(
+        {"type": "commandExecution", "command": "cat ../report.pdf", "exitCode": 0},
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+    wrong_directory = _completion_reviewer_evidence_from_item(
+        {"type": "commandExecution", "command": "cat nested/report.pdf", "exitCode": 0},
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert absolute_inside is not None and absolute_inside.paths == ("report.pdf",)
+    assert outside is not None and outside.paths == ()
+    assert traversal is not None and traversal.paths == ()
+    assert wrong_directory is not None and wrong_directory.paths == (
+        "nested/report.pdf",
+    )
+    assert not _reviewer_evidence_covers_path(
+        [wrong_directory],
+        "report.pdf",
+        workspace_state_id="state",
+    )
+
+
+def test_completion_reviewer_evidence_binds_capability_to_exact_command_segment(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("read me", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("enabled: true", encoding="utf-8")
+    compound = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "cat README.md && true config.yaml",
+            "exitCode": 0,
+            "output": "read me",
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert compound is not None
+    assert "config.yaml" in compound.paths
+    assert not _reviewer_evidence_covers_static_file(
+        [compound],
+        "config.yaml",
+        workspace_state_id="state",
+        task_contents="Update config.yaml",
+    )
+
+    direct = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "cat config.yaml",
+            "exitCode": 0,
+            "output": "enabled: true",
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert direct is not None
+    assert _reviewer_evidence_covers_static_file(
+        [direct],
+        "config.yaml",
+        workspace_state_id="state",
+        task_contents="Update config.yaml",
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        ("true src/app.py", ""),
+        ("printf src/app.py", "src/app.py"),
+        ("git diff --name-only -- src/app.py", "src/app.py"),
+        ("git diff --stat -- src/app.py", " src/app.py | 1 +"),
+        (
+            "GIT_EXTERNAL_DIFF=echo git diff -- src/app.py",
+            "src/app.py old-hash old-mode new-file new-hash new-mode",
+        ),
+        (
+            "head -n 0 src/app.py other.txt",
+            "==> src/app.py <==\n==> other.txt <==",
+        ),
+        (
+            "tail --lines=0 src/app.py other.txt",
+            "==> src/app.py <==\n==> other.txt <==",
+        ),
+    ],
+)
+def test_completion_reviewer_path_decoys_do_not_count_as_source_reads(
+    tmp_path: Path, command: str, output: str
+) -> None:
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    evidence = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": command,
+            "exitCode": 0,
+            "output": output,
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert evidence is not None
+    assert "src/app.py" in evidence.paths
+    assert not _reviewer_evidence_covers_path(
+        [evidence], "src/app.py", workspace_state_id="state"
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        (
+            "git diff -- src/app.py",
+            "diff --git a/src/app.py b/src/app.py\n"
+            "--- a/src/app.py\n+++ b/src/app.py\n"
+            "@@ -1 +1 @@\n-VALUE = 0\n+VALUE = 1\n",
+        ),
+        ("rg -n 'VALUE' src/app.py", "1:VALUE = 1"),
+        ("rg -n -C 1 'VALUE' src/app.py", "1:VALUE = 1"),
+        ("grep -n VALUE src/app.py", "1:VALUE = 1"),
+        ("grep -n --context=1 VALUE src/app.py", "1:VALUE = 1"),
+        ("head -n 1 src/app.py", "VALUE = 1"),
+    ],
+)
+def test_completion_reviewer_content_commands_count_as_source_reads(
+    tmp_path: Path, command: str, output: str
+) -> None:
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    evidence = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": command,
+            "exitCode": 0,
+            "output": output,
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert evidence is not None
+    assert _reviewer_evidence_covers_path(
+        [evidence], "src/app.py", workspace_state_id="state"
+    )
+
+
+def test_multifile_git_diff_binds_late_patch_paths_before_summary_truncation(
+    tmp_path: Path,
+) -> None:
+    source_a = tmp_path / "src" / "a.py"
+    source_b = tmp_path / "src" / "b.py"
+    source_a.parent.mkdir()
+    source_a.write_text("A = 1\n", encoding="utf-8")
+    source_b.write_text("B = 1\n", encoding="utf-8")
+    large_first_patch = "+" + ("x" * 3500)
+    output = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n"
+        f"@@ -1 +1 @@\n-A = 0\n{large_first_patch}\n"
+        "diff --git a/src/b.py b/src/b.py\n"
+        "--- a/src/b.py\n+++ b/src/b.py\n"
+        "@@ -1 +1 @@\n-B = 0\n+B = 1\n"
+    )
+    evidence = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "git diff -- src/a.py src/b.py",
+            "exitCode": 0,
+            "output": output,
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert evidence is not None
+    assert len(evidence.summary) <= 2000
+    assert evidence.patch_paths == ("src/a.py", "src/b.py")
+    assert _reviewer_evidence_covers_path(
+        [evidence], "src/a.py", workspace_state_id="state"
+    )
+    assert _reviewer_evidence_covers_path(
+        [evidence], "src/b.py", workspace_state_id="state"
+    )
+
+
+def test_completion_reviewer_successful_cat_can_inspect_an_empty_source_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "empty.py"
+    source.write_text("", encoding="utf-8")
+    evidence = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "cat empty.py",
+            "exitCode": 0,
+            "output": "",
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert evidence is not None
+    assert evidence.observed_output is False
+    assert evidence.empty_paths == ("empty.py",)
+    assert _reviewer_evidence_covers_path(
+        [evidence], "empty.py", workspace_state_id="state"
+    )
+
+
+def test_completion_source_access_requires_real_read_even_without_changed_files(
+    tmp_path: Path,
+) -> None:
+    controller, _store, task, _coder = _completion_gate_controller(
+        tmp_path, validations=[]
+    )
+    packet = _gate_packet(task, validations=[])
+    packet.changed_files = []
+    decision = CompletionReviewDecision(
+        decision="return",
+        reason="review current state",
+        validation_gaps=["current implementation needs review"],
+        message_to_coder="inspect current implementation",
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+    state = _workspace_state_id(tmp_path)
+    controller.completion_reviewer_evidence = []
+
+    issue = controller._completion_review_access_issue(
+        decision, packet=packet, workspace_state_id=state
+    )
+
+    assert issue is not None
+    assert "capable workspace-bound read" in issue
+
+    task_evidence = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "sed -n '1,120p' TASK.md",
+            "exitCode": 0,
+            "output": "# Task",
+        },
+        workspace_state_id=state,
+        workspace_root=tmp_path,
+    )
+    assert task_evidence is not None
+    controller.completion_reviewer_evidence = [task_evidence]
+
+    assert (
+        controller._completion_review_access_issue(
+            decision, packet=packet, workspace_state_id=state
+        )
+        is None
+    )
+
+
+def test_completion_reviewer_evidence_ignores_shell_comment_paths(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("read me", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("enabled: true", encoding="utf-8")
+    commented = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "cat README.md # config.yaml",
+            "exitCode": 0,
+            "output": "read me",
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert commented is not None
+    assert commented.paths == ("README.md",)
+    assert not _reviewer_evidence_covers_static_file(
+        [commented],
+        "config.yaml",
+        workspace_state_id="state",
+        task_contents="Update config.yaml",
+    )
+
+
+def test_completion_reviewer_render_requires_the_viewed_derived_output(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"pdf")
+    render = _completion_reviewer_evidence_from_item(
+        {
+            "type": "commandExecution",
+            "command": "pdftoppm -png report.pdf /tmp/report-page",
+            "exitCode": 0,
+        },
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+    unrelated_view = _completion_reviewer_evidence_from_item(
+        {"type": "imageView", "path": "/tmp/logo.png", "status": "completed"},
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+    derived_view = _completion_reviewer_evidence_from_item(
+        {"type": "imageView", "path": "/tmp/report-page-1.png", "status": "completed"},
+        workspace_state_id="state",
+        workspace_root=tmp_path,
+    )
+
+    assert (
+        render is not None and unrelated_view is not None and derived_view is not None
+    )
+    assert not _reviewer_evidence_covers_static_file(
+        [render, unrelated_view],
+        "report.pdf",
+        workspace_state_id="state",
+        task_contents="Create report.pdf",
+    )
+    assert _reviewer_evidence_covers_static_file(
+        [render, derived_view],
+        "report.pdf",
+        workspace_state_id="state",
+        task_contents="Create report.pdf",
+    )
+
+
 def test_workspace_context_reader_and_hasher_reject_fifo(tmp_path: Path) -> None:
     if not hasattr(os, "mkfifo"):
         pytest.skip("FIFO files are not supported on this platform")
@@ -6371,12 +10243,129 @@ def test_workspace_context_reader_and_hasher_reject_fifo(tmp_path: Path) -> None
         _hash_file(fifo)
 
 
+def test_completion_review_token_tracks_controller_and_git_state(
+    tmp_path: Path,
+) -> None:
+    controller, store, _, _ = _completion_gate_controller(tmp_path, validations=[])
+    controller._completion_product_revision = 0
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    tracked.write_text("two\n", encoding="utf-8")
+
+    before_stage = controller._capture_completion_review_token()
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+
+    assert "git_state_id" in (
+        controller._completion_review_token_issue(before_stage) or ""
+    )
+
+    before_exclude = controller._capture_completion_review_token()
+    exclude = tmp_path / ".git" / "info" / "exclude"
+    exclude.write_text(
+        exclude.read_text(encoding="utf-8") + "\nignored.local\n", encoding="utf-8"
+    )
+    assert "git_state_id" in (
+        controller._completion_review_token_issue(before_exclude) or ""
+    )
+
+    current = controller._capture_completion_review_token()
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": "new-turn"})
+    )
+    assert "active_coder_turn_id" in (
+        controller._completion_review_token_issue(current) or ""
+    )
+
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None})
+    )
+    current = controller._capture_completion_review_token()
+    controller.pending_approvals["request-1"] = SimpleNamespace(
+        request_type="command",
+        thread_id="thread",
+        turn_id="turn",
+        item_id="item",
+        command="echo hello",
+        grant_root=None,
+    )
+    assert "pending_approvals_fingerprint" in (
+        controller._completion_review_token_issue(current) or ""
+    )
+
+    controller.pending_approvals.clear()
+    current = controller._capture_completion_review_token()
+    controller._bump_completion_product_revision()
+    assert "product_revision" in (
+        controller._completion_review_token_issue(current) or ""
+    )
+
+
+def test_git_review_state_tracks_common_ref_in_linked_worktree(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-qb", "linked-review", str(linked)],
+        cwd=repository,
+        check=True,
+    )
+    before = _git_review_state_id(linked)
+
+    tracked.write_text("two\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "second"], cwd=repository, check=True)
+    new_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+    ).strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/heads/linked-review", new_head],
+        cwd=repository,
+        check=True,
+    )
+
+    assert _git_review_state_id(linked) != before
+
+
+def test_completion_review_token_tracks_task_outside_active_workspace(
+    tmp_path: Path,
+) -> None:
+    controller, _, task, _ = _completion_gate_controller(tmp_path, validations=[])
+    workspace = tmp_path / "snapshot"
+    workspace.mkdir()
+    controller.workspace_root = workspace
+    current = controller._capture_completion_review_token()
+
+    task.write_text("# Changed task", encoding="utf-8")
+
+    issue = controller._completion_review_token_issue(current)
+    assert issue is not None
+    assert "task_state_id" in issue
+
+
 def test_effective_max_adversary_runs_cli_override(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
     controller = BelloController.__new__(BelloController)
@@ -6405,10 +10394,14 @@ class _FakeSteerCoder:
         self.steers.append(message)
 
 
-async def test_no_marker_idle_skips_review_for_virgin_generation(tmp_path: Path) -> None:
+async def test_no_marker_idle_skips_review_for_virgin_generation(
+    tmp_path: Path,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
+        lambda cfg: cfg.model_copy(
+            update={"active_coder_turn_id": None, "last_event_sequence": 17}
+        )
     )
     controller._generation_has_coder_turn = False
     controller.coder = _FakeSteerCoder()
@@ -6416,16 +10409,22 @@ async def test_no_marker_idle_skips_review_for_virgin_generation(tmp_path: Path)
     await controller._handle_no_marker_idle()
 
     assert fake.completion_packets == []
-    assert "Controller forcing completion_review" not in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Controller forcing completion_review" not in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
     assert controller.coder.steers == [POST_RESTART_CONTINUE_NUDGE]
 
 
-async def test_completion_restart_discarded_for_virgin_generation(tmp_path: Path) -> None:
+async def test_completion_restart_discarded_for_virgin_generation(
+    tmp_path: Path,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
-        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+        BelloConfig(
+            project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"
+        ),
         overwrite=True,
     )
     handoff = RestartHandoff(
@@ -6477,7 +10476,9 @@ async def test_completion_restart_discarded_for_virgin_generation(tmp_path: Path
     assert cfg.generation == 0
     assert cfg.status not in (BelloStatus.STUCK, BelloStatus.RESTARTING)
     assert controller.completion_restarts == 0
-    assert "Discarded completion restart" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert "Discarded completion restart" in store.path(PROGRESS).read_text(
+        encoding="utf-8"
+    )
     events = store.path(EVENTS).read_text(encoding="utf-8")
     assert "completion/restart_discarded_virgin_generation" in events
     assert controller.coder.steers == [POST_RESTART_CONTINUE_NUDGE]
