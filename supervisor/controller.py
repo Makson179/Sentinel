@@ -225,6 +225,7 @@ MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
+CONTEXT_RECEIPT_DELIVERY_TIMEOUT_SECONDS = 3.0
 CODER_CONTEXT_COMPACT_THRESHOLD_TOKENS = 120_000
 CODER_CONTEXT_COMPACT_MIN_GROWTH_TOKENS = 60_000
 # Provider no_message (empty-completion) recovery for the completion review. A transient
@@ -471,6 +472,7 @@ class BelloController:
         self._coder_context_compaction_in_progress = False
         self._coder_context_compaction_interrupt_turn_id: str | None = None
         self._coder_context_compaction_turn_ids: set[str] = set()
+        self._coder_readiness_marker_turn_id: str | None = None
         self._coder_transition_lock = asyncio.Lock()
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self._shutdown_signal = asyncio.Event()
@@ -2301,6 +2303,7 @@ class BelloController:
             manager = self.approvals or fallback_manager
             response = manager.response_payload(context, resolution)
         is_denial = _approval_resolution_is_denial(resolution.decision)
+        capability_grant_failed = False
         if context.request_type is ApprovalRequestType.MCP_TOOL_CALL and not is_denial:
             if resolution.decision != "accept":
                 manager = self.approvals or fallback_manager
@@ -2315,10 +2318,21 @@ class BelloController:
                         pending_key=pending_key,
                     )
                 except ContextModeDataError as exc:
+                    capability_grant_failed = True
                     manager = self.approvals or fallback_manager
                     resolution = manager._deny(context, f"Context Mode capability grant rejected: {exc}")
                     response = manager.response_payload(context, resolution)
                     is_denial = True
+        denial_registration_error: ContextModeDataError | None = None
+        if (
+            context.request_type is ApprovalRequestType.MCP_TOOL_CALL
+            and is_denial
+            and not capability_grant_failed
+        ):
+            try:
+                self._mark_context_approval_denied(context)
+            except ContextModeDataError as exc:
+                denial_registration_error = exc
         try:
             await self._respond_to_origin(message, response, role=origin_role)
         except BaseException:
@@ -2346,6 +2360,13 @@ class BelloController:
                 if runtime is not None:
                     runtime.coordinator.mark_failed()
             raise
+        if denial_registration_error is not None:
+            await self.finalize(
+                "Context Mode approval denial binding failed: "
+                f"{denial_registration_error.__class__.__name__}",
+                status=BelloStatus.PROVIDER_FAILURE,
+            )
+            return
         decision_key = _approval_resolution_metric_key(resolution.decision)
         self._record_approval_metric(decision=decision_key, from_supervisor=resolution.from_supervisor)
         self.tui.render("DENIED" if is_denial else "APPROVAL", f"{resolution.decision}: {resolution.reason}")
@@ -2834,6 +2855,41 @@ class BelloController:
             (context.thread_id, context.turn_id, context.item_id)
         ] = capability.capability_id
 
+    def _mark_context_approval_denied(self, context: ApprovalContext) -> None:
+        """Bind an ordinary approval refusal to its exact pending Context call."""
+
+        if (
+            context.request_type is not ApprovalRequestType.MCP_TOOL_CALL
+            or context.tool_name not in CAPABILITY_REQUIRED_TOOLS
+            or not isinstance(context.thread_id, str)
+            or not context.thread_id
+            or not isinstance(context.turn_id, str)
+            or not context.turn_id
+            or not isinstance(context.item_id, str)
+            or not context.item_id
+            or not isinstance(context.normalized_arguments_digest, str)
+        ):
+            raise ContextModeStartupError(
+                "Context Mode approval denial lacks exact logical-call identity"
+            )
+        integration = getattr(self, "context_integration", None)
+        runtime = getattr(self, "context_runtime", None)
+        if integration is None or runtime is None:
+            raise ContextModeStartupError(
+                "Context Mode approval denial has no active runtime/integration"
+            )
+        integration.mark_approval_denied(
+            logical_key=LogicalContextCallKey(
+                ContextClientRole.CODER,
+                context.thread_id,
+                context.turn_id,
+                context.item_id,
+            ),
+            tool_name=context.tool_name,
+            arguments_digest=context.normalized_arguments_digest,
+            active_binding=runtime.binding,
+        )
+
     async def _respond_to_origin(
         self,
         message: AppServerMessage,
@@ -2993,6 +3049,8 @@ class BelloController:
             return
         context_outcome: ContextIntegrationOutcome | None = None
         if _is_bello_context_mode_item(params.get("item")):
+            if method == "item/completed" and origin_role is ClientRole.CODER:
+                await self._wait_for_context_terminal_receipt_delivery(params)
             context_outcome = self._normalize_context_mode_notification(
                 message,
                 origin_role=origin_role,
@@ -3034,6 +3092,8 @@ class BelloController:
                 text = item["text"].strip()
                 if text:
                     self.last_coder_message = CoderMessage(text=text, sequence=self._sequence)
+                    if isinstance(turn_id, str) and _has_readiness_marker(text):
+                        self._coder_readiness_marker_turn_id = turn_id
                 self.tui.render("CODER", text)
                 return
             if _is_completed_action(item):
@@ -3085,6 +3145,7 @@ class BelloController:
                     if (
                         context_outcome.classification is ContextCallClassification.EXECUTION
                         and not context_outcome.evidence
+                        and not context_outcome.controller_denied
                     ):
                         self._latest_context_execution_without_command_evidence_sequence = self._sequence
                     if context_validations:
@@ -3100,7 +3161,11 @@ class BelloController:
                         self._record_validation_progress(recorded_validation)
                         trigger_reasons.extend(self._record_validation_runtime_state(recorded_validation))
                     validation_trigger_reasons = tuple(dict.fromkeys(trigger_reasons))
-                if context_outcome is not None and not context_outcome.trusted:
+                if (
+                    context_outcome is not None
+                    and not context_outcome.trusted
+                    and not context_outcome.controller_denied
+                ):
                     validation_trigger_reasons = tuple(
                         dict.fromkeys((*validation_trigger_reasons, "context_untrusted_result"))
                     )
@@ -3109,11 +3174,15 @@ class BelloController:
                     self.inspections = self.inspections[-INSPECTION_LEDGER_LIMIT:]
                 changed_files = await self.changed_files()
                 self._update_relevant_edit_state(changed_files)
-                runtime_decision = self.should_wake_runtime_supervisor(
-                    action=triggering_action,
-                    validation=validation,
-                    changed_files=changed_files,
-                    validation_trigger_reasons=validation_trigger_reasons,
+                runtime_decision = (
+                    RuntimeTriggerDecision(should_wake=False, reasons=())
+                    if context_outcome is not None and context_outcome.controller_denied
+                    else self.should_wake_runtime_supervisor(
+                        action=triggering_action,
+                        validation=validation,
+                        changed_files=changed_files,
+                        validation_trigger_reasons=validation_trigger_reasons,
+                    )
                 )
                 if repaired_runtime_controls:
                     runtime_decision = RuntimeTriggerDecision(
@@ -3138,6 +3207,7 @@ class BelloController:
                 if (
                     context_outcome is not None
                     and context_outcome.classification is ContextCallClassification.PURGE
+                    and not context_outcome.controller_denied
                 ):
                     logical_key = (
                         (
@@ -3190,10 +3260,39 @@ class BelloController:
                     }
                 )
                 return
-            await self._maybe_compact_coder_context()
+            if turn_id != getattr(self, "_coder_readiness_marker_turn_id", None):
+                await self._maybe_compact_coder_context()
             if not self.running or getattr(self, "_terminal_cleanup_started", False):
                 return
             await self._handle_coder_turn_completed(item_id=item_id)
+
+    async def _wait_for_context_terminal_receipt_delivery(
+        self,
+        params: Mapping[str, Any],
+    ) -> bool:
+        """Yield briefly for a receipt emitted first on the broker channel.
+
+        The authority control stream and app-server item stream are consumed by
+        independent tasks.  Polling the exact attested digest lets the control
+        reader run without weakening the subsequent one-shot claim or full
+        provenance validation.  Timeout returns ``False`` and normalization
+        retains its existing fail-closed health violation.
+        """
+
+        integration = getattr(self, "context_integration", None)
+        if integration is None:
+            return False
+        receipt_digest = integration.terminal_receipt_delivery_digest(params)
+        if receipt_digest is None:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CONTEXT_RECEIPT_DELIVERY_TIMEOUT_SECONDS
+        while not integration.receipt_inbox.has_seen(receipt_digest):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.01, remaining))
+        return True
 
     def _normalize_context_mode_notification(
         self,
@@ -3408,7 +3507,11 @@ class BelloController:
         if receipt is not None:
             paths.extend((receipt.changed_paths or {}).keys())
             paths.extend(record.relative_path for record in receipt.retrieval)
-        trust = "trusted" if outcome.trusted else "untrusted"
+        trust = (
+            "controller-denied before execution"
+            if outcome.controller_denied
+            else "trusted" if outcome.trusted else "untrusted"
+        )
         return TriggeringAction(
             item_id=item_id,
             kind="mcpToolCall",
@@ -3417,7 +3520,11 @@ class BelloController:
             paths=list(dict.fromkeys(paths)),
             exit_code=exit_code,
             status=outcome.status.value,
-            summary=f"{summary} ({trust} broker provenance)",
+            summary=(
+                f"{summary} ({trust})"
+                if outcome.controller_denied
+                else f"{summary} ({trust} broker provenance)"
+            ),
         )
 
     def _validations_from_context_outcome(
@@ -4129,6 +4236,7 @@ class BelloController:
             self.prior_interventions = []
         self.no_marker_idle_nudge_count = 0
         self._last_completion_marker_sequence = None
+        self._coder_readiness_marker_turn_id = None
         self.last_coder_message = None
         # The new generation has produced no coder work yet; until its first turn starts,
         # completion machinery must not judge (or restart over) the previous generation's state.
@@ -4904,6 +5012,7 @@ class BelloController:
         self._coder_context_compaction_in_progress = False
         self._coder_context_compaction_interrupt_turn_id = None
         self._coder_context_compaction_turn_ids = set()
+        self._coder_readiness_marker_turn_id = None
 
     def _record_coder_context_token_sample(
         self,
@@ -4992,6 +5101,11 @@ class BelloController:
                 or not turn_id
                 or not getattr(self, "_coder_context_compaction_pending", False)
             ):
+                return False
+            if turn_id == getattr(self, "_coder_readiness_marker_turn_id", None):
+                # Let a coder turn that already emitted the exact readiness
+                # marker finish naturally.  Completion review may accept it,
+                # avoiding a needless compact/recovery/revalidation cycle.
                 return False
             existing = getattr(self, "_coder_context_compaction_interrupt_turn_id", None)
             if existing == turn_id:
@@ -8466,24 +8580,148 @@ def _validation_masking_reason(
     return _generic_validation_masking_reason(command)
 
 
+_SIMPLE_HEREDOC_DELIMITER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _literal_heredocs_on_shell_line(
+    line: str,
+    *,
+    initial_quote: str | None,
+    initial_escaped: bool,
+) -> tuple[list[tuple[str, bool]], str | None, bool]:
+    """Find simple quoted heredoc operators outside shell quotes/comments.
+
+    This deliberately recognizes only the common, unambiguous ``<<'WORD'``,
+    ``<<\"WORD\"``, and ``<<\\WORD`` forms.  Anything more exotic remains
+    visible to the masking checks (a safe false positive) instead of risking a
+    false negative by hiding real shell syntax.
+    """
+
+    found: list[tuple[str, bool]] = []
+    quote = initial_quote
+    escaped = initial_escaped
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote is not None:
+            if character == "\\" and quote in {'"', "`"}:
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+            index += 1
+            continue
+        if character == "\\":
+            escaped = True
+            index += 1
+            continue
+        if character == "#" and (
+            index == 0 or line[index - 1].isspace() or line[index - 1] in ";|&()"
+        ):
+            break
+        if not line.startswith("<<", index):
+            index += 1
+            continue
+
+        cursor = index + 2
+        strip_tabs = cursor < len(line) and line[cursor] == "-"
+        if strip_tabs:
+            cursor += 1
+        while cursor < len(line) and line[cursor] in " \t":
+            cursor += 1
+        if cursor >= len(line):
+            break
+
+        delimiter: str | None = None
+        end = cursor
+        opener = line[cursor]
+        if opener in {"'", '"'}:
+            end = line.find(opener, cursor + 1)
+            if end >= 0:
+                delimiter = line[cursor + 1 : end]
+                end += 1
+        elif opener == "\\":
+            match = _SIMPLE_HEREDOC_DELIMITER_RE.match(line, cursor + 1)
+            if match is not None:
+                delimiter = match.group(0)
+                end = match.end()
+
+        if (
+            delimiter is not None
+            and _SIMPLE_HEREDOC_DELIMITER_RE.fullmatch(delimiter) is not None
+            and (end == len(line) or line[end].isspace() or line[end] in ";|&()")
+        ):
+            found.append((delimiter, strip_tabs))
+            index = end
+            continue
+        index = cursor + 1
+    return found, quote, escaped
+
+
+def _without_literal_heredoc_bodies(command: str) -> str:
+    """Remove bodies whose quoted delimiter disables shell expansion.
+
+    Validation commands often use ``python - <<'PY'`` for an inline oracle.
+    Backticks, ``$()``, pipes, and semicolons in that Python source are data,
+    not shell control operators.  Keep the declaration and delimiter lines so
+    shell syntax surrounding the heredoc is still inspected.  Unquoted
+    heredocs are deliberately left untouched because substitutions in their
+    bodies are active shell syntax.
+    """
+
+    pending: list[tuple[str, bool]] = []
+    visible: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for line in command.splitlines(keepends=True):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = line.rstrip("\r\n")
+            if strip_tabs:
+                candidate = candidate.lstrip("\t")
+            if candidate == delimiter:
+                pending.pop(0)
+                visible.append(line)
+            else:
+                visible.append("\n" if line.endswith(("\n", "\r")) else "")
+            continue
+        visible.append(line)
+        declarations, quote, escaped = _literal_heredocs_on_shell_line(
+            line,
+            initial_quote=quote,
+            initial_escaped=escaped,
+        )
+        pending.extend(declarations)
+    return "".join(visible)
+
+
 def _marked_behavior_demo_masking_reason(command: str) -> str | None:
-    lowered = command.lower()
+    shell_syntax = _without_literal_heredoc_bodies(command)
+    lowered = shell_syntax.lower()
     pipeline_probe = lowered.replace("||", "")
     if "|" in pipeline_probe and "pipefail" not in lowered:
         return "pipeline_without_pipefail"
     if "||" in lowered and not re.search(r"\|\|\s*exit\s+1(\s|$)", lowered):
         return "logical_or_may_mask_validation_failure"
-    if ("$(" in command or "`" in command) and not _shell_errexit_is_enabled(command):
+    if ("$(" in shell_syntax or "`" in shell_syntax) and not _shell_errexit_is_enabled(shell_syntax):
         return "command_substitution_may_mask_failure"
     return None
 
 
 def _generic_validation_masking_reason(command: str) -> str | None:
-    lowered = command.lower()
+    shell_syntax = _without_literal_heredoc_bodies(command)
+    lowered = shell_syntax.lower()
     pipeline_probe = lowered.replace("||", "")
     if "|" in pipeline_probe and "pipefail" not in lowered:
         return "pipeline_without_pipefail"
-    if "$(" in command or "`" in command:
+    if "$(" in shell_syntax or "`" in shell_syntax:
         return "command_substitution_may_mask_failure"
     if "||" in lowered and not re.search(r"\|\|\s*exit\s+1(\s|$)", lowered):
         return "logical_or_may_mask_validation_failure"

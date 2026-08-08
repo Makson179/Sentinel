@@ -24,6 +24,7 @@ from supervisor.controller import (
     _has_passing_behavioral_validation,
     _has_readiness_marker,
     _git_status_entries_from_porcelain_v1_z,
+    _generic_validation_masking_reason,
     _inspection_from_action,
     _hash_file,
     _path_from_git_status_line,
@@ -2573,6 +2574,90 @@ def test_heredoc_script_command_is_behavior_demo_validation() -> None:
     assert validation.type == "behavior_demo"
     assert validation.trusted_validation_outcome == "passed"
     assert validation.captured_output == "<button>Save</button>\n"
+
+
+def test_quoted_heredoc_literals_do_not_look_like_shell_substitution() -> None:
+    command = (
+        "python - <<'PY'\n"
+        "message = 'cannot specify `--emit abi` twice'\n"
+        "assert '$(' not in message\n"
+        "print('compiler diagnostic=' + message)\n"
+        "PY"
+    )
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command=command,
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=8,
+        item={
+            "type": "commandExecution",
+            "stdout": "compiler diagnostic=cannot specify `--emit abi` twice\n",
+        },
+        changed_paths=["solar.py"],
+    )
+
+    assert validation is not None
+    assert validation.masking_reason is None
+    assert validation.trusted_validation_outcome == "passed"
+
+
+def test_unquoted_heredoc_shell_substitution_remains_masked() -> None:
+    command = "python - <<PY\nprint(`printf hidden`)\nPY"
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command=command,
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=9,
+        item={"type": "commandExecution", "stdout": "hidden\n"},
+        changed_paths=["solar.py"],
+    )
+
+    assert validation is not None
+    assert validation.masking_reason == "command_substitution_may_mask_failure"
+    assert validation.trusted_validation_outcome == "masked_or_unknown"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "python -c 'print(1)' # <<'X'",
+        "python -c \"print(\\\"<<'X'\\\")\"",
+    ],
+)
+def test_heredoc_text_in_comment_or_quote_cannot_hide_shell_pipeline(
+    declaration: str,
+) -> None:
+    command = f"{declaration}\nprintf unsafe | cat\nX"
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution",
+            command=command,
+            exit_code=0,
+            status="completed",
+            summary="command completed",
+        ),
+        sequence=10,
+        item={"type": "commandExecution", "stdout": "unsafe\n"},
+        changed_paths=["solar.py"],
+    )
+
+    assert validation is not None
+    assert validation.masking_reason == "pipeline_without_pipefail"
+    assert validation.trusted_validation_outcome == "masked_or_unknown"
+
+
+def test_heredoc_text_in_multiline_quote_cannot_hide_shell_pipeline() -> None:
+    command = "printf '%s\\n' \"literal\n<<'X'\n\"\nfalse | true\nX\ntrue"
+
+    assert _generic_validation_masking_reason(command) == "pipeline_without_pipefail"
 
 
 def test_absolute_python_script_command_is_behavior_demo_validation() -> None:

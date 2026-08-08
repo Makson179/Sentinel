@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -427,6 +428,141 @@ def test_execution_terminal_requires_out_of_band_receipt_for_evidence(tmp_path: 
     assert "duplicate_logical_terminal" in duplicate.protocol_issues
 
 
+@pytest.mark.asyncio
+async def test_controller_waits_for_delayed_receipt_before_terminal_normalization(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    controller = _approval_controller(binding)
+    arguments = {"code": "python3 reviewable-helper.py"}
+    capability_id = "capability"
+
+    started = controller._normalize_context_mode_notification(
+        _started_message(arguments=arguments),
+        origin_role=AppServerClientRole.CODER,
+    )
+    assert started.status is ContextOutcomeStatus.STARTED
+    logical_key = LogicalContextCallKey(ClientRole.CODER, "thread", "turn", "item")
+    controller.context_integration.attach_approval_capability(
+        logical_key=logical_key,
+        capability_id=capability_id,
+        tool_name="ctx_execute",
+        arguments_digest=normalized_arguments_digest(arguments),
+        active_binding=binding,
+    )
+    controller._context_capability_by_item[("thread", "turn", "item")] = capability_id
+    receipt, result = _receipt_and_result(
+        binding,
+        tool="ctx_execute",
+        arguments=arguments,
+        capability_id=capability_id,
+    )
+    terminal_message = AppServerMessage(
+        {
+            "method": "item/completed",
+            "params": _params(
+                tool="ctx_execute",
+                arguments=arguments,
+                result=result,
+                status="failed",
+                request_id=None,
+            ),
+        },
+        role=AppServerClientRole.CODER,
+        process_epoch=4,
+        app_server_instance_id="app",
+    )
+
+    async def publish_after_terminal_arrives() -> None:
+        await asyncio.sleep(0.01)
+        controller.context_integration.publish_receipt(receipt)
+
+    publish_task = asyncio.create_task(publish_after_terminal_arrives())
+    delivered = await asyncio.wait_for(
+        controller._wait_for_context_terminal_receipt_delivery(terminal_message.params),
+        timeout=2.0,
+    )
+    await publish_task
+    assert delivered is True
+
+    terminal = controller._normalize_context_mode_notification(
+        terminal_message,
+        origin_role=AppServerClientRole.CODER,
+    )
+    assert terminal.status is ContextOutcomeStatus.FAILED
+    assert terminal.trusted is True
+    assert "missing_or_invalid_out_of_band_receipt" not in terminal.protocol_issues
+
+
+@pytest.mark.asyncio
+async def test_controller_receipt_delivery_timeout_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    controller = _approval_controller(binding)
+    arguments = {"query": "receipt ordering"}
+    started_message = AppServerMessage(
+        {
+            "method": "item/started",
+            "params": _params(
+                tool="ctx_search",
+                arguments=arguments,
+                request_id=None,
+            ),
+        },
+        role=AppServerClientRole.CODER,
+        process_epoch=4,
+        app_server_instance_id="app",
+    )
+    started = controller._normalize_context_mode_notification(
+        started_message,
+        origin_role=AppServerClientRole.CODER,
+    )
+    assert started.status is ContextOutcomeStatus.STARTED
+    _receipt, result = _receipt_and_result(
+        binding,
+        tool="ctx_search",
+        arguments=arguments,
+        capability_id=None,
+    )
+    terminal_message = AppServerMessage(
+        {
+            "method": "item/completed",
+            "params": _params(
+                tool="ctx_search",
+                arguments=arguments,
+                result=result,
+                status="failed",
+                request_id=None,
+            ),
+        },
+        role=AppServerClientRole.CODER,
+        process_epoch=4,
+        app_server_instance_id="app",
+    )
+    monkeypatch.setattr(
+        "supervisor.controller.CONTEXT_RECEIPT_DELIVERY_TIMEOUT_SECONDS",
+        0.001,
+    )
+
+    assert (
+        await controller._wait_for_context_terminal_receipt_delivery(terminal_message.params)
+        is False
+    )
+    terminal = controller._normalize_context_mode_notification(
+        terminal_message,
+        origin_role=AppServerClientRole.CODER,
+    )
+    assert terminal.trusted is False
+    assert terminal.evidence == ()
+    assert "missing_or_invalid_out_of_band_receipt" in terminal.protocol_issues
+
+
 def test_execution_capability_attaches_after_public_item_started(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -493,6 +629,132 @@ def test_execution_capability_attaches_after_public_item_started(tmp_path: Path)
             arguments_digest=normalized_arguments_digest(arguments),
             active_binding=binding,
         )
+
+
+def test_controller_denial_has_nonfatal_failed_terminal_without_receipt(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    arguments = {"code": "python3 oversized-review-helper.py"}
+    logical_key = LogicalContextCallKey(ClientRole.CODER, "thread", "turn", "item")
+    integration = ContextModeIntegration(redaction_authority_key=b"k" * 32)
+
+    started = integration.normalize_notification(
+        method="item/started",
+        params=_params(tool="ctx_execute", arguments=arguments, request_id=None),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+    assert started.status is ContextOutcomeStatus.STARTED
+
+    integration.mark_approval_denied(
+        logical_key=logical_key,
+        tool_name="ctx_execute",
+        arguments_digest=normalized_arguments_digest(arguments),
+        active_binding=binding,
+    )
+    terminal = integration.normalize_notification(
+        method="item/completed",
+        params=_params(
+            tool="ctx_execute",
+            arguments=arguments,
+            status="failed",
+            request_id=None,
+        ),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+
+    assert terminal.status is ContextOutcomeStatus.FAILED
+    assert terminal.controller_denied is True
+    assert terminal.trusted is False
+    assert terminal.health_violation is False
+    assert terminal.protocol_issues == ()
+    assert terminal.action_counted is False
+    assert integration.telemetry.value("context_mode_calls_failed") == 1
+    assert integration.telemetry.value("context_mode_untrusted_results") == 0
+    assert integration.telemetry.value("context_mode_provenance_failures") == 0
+
+
+def test_controller_denied_purge_is_not_an_executed_action(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    arguments = {"scope": "workspace"}
+    logical_key = LogicalContextCallKey(ClientRole.CODER, "thread", "turn", "item")
+    integration = ContextModeIntegration(redaction_authority_key=b"k" * 32)
+    integration.normalize_notification(
+        method="item/started",
+        params=_params(tool="ctx_purge", arguments=arguments, request_id=None),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+    integration.mark_approval_denied(
+        logical_key=logical_key,
+        tool_name="ctx_purge",
+        arguments_digest=normalized_arguments_digest(arguments),
+        active_binding=binding,
+    )
+
+    terminal = integration.normalize_notification(
+        method="item/completed",
+        params=_params(
+            tool="ctx_purge",
+            arguments=arguments,
+            status="failed",
+            request_id=None,
+        ),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+
+    assert terminal.classification is ContextCallClassification.PURGE
+    assert terminal.controller_denied is True
+    assert terminal.action_counted is False
+    assert terminal.health_violation is False
+
+
+def test_controller_denial_rejects_an_impossible_success_terminal(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    arguments = {"code": "python3 oversized-review-helper.py"}
+    logical_key = LogicalContextCallKey(ClientRole.CODER, "thread", "turn", "item")
+    integration = ContextModeIntegration(redaction_authority_key=b"k" * 32)
+    integration.normalize_notification(
+        method="item/started",
+        params=_params(tool="ctx_execute", arguments=arguments, request_id=None),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+    integration.mark_approval_denied(
+        logical_key=logical_key,
+        tool_name="ctx_execute",
+        arguments_digest=normalized_arguments_digest(arguments),
+        active_binding=binding,
+    )
+
+    terminal = integration.normalize_notification(
+        method="item/completed",
+        params=_params(
+            tool="ctx_execute",
+            arguments=arguments,
+            status="completed",
+            request_id=None,
+        ),
+        origin=_origin(),
+        active_binding=binding,
+        workspace_revision=5,
+    )
+
+    assert terminal.controller_denied is False
+    assert terminal.health_violation is True
+    assert "controller_denial_terminal_mismatch" in terminal.protocol_issues
 
 
 def test_terminal_replay_after_monotonic_process_recovery_is_trusted_once(tmp_path: Path) -> None:
@@ -820,6 +1082,40 @@ async def test_controller_correlates_real_elicitation_and_attaches_one_shot_capa
     logical_key = LogicalContextCallKey(ClientRole.CODER, "thread", "turn", "item")
     assert controller.context_integration._calls[logical_key].approval_capability_id == capability_id
     assert len(controller.context_runtime.native_runtime.registered) == 1
+
+
+def test_controller_binds_policy_denial_to_exact_pending_context_call(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binding = _binding(workspace)
+    controller = _approval_controller(binding)
+    arguments = {"code": "python3 reviewable-helper.py"}
+
+    controller._normalize_context_mode_notification(
+        _started_message(arguments=arguments),
+        origin_role=AppServerClientRole.CODER,
+    )
+    approval = _approval_message(arguments)
+    update = controller._active_context_approval_binding(
+        approval,
+        origin_role=AppServerClientRole.CODER,
+        pending_key=PendingRequestKey(AppServerClientRole.CODER, 4, 91),
+    )
+    context = normalize_approval_request(approval).model_copy(
+        update={
+            "client_role": "coder",
+            "process_epoch": 4,
+            "app_server_instance_id": "app",
+            **update,
+        }
+    )
+
+    controller._mark_context_approval_denied(context)
+
+    logical_key = LogicalContextCallKey(ClientRole.CODER, "thread", "turn", "item")
+    state = controller.context_integration._calls[logical_key]
+    assert state.approval_denied is True
+    assert state.approval_capability_id is None
 
 
 def test_context_approval_wake_packet_is_bounded_and_redacted(tmp_path: Path) -> None:

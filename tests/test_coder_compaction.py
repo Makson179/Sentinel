@@ -518,6 +518,40 @@ async def test_threshold_interrupts_a_long_active_coder_turn_before_compaction()
     assert coder.interrupts == 1
 
 
+@pytest.mark.asyncio
+async def test_threshold_does_not_interrupt_turn_after_readiness_marker() -> None:
+    controller = _policy_controller()
+    controller.running = True
+    controller.paused = False
+    controller._terminal_cleanup_started = False
+    controller._coder_context_input_tokens = 120_000
+    controller._coder_context_compaction_pending = True
+    controller._coder_context_compaction_interrupt_turn_id = None
+    controller._coder_readiness_marker_turn_id = "ready-turn"
+    controller.pending_approvals = {}
+    controller._coder_transition_lock = asyncio.Lock()
+    controller.tui = SimpleNamespace(render=lambda *args: None)
+
+    class Coder:
+        thread_id = "thread-1"
+        active_turn_id = "ready-turn"
+
+        def __init__(self) -> None:
+            self.interrupts = 0
+
+        async def interrupt(self):
+            self.interrupts += 1
+
+    coder = Coder()
+    controller.context_runtime = SimpleNamespace()  # type: ignore[assignment]
+    controller.coder = coder  # type: ignore[assignment]
+
+    assert not await controller._maybe_compact_coder_context()
+    assert coder.interrupts == 0
+    assert controller._coder_context_compaction_interrupt_turn_id is None
+    assert controller._coder_context_compaction_pending
+
+
 def test_native_precompact_hook_commits_before_sessionstart_recovery(tmp_path: Path) -> None:
     broker_module = runpy.run_path(
         str(

@@ -159,6 +159,18 @@ class OutOfBandReceiptInbox:
             self._seen_operations.add(receipt.operation_id)
             self._seen_sequences.add(sequence_key)
 
+    def has_seen(self, digest: str) -> bool:
+        """Report whether one exact authority-channel receipt was delivered.
+
+        Claimed digests deliberately remain in the seen set so replayed
+        terminals do not spend a delivery timeout before ``claim`` rejects
+        them as already consumed.
+        """
+
+        require_sha256(digest, "receipt_digest")
+        with self._lock:
+            return digest in self._seen_digests
+
     def claim(
         self,
         envelope: ResultEnvelope,
@@ -249,6 +261,7 @@ class ContextIntegrationOutcome:
     redacted_summary: Mapping[str, Any] | None = None
     action_counted: bool = False
     health_violation: bool = False
+    controller_denied: bool = False
 
     @property
     def protocol_issue(self) -> str | None:
@@ -273,6 +286,7 @@ class _CallState:
     started_origin: ContextNotificationOrigin
     workspace_revision_started: int
     start_protocol_issues: tuple[str, ...]
+    approval_denied: bool = False
     terminal_notification_digest: str | None = None
     terminal_outcome: ContextIntegrationOutcome | None = None
 
@@ -483,6 +497,46 @@ class ContextModeIntegration:
     def publish_receipt(self, receipt: BrokerReceipt) -> None:
         self.receipt_inbox.publish(receipt)
 
+    def terminal_receipt_delivery_digest(
+        self,
+        params: Mapping[str, Any],
+    ) -> str | None:
+        """Return the receipt digest worth awaiting for one terminal.
+
+        Malformed/no-result terminals, calls without an accepted start, and
+        calls which the Controller already denied must go directly through
+        normal fail-closed terminal normalization without delaying the event
+        loop.
+        """
+
+        item = params.get("item")
+        if not isinstance(item, Mapping):
+            return None
+        result = item.get("result")
+        if not isinstance(result, Mapping):
+            return None
+        try:
+            envelope = ResultEnvelope.from_result(result)
+        except ProvenanceError:
+            return None
+
+        thread_id = params.get("threadId", item.get("threadId"))
+        turn_id = params.get("turnId", item.get("turnId"))
+        item_id = params.get("itemId", item.get("id"))
+        if not all(isinstance(value, str) and value for value in (thread_id, turn_id, item_id)):
+            return None
+        logical_key = LogicalContextCallKey(
+            ClientRole.CODER,
+            thread_id,
+            turn_id,
+            item_id,
+        )
+        with self._lock:
+            state = self._calls.get(logical_key)
+            if state is None or state.approval_denied:
+                return None
+        return envelope.broker_receipt_digest
+
     def bounded_evidence_summary(
         self,
         value: Mapping[str, Any],
@@ -564,6 +618,8 @@ class ContextModeIntegration:
                 if state.approval_capability_id == capability_id:
                     return
                 raise IntegrationError("pending Context call already has another approval capability")
+            if state.approval_denied:
+                raise IntegrationError("pending Context call was already denied by the controller")
             state.approval_capability_id = capability_id
             # Older persisted/in-memory candidates may have been created by a
             # pre-fix normalizer which treated pre-approval started items as an
@@ -573,6 +629,62 @@ class ContextModeIntegration:
                 for issue in state.start_protocol_issues
                 if issue != "missing_controller_approval_capability"
             )
+
+    def mark_approval_denied(
+        self,
+        *,
+        logical_key: LogicalContextCallKey,
+        tool_name: str,
+        arguments_digest: str,
+        active_binding: ContextBinding,
+    ) -> None:
+        """Record a deliberate controller denial before Codex emits terminal failure.
+
+        A declined MCP elicitation normally produces an ``item/completed`` event
+        with ``status=failed`` and no broker result: the tool never executed, so
+        there is intentionally no capability, result envelope, or receipt.  That
+        is a policy outcome, not a Context protocol failure.  Bind the denial to
+        the exact already-started logical call so only that expected terminal can
+        take the non-fatal path.
+        """
+
+        assert_tool_name(tool_name)
+        if tool_name not in CAPABILITY_REQUIRED_TOOLS:
+            raise IntegrationError(f"{tool_name!r} does not require controller approval")
+        require_sha256(arguments_digest, "arguments_digest")
+        lifecycle = active_binding.lifecycle
+        with self._lock:
+            state = self._calls.get(logical_key)
+            if state is None:
+                raise IntegrationError("approval denial has no pending Context call")
+            if state.terminal_outcome is not None:
+                raise IntegrationError("approval denial arrived after the Context call became terminal")
+            mismatches = []
+            if state.tool_name != tool_name:
+                mismatches.append("tool_name")
+            if state.arguments_digest != arguments_digest:
+                mismatches.append("arguments_digest")
+            if state.run_id != active_binding.stable.run_id:
+                mismatches.append("run_id")
+            if state.workspace_id != active_binding.stable.workspace_id:
+                mismatches.append("workspace_id")
+            if state.context_session_id != active_binding.stable.context_session_id:
+                mismatches.append("context_session_id")
+            if state.binding_version != lifecycle.binding_version:
+                mismatches.append("binding_version")
+            if state.context_state_epoch != lifecycle.context_state_epoch:
+                mismatches.append("context_state_epoch")
+            if state.coder_generation != lifecycle.coder_generation:
+                mismatches.append("coder_generation")
+            if state.generation_lease_id != lifecycle.generation_lease_id:
+                mismatches.append("generation_lease_id")
+            if mismatches:
+                raise IntegrationError(
+                    f"approval denial does not match pending Context call: {mismatches!r}"
+                )
+            if state.approval_capability_id is not None:
+                raise IntegrationError("approved Context call cannot also be denied")
+            state.approval_denied = True
 
     def normalize_notification(
         self,
@@ -998,13 +1110,23 @@ class ContextModeIntegration:
             )
         else:
             issues.extend(state.start_protocol_issues)
-            if tool_name in CAPABILITY_REQUIRED_TOOLS and state.approval_capability_id is None:
+            if (
+                tool_name in CAPABILITY_REQUIRED_TOOLS
+                and state.approval_capability_id is None
+                and not state.approval_denied
+            ):
                 issues.append("missing_controller_approval_capability")
 
         result = item.get("result")
+        controller_denied = bool(state is not None and state.approval_denied)
+        expected_denial_terminal = controller_denied and failed and result is None
+        if controller_denied and not expected_denial_terminal:
+            issues.append("controller_denial_terminal_mismatch")
         result_digest: str | None = None
         envelope: ResultEnvelope | None = None
-        if not isinstance(result, Mapping):
+        if expected_denial_terminal:
+            pass
+        elif not isinstance(result, Mapping):
             issues.append("missing_or_invalid_terminal_result")
         else:
             try:
@@ -1122,13 +1244,20 @@ class ContextModeIntegration:
                 indexed_bytes=None,
                 protocol_issues=tuple(dict.fromkeys(issues)),
             )
-        action_counted = disposition in {None, EventDisposition.ACCEPTED_TERMINAL}
+        # A controller denial is a terminal policy observation, not an executed
+        # repository action.  Keep the failed-call telemetry, but do not let it
+        # advance coder action accounting or execution-specific controller paths.
+        action_counted = (
+            disposition in {None, EventDisposition.ACCEPTED_TERMINAL}
+            and not expected_denial_terminal
+        )
         self._record_terminal_telemetry(
             logical_key=logical_key,
             tool_name=tool_name,
             failed=failed,
             trusted=trusted,
             receipt=receipt,
+            controller_denied=expected_denial_terminal,
         )
         evidence = (
             evidence_from_provenance(
@@ -1157,6 +1286,7 @@ class ContextModeIntegration:
             protocol_issues=tuple(dict.fromkeys(issues)),
             redacted_summary=summary.value,
             action_counted=action_counted,
+            controller_denied=expected_denial_terminal,
             health_violation=bool(
                 frozenset(issues)
                 & {
@@ -1170,6 +1300,7 @@ class ContextModeIntegration:
                     "terminal_envelope_request_id_mismatch",
                     "missing_controller_approval_capability",
                     "controller_approval_capability_changed",
+                    "controller_denial_terminal_mismatch",
                     "event_summary_redaction_failed",
                     "event_ledger_terminal_conflict",
                 }
@@ -1201,6 +1332,7 @@ class ContextModeIntegration:
         failed: bool,
         trusted: bool,
         receipt: BrokerReceipt | None,
+        controller_denied: bool = False,
     ) -> None:
         authority = MetricAuthority.CONTROLLER_OBSERVED
         self.telemetry.increment(
@@ -1216,7 +1348,7 @@ class ContextModeIntegration:
             self.telemetry.increment(
                 "context_mode_execute_calls", authority=authority, idempotency_key=logical_key.stable_id
             )
-        if not trusted:
+        if not trusted and not controller_denied:
             self.telemetry.increment(
                 "context_mode_untrusted_results", authority=authority, idempotency_key=logical_key.stable_id
             )

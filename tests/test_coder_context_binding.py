@@ -120,6 +120,10 @@ def test_context_mode_routing_states_search_limit_and_timeout_units() -> None:
     assert "`timeout` field on all execution tools is measured in milliseconds" in routing
     assert "120000 ms default" in routing
     assert "never second-like values such as `30`, `60`, or `120`" in routing
+    assert "never embed a multi-kilobyte program or heredoc larger than 3 KiB" in routing
+    assert "combined command/code text across an entire `ctx_batch_execute` below 3 KiB" in routing
+    assert "Do not evade this aggregate bound" in routing
+    assert "normal reviewable file-edit tool" in routing
     assert "statement itself establishes the incomplete-Context boundary" in routing
     assert "do not refuse the native fallback as conflicting with this policy" in routing
 
