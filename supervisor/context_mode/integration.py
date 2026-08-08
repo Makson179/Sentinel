@@ -416,11 +416,16 @@ def _bounded_json_digest(value: Any, *, maximum_bytes: int, issue: str, issues: 
     return sha256_bytes(encoded)
 
 
-def normalized_mcp_result_digest(result: Mapping[str, Any]) -> str:
-    """Digest a terminal result after removing only its attestation envelope.
+def normalized_mcp_result_digest(
+    result: Mapping[str, Any],
+    *,
+    terminal_failed: bool = False,
+) -> str:
+    """Digest a terminal result after normalizing the public app-server form.
 
-    The pinned fork and Controller must use this exact normalization.  Other
-    structured content remains part of the result digest.
+    The pinned fork and Controller must use this exact normalization.  The
+    attestation envelope is removed; other structured content remains part of
+    the result digest.
     """
 
     normalized = dict(result)
@@ -429,6 +434,13 @@ def normalized_mcp_result_digest(result: Mapping[str, Any]) -> str:
     # result, where that field is absent, so normalize the wire placeholder.
     if normalized.get("_meta") is None:
         normalized.pop("_meta", None)
+    # Codex app-server 0.146 also omits the MCP SDK's top-level
+    # ``isError: true`` marker from the public result while exposing the item
+    # itself with status ``failed``.  The broker signs the original MCP result,
+    # so reconstruct only that one implied value.  Keeping an explicit value
+    # untouched preserves fail-closed mismatch detection.
+    if terminal_failed and "isError" not in normalized:
+        normalized["isError"] = True
     structured = normalized.get("structuredContent")
     if isinstance(structured, Mapping):
         normalized_structured = dict(structured)
@@ -1135,7 +1147,10 @@ class ContextModeIntegration:
                     encoded_bytes=len(encoded_result),
                     estimated_tokens=(len(encoded_result) + 3) // 4,
                 )
-                result_digest = normalized_mcp_result_digest(result)
+                result_digest = normalized_mcp_result_digest(
+                    result,
+                    terminal_failed=failed,
+                )
             except ContextModeDataError:
                 issues.append("invalid_or_oversized_terminal_result")
             try:

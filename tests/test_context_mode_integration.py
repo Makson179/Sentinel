@@ -250,6 +250,7 @@ def _receipt_and_result(
     receipt_seq: int = 1,
     retrieval: tuple[RetrievalRecord, ...] = (),
     indexed_bytes: int | None = None,
+    broker_is_error: bool = False,
 ) -> tuple[BrokerReceipt, dict[str, object]]:
     command = CommandRecord(
         runner_identity="bello-native-runner-v1",
@@ -273,6 +274,9 @@ def _receipt_and_result(
         "content": [{"type": "text", "text": "bounded result"}],
         "structuredContent": {"answer": "ok"},
     }
+    broker_result = dict(bare_result)
+    if broker_is_error:
+        broker_result["isError"] = True
     stable, lifecycle = binding.stable, binding.lifecycle
     receipt = BrokerReceipt(
         receipt_seq=receipt_seq,
@@ -290,7 +294,7 @@ def _receipt_and_result(
         tool_name=tool,
         arguments_digest=normalized_arguments_digest(arguments),
         operation_id=operation_id,
-        result_digest=normalized_mcp_result_digest(bare_result),
+        result_digest=normalized_mcp_result_digest(broker_result),
         sandbox_backend="linux-bwrap-seccomp",
         sandbox_policy_digest=lifecycle.sandbox_policy_digest,
         capability_id=capability_id,
@@ -458,6 +462,16 @@ async def test_controller_waits_for_delayed_receipt_before_terminal_normalizatio
         tool="ctx_execute",
         arguments=arguments,
         capability_id=capability_id,
+        broker_is_error=True,
+    )
+    # Codex app-server exposes a failed item but strips the MCP result's
+    # top-level isError marker.  The controller must reconstruct the broker's
+    # signed representation from that terminal status.
+    assert "isError" not in result
+    assert normalized_mcp_result_digest(result) != receipt.result_digest
+    assert (
+        normalized_mcp_result_digest(result, terminal_failed=True)
+        == receipt.result_digest
     )
     terminal_message = AppServerMessage(
         {
@@ -529,6 +543,7 @@ async def test_controller_receipt_delivery_timeout_remains_fail_closed(
         tool="ctx_search",
         arguments=arguments,
         capability_id=None,
+        broker_is_error=True,
     )
     terminal_message = AppServerMessage(
         {
